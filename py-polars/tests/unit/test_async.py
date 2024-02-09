@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from functools import partial
 from typing import Any, Callable
@@ -9,6 +10,8 @@ import pytest
 
 import polars as pl
 from polars.dependencies import gevent
+
+pytestmark = pytest.mark.slow()
 
 
 async def _aio_collect_async(raises: bool = False) -> pl.DataFrame:
@@ -167,6 +170,7 @@ def test_gevent_collect_async_with_hub(
     _gevent_run(main, raises)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="May time out on Windows")
 @_gevent_collect
 def test_gevent_collect_async_switch(
     get_result: Callable[[], Any], raises: Exception | None

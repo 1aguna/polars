@@ -31,9 +31,14 @@ pub fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
             data_type,
             strict,
         },
-        Expr::Take { expr, idx } => AExpr::Take {
+        Expr::Gather {
+            expr,
+            idx,
+            returns_scalar,
+        } => AExpr::Gather {
             expr: to_aexpr(*expr, arena),
             idx: to_aexpr(*idx, arena),
+            returns_scalar,
         },
         Expr::Sort { expr, options } => AExpr::Sort {
             expr: to_aexpr(*expr, arena),
@@ -74,7 +79,9 @@ pub fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
                 AggExpr::Last(expr) => AAggExpr::Last(to_aexpr(*expr, arena)),
                 AggExpr::Mean(expr) => AAggExpr::Mean(to_aexpr(*expr, arena)),
                 AggExpr::Implode(expr) => AAggExpr::Implode(to_aexpr(*expr, arena)),
-                AggExpr::Count(expr) => AAggExpr::Count(to_aexpr(*expr, arena)),
+                AggExpr::Count(expr, include_nulls) => {
+                    AAggExpr::Count(to_aexpr(*expr, arena), include_nulls)
+                },
                 AggExpr::Quantile {
                     expr,
                     quantile,
@@ -128,12 +135,10 @@ pub fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
         Expr::Window {
             function,
             partition_by,
-            order_by,
             options,
         } => AExpr::Window {
             function: to_aexpr(*function, arena),
             partition_by: to_aexprs(partition_by, arena),
-            order_by: order_by.map(|ob| to_aexpr(*ob, arena)),
             options,
         },
         Expr::Slice {
@@ -146,10 +151,11 @@ pub fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
             length: to_aexpr(*length, arena),
         },
         Expr::Wildcard => AExpr::Wildcard,
-        Expr::Count => AExpr::Count,
+        Expr::Len => AExpr::Len,
         Expr::Nth(i) => AExpr::Nth(i),
-        Expr::KeepName(_) => panic!("no keep_name expected at this point"),
-        Expr::Exclude(_, _) => panic!("no exclude expected at this point"),
+        Expr::SubPlan { .. } => panic!("no SQLSubquery expected at this point"),
+        Expr::KeepName(_) => panic!("no `name.keep` expected at this point"),
+        Expr::Exclude(_, _) => panic!("no `exclude` expected at this point"),
         Expr::RenameAlias { .. } => panic!("no `rename_alias` expected at this point"),
         Expr::Columns { .. } => panic!("no `columns` expected at this point"),
         Expr::DtypeColumn { .. } => panic!("no `dtype-columns` expected at this point"),
@@ -169,29 +175,17 @@ pub fn to_alp(
     let v = match lp {
         LogicalPlan::Scan {
             file_info,
-            path,
+            paths,
             predicate,
             scan_type,
             file_options: options,
         } => ALogicalPlan::Scan {
             file_info,
-            path,
+            paths,
             output_schema: None,
             predicate: predicate.map(|expr| to_aexpr(expr, expr_arena)),
             scan_type,
             file_options: options,
-        },
-        LogicalPlan::AnonymousScan {
-            function,
-            file_info,
-            predicate,
-            options,
-        } => ALogicalPlan::AnonymousScan {
-            function,
-            file_info,
-            output_schema: None,
-            predicate: predicate.map(|expr| to_aexpr(expr, expr_arena)),
-            options,
         },
         #[cfg(feature = "python")]
         LogicalPlan::PythonScan { options } => ALogicalPlan::PythonScan {
@@ -204,6 +198,21 @@ pub fn to_alp(
                 .map(|lp| to_alp(lp, expr_arena, lp_arena))
                 .collect::<PolarsResult<_>>()?;
             ALogicalPlan::Union { inputs, options }
+        },
+        LogicalPlan::HConcat {
+            inputs,
+            schema,
+            options,
+        } => {
+            let inputs = inputs
+                .into_iter()
+                .map(|lp| to_alp(lp, expr_arena, lp_arena))
+                .collect::<PolarsResult<_>>()?;
+            ALogicalPlan::HConcat {
+                inputs,
+                schema,
+                options,
+            }
         },
         LogicalPlan::Selection { input, predicate } => {
             let i = to_alp(*input, expr_arena, lp_arena)?;
@@ -412,12 +421,17 @@ pub fn node_to_expr(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
                 options,
             }
         },
-        AExpr::Take { expr, idx } => {
+        AExpr::Gather {
+            expr,
+            idx,
+            returns_scalar,
+        } => {
             let expr = node_to_expr(expr, expr_arena);
             let idx = node_to_expr(idx, expr_arena);
-            Expr::Take {
+            Expr::Gather {
                 expr: Box::new(expr),
                 idx: Box::new(idx),
+                returns_scalar,
             }
         },
         AExpr::SortBy {
@@ -522,9 +536,9 @@ pub fn node_to_expr(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
                 let exp = node_to_expr(expr, expr_arena);
                 AggExpr::AggGroups(Box::new(exp)).into()
             },
-            AAggExpr::Count(expr) => {
-                let exp = node_to_expr(expr, expr_arena);
-                AggExpr::Count(Box::new(exp)).into()
+            AAggExpr::Count(expr, include_nulls) => {
+                let expr = node_to_expr(expr, expr_arena);
+                AggExpr::Count(Box::new(expr), include_nulls).into()
             },
         },
         AExpr::Ternary {
@@ -565,16 +579,13 @@ pub fn node_to_expr(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
         AExpr::Window {
             function,
             partition_by,
-            order_by,
             options,
         } => {
             let function = Box::new(node_to_expr(function, expr_arena));
             let partition_by = nodes_to_exprs(&partition_by, expr_arena);
-            let order_by = order_by.map(|ob| Box::new(node_to_expr(ob, expr_arena)));
             Expr::Window {
                 function,
                 partition_by,
-                order_by,
                 options,
             }
         },
@@ -587,7 +598,7 @@ pub fn node_to_expr(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
             offset: Box::new(node_to_expr(offset, expr_arena)),
             length: Box::new(node_to_expr(length, expr_arena)),
         },
-        AExpr::Count => Expr::Count,
+        AExpr::Len => Expr::Len,
         AExpr::Nth(i) => Expr::Nth(i),
         AExpr::Wildcard => Expr::Wildcard,
     }
@@ -613,30 +624,18 @@ impl ALogicalPlan {
         };
         match lp {
             ALogicalPlan::Scan {
-                path,
+                paths,
                 file_info,
                 predicate,
                 scan_type,
                 output_schema: _,
                 file_options: options,
             } => LogicalPlan::Scan {
-                path,
+                paths,
                 file_info,
                 predicate: predicate.map(|n| node_to_expr(n, expr_arena)),
                 scan_type,
                 file_options: options,
-            },
-            ALogicalPlan::AnonymousScan {
-                function,
-                file_info,
-                output_schema: _,
-                predicate,
-                options,
-            } => LogicalPlan::AnonymousScan {
-                function,
-                file_info,
-                predicate: predicate.map(|n| node_to_expr(n, expr_arena)),
-                options,
             },
             #[cfg(feature = "python")]
             ALogicalPlan::PythonScan { options, .. } => LogicalPlan::PythonScan { options },
@@ -646,6 +645,21 @@ impl ALogicalPlan {
                     .map(|node| convert_to_lp(node, lp_arena))
                     .collect();
                 LogicalPlan::Union { inputs, options }
+            },
+            ALogicalPlan::HConcat {
+                inputs,
+                schema,
+                options,
+            } => {
+                let inputs = inputs
+                    .into_iter()
+                    .map(|node| convert_to_lp(node, lp_arena))
+                    .collect();
+                LogicalPlan::HConcat {
+                    inputs,
+                    schema: schema.clone(),
+                    options,
+                }
             },
             ALogicalPlan::Slice { input, offset, len } => {
                 let lp = convert_to_lp(input, lp_arena);

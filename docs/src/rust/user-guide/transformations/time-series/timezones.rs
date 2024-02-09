@@ -8,14 +8,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tz_naive = Series::new("tz_naive", &ts);
     let time_zones_df = DataFrame::new(vec![tz_naive])?
         .lazy()
-        .select([col("tz_naive").str().strptime(
-            DataType::Datetime(TimeUnit::Milliseconds, None),
+        .select([col("tz_naive").str().to_datetime(
+            Some(TimeUnit::Milliseconds),
+            None,
             StrptimeOptions::default(),
             lit("raise"),
         )])
         .with_columns([col("tz_naive")
             .dt()
-            .replace_time_zone(Some("UTC".to_string()), None)
+            .replace_time_zone(Some("UTC".to_string()), lit("raise"))
             .alias("tz_aware")])
         .collect()?;
 
@@ -28,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .select([
             col("tz_aware")
                 .dt()
-                .replace_time_zone(Some("Europe/Brussels".to_string()), None)
+                .replace_time_zone(Some("Europe/Brussels".to_string()), lit("raise"))
                 .alias("replace time zone"),
             col("tz_aware")
                 .dt()
@@ -36,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .alias("convert time zone"),
             col("tz_aware")
                 .dt()
-                .replace_time_zone(None, None)
+                .replace_time_zone(None, lit("raise"))
                 .alias("unset time zone"),
         ])
         .collect()?;

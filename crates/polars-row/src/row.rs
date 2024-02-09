@@ -1,5 +1,6 @@
-use arrow::array::BinaryArray;
-use arrow::datatypes::DataType;
+use arrow::array::{BinaryArray, BinaryViewArray};
+use arrow::compute::cast::binary_to_binview;
+use arrow::datatypes::ArrowDataType;
 use arrow::ffi::mmap;
 use arrow::offset::{Offsets, OffsetsBuffer};
 
@@ -38,7 +39,7 @@ unsafe fn rows_to_array(buf: Vec<u8>, offsets: Vec<usize>) -> BinaryArray<i64> {
     // Safety: monotonically increasing
     let offsets = Offsets::new_unchecked(offsets);
 
-    BinaryArray::new(DataType::LargeBinary, offsets.into(), buf.into(), None)
+    BinaryArray::new(ArrowDataType::LargeBinary, offsets.into(), buf.into(), None)
 }
 
 impl RowsEncoded {
@@ -70,12 +71,18 @@ impl RowsEncoded {
             let (_, offsets, _) = mmap::slice(offsets).into_inner();
             let offsets = OffsetsBuffer::new_unchecked(offsets);
 
-            BinaryArray::new(DataType::LargeBinary, offsets, values, None)
+            BinaryArray::new(ArrowDataType::LargeBinary, offsets, values, None)
         }
     }
 
+    /// This conversion is free.
     pub fn into_array(self) -> BinaryArray<i64> {
         unsafe { rows_to_array(self.values, self.offsets) }
+    }
+
+    /// This does allocate views.
+    pub fn into_binview(self) -> BinaryViewArray {
+        binary_to_binview(&self.into_array())
     }
 
     #[cfg(test)]

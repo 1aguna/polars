@@ -5,7 +5,7 @@ use ahash::RandomState;
 use super::{private, IntoSeries, SeriesTrait, *};
 use crate::chunked_array::comparison::*;
 use crate::chunked_array::ops::compare_inner::{
-    IntoPartialEqInner, IntoPartialOrdInner, PartialEqInner, PartialOrdInner,
+    IntoTotalEqInner, IntoTotalOrdInner, TotalEqInner, TotalOrdInner,
 };
 use crate::chunked_array::ops::explode::ExplodeByOffsets;
 use crate::chunked_array::AsSinglePtr;
@@ -42,11 +42,11 @@ impl private::PrivateSeries for SeriesWrap<BinaryChunked> {
     fn zip_with_same_type(&self, mask: &BooleanChunked, other: &Series) -> PolarsResult<Series> {
         ChunkZip::zip_with(&self.0, mask, other.as_ref().as_ref()).map(|ca| ca.into_series())
     }
-    fn into_partial_eq_inner<'a>(&'a self) -> Box<dyn PartialEqInner + 'a> {
-        (&self.0).into_partial_eq_inner()
+    fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
+        (&self.0).into_total_eq_inner()
     }
-    fn into_partial_ord_inner<'a>(&'a self) -> Box<dyn PartialOrdInner + 'a> {
-        (&self.0).into_partial_ord_inner()
+    fn into_total_ord_inner<'a>(&'a self) -> Box<dyn TotalOrdInner + 'a> {
+        (&self.0).into_total_ord_inner()
     }
 
     fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
@@ -62,6 +62,16 @@ impl private::PrivateSeries for SeriesWrap<BinaryChunked> {
     #[cfg(feature = "algorithm_group_by")]
     unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         self.0.agg_list(groups)
+    }
+
+    #[cfg(feature = "algorithm_group_by")]
+    unsafe fn agg_min(&self, groups: &GroupsProxy) -> Series {
+        self.0.agg_min(groups)
+    }
+
+    #[cfg(feature = "algorithm_group_by")]
+    unsafe fn agg_max(&self, groups: &GroupsProxy) -> Series {
+        self.0.agg_max(groups)
     }
 
     fn subtract(&self, rhs: &Series) -> PolarsResult<Series> {
@@ -130,16 +140,6 @@ impl SeriesTrait for SeriesWrap<BinaryChunked> {
 
     fn filter(&self, filter: &BooleanChunked) -> PolarsResult<Series> {
         ChunkFilter::filter(&self.0, filter).map(|ca| ca.into_series())
-    }
-
-    #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
-        self.0.take_chunked_unchecked(by, sorted).into_series()
-    }
-
-    #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_opt_chunked_unchecked(&self, by: &[Option<ChunkId>]) -> Series {
-        self.0.take_opt_chunked_unchecked(by).into_series()
     }
 
     fn take(&self, indices: &IdxCa) -> PolarsResult<Series> {
@@ -234,26 +234,13 @@ impl SeriesTrait for SeriesWrap<BinaryChunked> {
         ChunkShift::shift(&self.0, periods).into_series()
     }
 
-    fn _sum_as_series(&self) -> Series {
-        ChunkAggSeries::sum_as_series(&self.0)
+    fn max_as_series(&self) -> PolarsResult<Series> {
+        Ok(ChunkAggSeries::max_as_series(&self.0))
     }
-    fn max_as_series(&self) -> Series {
-        ChunkAggSeries::max_as_series(&self.0)
-    }
-    fn min_as_series(&self) -> Series {
-        ChunkAggSeries::min_as_series(&self.0)
+    fn min_as_series(&self) -> PolarsResult<Series> {
+        Ok(ChunkAggSeries::min_as_series(&self.0))
     }
     fn clone_inner(&self) -> Arc<dyn SeriesTrait> {
         Arc::new(SeriesWrap(Clone::clone(&self.0)))
-    }
-
-    #[cfg(feature = "repeat_by")]
-    fn repeat_by(&self, by: &IdxCa) -> PolarsResult<ListChunked> {
-        RepeatBy::repeat_by(&self.0, by)
-    }
-
-    #[cfg(feature = "mode")]
-    fn mode(&self) -> PolarsResult<Series> {
-        Ok(self.0.mode()?.into_series())
     }
 }

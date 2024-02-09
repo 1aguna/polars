@@ -1,6 +1,7 @@
+use arrow::array::MutableBinaryArray;
 use once_cell::sync::Lazy;
-use polars_arrow::export::arrow::array::MutableBinaryArray;
 use polars_core::export::once_cell;
+use polars_utils::hashing::hash_to_partition;
 
 use super::*;
 use crate::pipeline::PARTITION_SIZE;
@@ -68,8 +69,12 @@ impl SpillPartitions {
             .map(|_| MutableBinaryArray::with_capacity(OB_SIZE))
             .collect();
 
-        let hash_partitioned = vec![Vec::with_capacity(OB_SIZE); PARTITION_SIZE];
-        let chunk_index_partitioned = vec![Vec::with_capacity(OB_SIZE); PARTITION_SIZE];
+        let hash_partitioned = (0..PARTITION_SIZE)
+            .map(|_| Vec::with_capacity(OB_SIZE))
+            .collect::<Vec<_>>();
+        let chunk_index_partitioned = (0..PARTITION_SIZE)
+            .map(|_| Vec::with_capacity(OB_SIZE))
+            .collect::<Vec<_>>();
 
         Self {
             keys_partitioned,

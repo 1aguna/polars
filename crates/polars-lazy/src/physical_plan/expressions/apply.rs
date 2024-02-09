@@ -5,9 +5,9 @@ use polars_core::frame::group_by::GroupsProxy;
 use polars_core::prelude::*;
 use polars_core::POOL;
 #[cfg(feature = "parquet")]
-use polars_io::parquet::predicates::BatchStats;
-#[cfg(feature = "parquet")]
-use polars_io::predicates::StatsEvaluator;
+use polars_io::predicates::{BatchStats, StatsEvaluator};
+#[cfg(feature = "is_between")]
+use polars_ops::prelude::ClosedInterval;
 #[cfg(feature = "parquet")]
 use polars_plan::dsl::FunctionExpr;
 use rayon::prelude::*;
@@ -16,20 +16,48 @@ use crate::physical_plan::state::ExecutionState;
 use crate::prelude::*;
 
 pub struct ApplyExpr {
-    pub inputs: Vec<Arc<dyn PhysicalExpr>>,
-    pub function: SpecialEq<Arc<dyn SeriesUdf>>,
-    pub expr: Expr,
-    pub collect_groups: ApplyOptions,
-    pub auto_explode: bool,
-    pub allow_rename: bool,
-    pub pass_name_to_apply: bool,
-    pub input_schema: Option<SchemaRef>,
-    pub allow_threading: bool,
-    pub check_lengths: bool,
-    pub allow_group_aware: bool,
+    inputs: Vec<Arc<dyn PhysicalExpr>>,
+    function: SpecialEq<Arc<dyn SeriesUdf>>,
+    expr: Expr,
+    collect_groups: ApplyOptions,
+    returns_scalar: bool,
+    allow_rename: bool,
+    pass_name_to_apply: bool,
+    input_schema: Option<SchemaRef>,
+    allow_threading: bool,
+    check_lengths: bool,
+    allow_group_aware: bool,
 }
 
 impl ApplyExpr {
+    pub(crate) fn new(
+        inputs: Vec<Arc<dyn PhysicalExpr>>,
+        function: SpecialEq<Arc<dyn SeriesUdf>>,
+        expr: Expr,
+        options: FunctionOptions,
+        allow_threading: bool,
+        input_schema: Option<SchemaRef>,
+    ) -> Self {
+        #[cfg(debug_assertions)]
+        if matches!(options.collect_groups, ApplyOptions::ElementWise) && options.returns_scalar {
+            panic!("expr {} is not implemented correctly. 'returns_scalar' and 'elementwise' are mutually exclusive", expr)
+        }
+
+        Self {
+            inputs,
+            function,
+            expr,
+            collect_groups: options.collect_groups,
+            returns_scalar: options.returns_scalar,
+            allow_rename: options.allow_rename,
+            pass_name_to_apply: options.pass_name_to_apply,
+            input_schema,
+            allow_threading,
+            check_lengths: options.check_lengths(),
+            allow_group_aware: options.allow_group_aware,
+        }
+    }
+
     pub(crate) fn new_minimal(
         inputs: Vec<Arc<dyn PhysicalExpr>>,
         function: SpecialEq<Arc<dyn SeriesUdf>>,
@@ -41,7 +69,7 @@ impl ApplyExpr {
             function,
             expr,
             collect_groups,
-            auto_explode: false,
+            returns_scalar: false,
             allow_rename: false,
             pass_name_to_apply: false,
             input_schema: None,
@@ -72,13 +100,15 @@ impl ApplyExpr {
         ca: ListChunked,
     ) -> PolarsResult<AggregationContext<'a>> {
         let all_unit_len = all_unit_length(&ca);
-        if all_unit_len && self.auto_explode {
-            ac.with_series(ca.explode().unwrap().into_series(), true, Some(&self.expr))?;
-            ac.update_groups = UpdateGroups::No;
+        if all_unit_len && self.returns_scalar {
+            ac.with_agg_state(AggState::AggregatedScalar(
+                ca.explode().unwrap().into_series(),
+            ));
         } else {
             ac.with_series(ca.into_series(), true, Some(&self.expr))?;
             ac.with_update_groups(UpdateGroups::WithSeriesLen);
         }
+
         Ok(ac)
     }
 
@@ -105,7 +135,7 @@ impl ApplyExpr {
         let s = ac.series();
 
         polars_ensure!(
-            !matches!(ac.agg_state(), AggState::AggregatedFlat(_)),
+            !matches!(ac.agg_state(), AggState::AggregatedScalar(_)),
             expr = self.expr,
             ComputeError: "cannot aggregate, the column is already aggregated",
         );
@@ -164,11 +194,14 @@ impl ApplyExpr {
                 let out = ca.apply_to_inner(&|s| self.eval_and_flatten(&mut [s]))?;
                 (out.into_series(), true)
             },
-            AggState::AggregatedFlat(s) => (self.eval_and_flatten(&mut [s.clone()])?, true),
-            AggState::NotAggregated(s) | AggState::Literal(s) => {
+            AggState::NotAggregated(s) => {
                 let (out, aggregated) = (self.eval_and_flatten(&mut [s.clone()])?, false);
                 check_map_output_len(s.len(), out.len(), &self.expr)?;
                 (out, aggregated)
+            },
+            agg_state => {
+                ac.with_agg_state(agg_state.try_map(|s| self.eval_and_flatten(&mut [s.clone()]))?);
+                return Ok(ac);
             },
         };
 
@@ -197,12 +230,27 @@ impl ApplyExpr {
         let len = iters[0].size_hint().0;
 
         if len == 0 {
-            let out = Series::full_null(field.name(), 0, &field.dtype);
             drop(iters);
 
             // Take the first aggregation context that as that is the input series.
             let mut ac = acs.swap_remove(0);
-            ac.with_series(out, true, Some(&self.expr))?;
+            ac.with_update_groups(UpdateGroups::No);
+
+            let agg_state = if self.returns_scalar {
+                AggState::AggregatedScalar(Series::new_empty(field.name(), &field.dtype))
+            } else {
+                match self.collect_groups {
+                    ApplyOptions::ElementWise | ApplyOptions::ApplyList => ac
+                        .agg_state()
+                        .map(|_| Series::new_empty(field.name(), &field.dtype)),
+                    ApplyOptions::GroupWise => AggState::AggregatedList(Series::new_empty(
+                        field.name(),
+                        &DataType::List(Box::new(field.dtype.clone())),
+                    )),
+                }
+            };
+
+            ac.with_agg_state(agg_state);
             return Ok(ac);
         }
 
@@ -239,7 +287,7 @@ fn check_map_output_len(input_len: usize, output_len: usize, expr: &Expr) -> Pol
     polars_ensure!(
         input_len == output_len, expr = expr, InvalidOperation:
         "output length of `map` ({}) must be equal to the input length ({}); \
-        consider using `apply` instead", input_len, output_len
+        consider using `apply` instead", output_len, input_len
     );
     Ok(())
 }
@@ -291,8 +339,8 @@ impl PhysicalExpr for ApplyExpr {
                     ac.with_series(s, true, Some(&self.expr))?;
                     Ok(ac)
                 },
-                ApplyOptions::ApplyGroups => self.apply_single_group_aware(ac),
-                ApplyOptions::ApplyFlat => self.apply_single_elementwise(ac),
+                ApplyOptions::GroupWise => self.apply_single_group_aware(ac),
+                ApplyOptions::ElementWise => self.apply_single_elementwise(ac),
             }
         } else {
             let mut acs = self.prepare_multiple_inputs(df, groups, state)?;
@@ -307,8 +355,8 @@ impl PhysicalExpr for ApplyExpr {
                     ac.with_series(s, true, Some(&self.expr))?;
                     Ok(ac)
                 },
-                ApplyOptions::ApplyGroups => self.apply_multiple_group_aware(acs, df),
-                ApplyOptions::ApplyFlat => {
+                ApplyOptions::GroupWise => self.apply_multiple_group_aware(acs, df),
+                ApplyOptions::ElementWise => {
                     if acs
                         .iter()
                         .any(|ac| matches!(ac.agg_state(), AggState::AggregatedList(_)))
@@ -329,9 +377,6 @@ impl PhysicalExpr for ApplyExpr {
     fn to_field(&self, input_schema: &Schema) -> PolarsResult<Field> {
         self.expr.to_field(input_schema, Context::Default)
     }
-    fn is_valid_aggregation(&self) -> bool {
-        matches!(self.collect_groups, ApplyOptions::ApplyGroups)
-    }
     #[cfg(feature = "parquet")]
     fn as_stats_evaluator(&self) -> Option<&dyn polars_io::predicates::StatsEvaluator> {
         let function = match &self.expr {
@@ -343,11 +388,14 @@ impl PhysicalExpr for ApplyExpr {
             FunctionExpr::Boolean(BooleanFunction::IsNull) => Some(self),
             #[cfg(feature = "is_in")]
             FunctionExpr::Boolean(BooleanFunction::IsIn) => Some(self),
+            #[cfg(feature = "is_between")]
+            FunctionExpr::Boolean(BooleanFunction::IsBetween { closed: _ }) => Some(self),
+            FunctionExpr::Boolean(BooleanFunction::IsNotNull) => Some(self),
             _ => None,
         }
     }
     fn as_partitioned_aggregator(&self) -> Option<&dyn PartitionedAggregation> {
-        if self.inputs.len() == 1 && matches!(self.collect_groups, ApplyOptions::ApplyFlat) {
+        if self.inputs.len() == 1 && matches!(self.collect_groups, ApplyOptions::ElementWise) {
             Some(self)
         } else {
             None
@@ -382,7 +430,8 @@ fn apply_multiple_elementwise<'a>(
             ac.with_series(out.into_series(), true, None)?;
             Ok(ac)
         },
-        _ => {
+        first_as => {
+            let check_lengths = check_lengths && !matches!(first_as, AggState::Literal(_));
             let mut s = acs
                 .iter_mut()
                 .enumerate()
@@ -454,6 +503,23 @@ impl ApplyExpr {
                     None => Ok(true),
                 }
             },
+            FunctionExpr::Boolean(BooleanFunction::IsNotNull) => {
+                let root = expr_to_leaf_column_name(&self.expr)?;
+
+                match stats.get_stats(&root).ok() {
+                    Some(st) => match st.null_count() {
+                        Some(null_count)
+                            if stats
+                                .num_rows()
+                                .map_or(false, |num_rows| num_rows == null_count) =>
+                        {
+                            Ok(false)
+                        },
+                        _ => Ok(true),
+                    },
+                    None => Ok(true),
+                }
+            },
             #[cfg(feature = "is_in")]
             FunctionExpr::Boolean(BooleanFunction::IsIn) => {
                 let should_read = || -> Option<bool> {
@@ -467,9 +533,73 @@ impl ApplyExpr {
                     let min = st.to_min()?;
                     let max = st.to_max()?;
 
-                    let all_smaller = || Some(ChunkCompare::lt(input, &min).ok()?.all());
-                    let all_bigger = || Some(ChunkCompare::gt(input, &max).ok()?.all());
-                    Some(!all_smaller()? && !all_bigger()?)
+                    if max.get(0).unwrap() == min.get(0).unwrap() {
+                        let one_equals =
+                            |value: &Series| Some(ChunkCompare::equal(input, value).ok()?.any());
+                        return one_equals(min);
+                    }
+
+                    let smaller = ChunkCompare::lt(input, min).ok()?;
+                    let bigger = ChunkCompare::gt(input, max).ok()?;
+
+                    Some(!(smaller | bigger).all())
+                };
+
+                Ok(should_read().unwrap_or(true))
+            },
+            #[cfg(feature = "is_between")]
+            FunctionExpr::Boolean(BooleanFunction::IsBetween { closed }) => {
+                let should_read = || -> Option<bool> {
+                    let root: Arc<str> = expr_to_leaf_column_name(&input[0]).ok()?;
+                    let Expr::Literal(left) = &input[1] else {
+                        return None;
+                    };
+                    let Expr::Literal(right) = &input[2] else {
+                        return None;
+                    };
+
+                    let st = stats.get_stats(&root).ok()?;
+                    let min = st.to_min()?;
+                    let max = st.to_max()?;
+
+                    let (left, left_dtype) = (left.to_any_value()?, left.get_datatype());
+                    let (right, right_dtype) = (right.to_any_value()?, right.get_datatype());
+
+                    let left =
+                        Series::from_any_values_and_dtype("", &[left], &left_dtype, false).ok()?;
+                    let right =
+                        Series::from_any_values_and_dtype("", &[right], &right_dtype, false)
+                            .ok()?;
+
+                    // don't read the row_group anyways as
+                    // the condition will evaluate to false.
+                    // e.g. in_between(10, 5)
+                    if ChunkCompare::gt(&left, &right).ok()?.all() {
+                        return Some(false);
+                    }
+
+                    let (left_open, right_open) = match closed {
+                        ClosedInterval::None => (true, true),
+                        ClosedInterval::Both => (false, false),
+                        ClosedInterval::Left => (false, true),
+                        ClosedInterval::Right => (true, false),
+                    };
+                    // check the right limit of the interval.
+                    // if the end is open, we should be stricter (lt_eq instead of lt).
+                    if right_open && ChunkCompare::lt_eq(&right, min).ok()?.all()
+                        || !right_open && ChunkCompare::lt(&right, min).ok()?.all()
+                    {
+                        return Some(false);
+                    }
+                    // we couldn't conclude anything using the right limit,
+                    // check the left limit of the interval
+                    if left_open && ChunkCompare::gt_eq(&left, max).ok()?.all()
+                        || !left_open && ChunkCompare::gt(&left, max).ok()?.all()
+                    {
+                        return Some(false);
+                    }
+                    // read the row_group
+                    Some(true)
                 };
 
                 Ok(should_read().unwrap_or(true))

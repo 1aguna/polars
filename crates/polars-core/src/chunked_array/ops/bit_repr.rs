@@ -45,7 +45,7 @@ fn reinterpret_list_chunked<T: PolarsNumericType, U: PolarsNumericType>(
         let pa =
             PrimitiveArray::from_data_default(reinterpreted_buf, inner_arr.validity().cloned());
         LargeListArray::new(
-            DataType::List(Box::new(U::get_dtype())).to_arrow(),
+            DataType::List(Box::new(U::get_dtype())).to_arrow(true),
             array.offsets().clone(),
             pa.to_boxed(),
             array.validity().cloned(),
@@ -246,7 +246,7 @@ impl UInt32Chunked {
 /// Used to save compilation paths. Use carefully. Although this is safe,
 /// if misused it can lead to incorrect results.
 impl Float32Chunked {
-    pub(crate) fn apply_as_ints<F>(&self, f: F) -> Series
+    pub fn apply_as_ints<F>(&self, f: F) -> Series
     where
         F: Fn(&Series) -> Series,
     {
@@ -257,7 +257,7 @@ impl Float32Chunked {
     }
 }
 impl Float64Chunked {
-    pub(crate) fn apply_as_ints<F>(&self, f: F) -> Series
+    pub fn apply_as_ints<F>(&self, f: F) -> Series
     where
         F: Fn(&Series) -> Series,
     {

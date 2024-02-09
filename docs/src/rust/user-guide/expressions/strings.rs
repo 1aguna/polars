@@ -12,8 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .lazy()
         .select([
-            col("animal").str().lengths().alias("byte_count"),
-            col("animal").str().n_chars().alias("letter_count"),
+            col("animal").str().len_bytes().alias("byte_count"),
+            col("animal").str().len_chars().alias("letter_count"),
         ])
         .collect()?;
 
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = df
         .clone()
         .lazy()
-        .select([col("a").str().extract(r"candidate=(\w+)", 1)])
+        .select([col("a").str().extract(lit(r"candidate=(\w+)"), 1)])
         .collect()?;
     println!("{}", &out);
     // --8<-- [end:extract]

@@ -8,7 +8,6 @@ from polars import functions as F
 from polars.datatypes import (
     FLOAT_DTYPES,
     INTEGER_DTYPES,
-    NUMERIC_DTYPES,
     Date,
     Datetime,
     Float64,
@@ -79,7 +78,7 @@ class _XLFormatCache:
 
 def _adjacent_cols(df: DataFrame, cols: Iterable[str], min_max: dict[str, Any]) -> bool:
     """Indicate if the given columns are all adjacent to one another."""
-    idxs = sorted(df.find_idx_by_name(col) for col in cols)
+    idxs = sorted(df.get_column_index(col) for col in cols)
     if idxs != sorted(range(min(idxs), max(idxs) + 1)):
         return False
     else:
@@ -90,7 +89,7 @@ def _adjacent_cols(df: DataFrame, cols: Iterable[str], min_max: dict[str, Any]) 
 
 
 def _unpack_multi_column_dict(
-    d: dict[str | Sequence[str], Any] | Any
+    d: dict[str | Sequence[str], Any] | Any,
 ) -> dict[str, Any] | Any:
     """Unpack multi-col dictionary into equivalent single-col definitions."""
     if not isinstance(d, dict):
@@ -110,7 +109,7 @@ def _xl_apply_conditional_formats(
     *,
     conditional_formats: ConditionalFormatDict,
     table_start: tuple[int, int],
-    has_header: bool,
+    include_header: bool,
     format_cache: _XLFormatCache,
 ) -> None:
     """Take all conditional formatting options and apply them to the table/range."""
@@ -129,17 +128,17 @@ def _xl_apply_conditional_formats(
                 fmt = {"type": fmt}
             if isinstance(cols, str):
                 col_range = _xl_column_range(
-                    df, table_start, cols, has_header=has_header
+                    df, table_start, cols, include_header=include_header
                 )
             else:
                 col_range = _xl_column_multi_range(
-                    df, table_start, cols, has_header=has_header
+                    df, table_start, cols, include_header=include_header
                 )
                 if " " in col_range:
                     col = next(iter(cols))
                     fmt["multi_range"] = col_range
                     col_range = _xl_column_range(
-                        df, table_start, col, has_header=has_header
+                        df, table_start, col, include_header=include_header
                     )
 
             if "format" in fmt:
@@ -160,7 +159,7 @@ def _xl_column_range(
     table_start: tuple[int, int],
     col: str | tuple[int, int],
     *,
-    has_header: bool,
+    include_header: bool,
     as_range: Literal[True] = ...,
 ) -> str:
     ...
@@ -172,7 +171,7 @@ def _xl_column_range(
     table_start: tuple[int, int],
     col: str | tuple[int, int],
     *,
-    has_header: bool,
+    include_header: bool,
     as_range: Literal[False],
 ) -> tuple[int, int, int, int]:
     ...
@@ -183,13 +182,13 @@ def _xl_column_range(
     table_start: tuple[int, int],
     col: str | tuple[int, int],
     *,
-    has_header: bool,
+    include_header: bool,
     as_range: bool = True,
 ) -> tuple[int, int, int, int] | str:
     """Return the excel sheet range of a named column, accounting for all offsets."""
     col_start = (
-        table_start[0] + int(has_header),
-        table_start[1] + df.find_idx_by_name(col) if isinstance(col, str) else col[0],
+        table_start[0] + int(include_header),
+        table_start[1] + df.get_column_index(col) if isinstance(col, str) else col[0],
     )
     col_finish = (
         col_start[0] + len(df) - 1,
@@ -206,16 +205,20 @@ def _xl_column_multi_range(
     table_start: tuple[int, int],
     cols: Iterable[str],
     *,
-    has_header: bool,
+    include_header: bool,
 ) -> str:
     """Return column ranges as an xlsxwriter 'multi_range' string, or spanning range."""
     m: dict[str, Any] = {}
     if _adjacent_cols(df, cols, min_max=m):
         return _xl_column_range(
-            df, table_start, (m["min"]["idx"], m["max"]["idx"]), has_header=has_header
+            df,
+            table_start,
+            (m["min"]["idx"], m["max"]["idx"]),
+            include_header=include_header,
         )
     return " ".join(
-        _xl_column_range(df, table_start, col, has_header=has_header) for col in cols
+        _xl_column_range(df, table_start, col, include_header=include_header)
+        for col in cols
     )
 
 
@@ -229,7 +232,8 @@ def _xl_inject_dummy_table_columns(
 
     for col, definition in options.items():
         if col in df_original_columns:
-            raise DuplicateError(f"cannot create a second {col!r} column")
+            msg = f"cannot create a second {col!r} column"
+            raise DuplicateError(msg)
         elif not isinstance(definition, dict):
             df_select_cols.append(col)
         else:
@@ -272,7 +276,7 @@ def _xl_inject_sparklines(
     table_start: tuple[int, int],
     col: str,
     *,
-    has_header: bool,
+    include_header: bool,
     params: Sequence[str] | dict[str, Any],
 ) -> None:
     """Inject sparklines into (previously-created) empty table columns."""
@@ -281,12 +285,14 @@ def _xl_inject_sparklines(
     m: dict[str, Any] = {}
     data_cols = params.get("columns") if isinstance(params, dict) else params
     if not data_cols:
-        raise ValueError("supplying 'columns' param value is mandatory for sparklines")
+        msg = "supplying 'columns' param value is mandatory for sparklines"
+        raise ValueError(msg)
     elif not _adjacent_cols(df, data_cols, min_max=m):
-        raise RuntimeError("sparkline data range/cols must all be adjacent")
+        msg = "sparkline data range/cols must all be adjacent"
+        raise RuntimeError(msg)
 
     spk_row, spk_col, _, _ = _xl_column_range(
-        df, table_start, col, has_header=has_header, as_range=False
+        df, table_start, col, include_header=include_header, as_range=False
     )
     data_start_col = table_start[1] + m["min"]["idx"]
     data_end_col = table_start[1] + m["max"]["idx"]
@@ -367,9 +373,7 @@ def _xl_setup_table_columns(
     if not row_totals:
         row_total_funcs = {}
     else:
-        numeric_cols = {
-            col for col, tp in df.schema.items() if tp.base_type() in NUMERIC_DTYPES
-        }
+        numeric_cols = {col for col, tp in df.schema.items() if tp.is_numeric()}
         if not isinstance(row_totals, dict):
             sum_cols = (
                 numeric_cols
@@ -409,9 +413,8 @@ def _xl_setup_table_columns(
             dtype_formats.update(dict.fromkeys(tp, dtype_formats.pop(tp)))
     for fmt in dtype_formats.values():
         if not isinstance(fmt, str):
-            raise TypeError(
-                f"invalid dtype_format value: {fmt!r} (expected format string, got {type(fmt).__name__!r})"
-            )
+            msg = f"invalid dtype_format value: {fmt!r} (expected format string, got {type(fmt).__name__!r})"
+            raise TypeError(msg)
 
     # inject sparkline/row-total placeholder(s)
     if sparklines:
@@ -446,7 +449,7 @@ def _xl_setup_table_columns(
         if base_type in dtype_formats:
             fmt = dtype_formats.get(tp, dtype_formats[base_type])
             column_formats.setdefault(col, fmt)
-        if base_type in NUMERIC_DTYPES:
+        if base_type.is_numeric():
             if column_totals is True:
                 column_total_funcs.setdefault(col, "sum")
             elif isinstance(column_totals, str):
@@ -494,7 +497,7 @@ def _xl_setup_table_columns(
 
 
 def _xl_setup_table_options(
-    table_style: dict[str, Any] | str | None
+    table_style: dict[str, Any] | str | None,
 ) -> tuple[dict[str, Any] | str | None, dict[str, Any]]:
     """Setup table options, distinguishing style name from other formatting."""
     if isinstance(table_style, dict):
@@ -507,7 +510,8 @@ def _xl_setup_table_options(
         )
         for key in table_style:
             if key not in valid_options:
-                raise ValueError(f"invalid table style key: {key!r}")
+                msg = f"invalid table style key: {key!r}"
+                raise ValueError(msg)
 
         table_options = table_style.copy()
         table_style = table_options.pop("style", None)

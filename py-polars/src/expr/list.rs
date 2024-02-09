@@ -49,12 +49,16 @@ impl PyExpr {
         self.inner.clone().list().get(index.inner).into()
     }
 
-    fn list_join(&self, separator: PyExpr) -> Self {
-        self.inner.clone().list().join(separator.inner).into()
+    fn list_join(&self, separator: PyExpr, ignore_nulls: bool) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .join(separator.inner, ignore_nulls)
+            .into()
     }
 
-    fn list_lengths(&self) -> Self {
-        self.inner.clone().list().lengths().into()
+    fn list_len(&self) -> Self {
+        self.inner.clone().list().len().into()
     }
 
     fn list_max(&self) -> Self {
@@ -70,6 +74,33 @@ impl PyExpr {
             .into()
     }
 
+    fn list_median(&self) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .median()
+            .with_fmt("list.median")
+            .into()
+    }
+
+    fn list_std(&self, ddof: u8) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .std(ddof)
+            .with_fmt("list.std")
+            .into()
+    }
+
+    fn list_var(&self, ddof: u8) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .var(ddof)
+            .with_fmt("list.var")
+            .into()
+    }
+
     fn list_min(&self) -> Self {
         self.inner.clone().list().min().into()
     }
@@ -78,8 +109,8 @@ impl PyExpr {
         self.inner.clone().list().reverse().into()
     }
 
-    fn list_shift(&self, periods: i64) -> Self {
-        self.inner.clone().list().shift(periods).into()
+    fn list_shift(&self, periods: PyExpr) -> Self {
+        self.inner.clone().list().shift(periods.inner).into()
     }
 
     fn list_slice(&self, offset: PyExpr, length: Option<PyExpr>) -> Self {
@@ -94,15 +125,15 @@ impl PyExpr {
         self.inner.clone().list().tail(n.inner).into()
     }
 
-    fn list_sort(&self, descending: bool) -> Self {
+    fn list_sort(&self, descending: bool, nulls_last: bool) -> Self {
         self.inner
             .clone()
             .list()
             .sort(SortOptions {
                 descending,
+                nulls_last,
                 ..Default::default()
             })
-            .with_fmt("list.sort")
             .into()
     }
 
@@ -110,13 +141,61 @@ impl PyExpr {
         self.inner.clone().list().sum().with_fmt("list.sum").into()
     }
 
-    #[cfg(feature = "list_take")]
-    fn list_take(&self, index: PyExpr, null_on_oob: bool) -> Self {
+    #[cfg(feature = "list_drop_nulls")]
+    fn list_drop_nulls(&self) -> Self {
+        self.inner.clone().list().drop_nulls().into()
+    }
+
+    #[cfg(feature = "list_sample")]
+    fn list_sample_n(
+        &self,
+        n: PyExpr,
+        with_replacement: bool,
+        shuffle: bool,
+        seed: Option<u64>,
+    ) -> Self {
         self.inner
             .clone()
             .list()
-            .take(index.inner, null_on_oob)
+            .sample_n(n.inner, with_replacement, shuffle, seed)
             .into()
+    }
+
+    #[cfg(feature = "list_sample")]
+    fn list_sample_fraction(
+        &self,
+        fraction: PyExpr,
+        with_replacement: bool,
+        shuffle: bool,
+        seed: Option<u64>,
+    ) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .sample_fraction(fraction.inner, with_replacement, shuffle, seed)
+            .into()
+    }
+
+    #[cfg(feature = "list_gather")]
+    fn list_gather(&self, index: PyExpr, null_on_oob: bool) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .gather(index.inner, null_on_oob)
+            .into()
+    }
+
+    #[cfg(feature = "list_gather")]
+    fn list_gather_every(&self, n: PyExpr, offset: PyExpr) -> Self {
+        self.inner
+            .clone()
+            .list()
+            .gather_every(n.inner, offset.inner)
+            .into()
+    }
+
+    fn list_to_array(&self, width: usize) -> Self {
+        self.inner.clone().list().to_array(width).into()
     }
 
     #[pyo3(signature = (width_strat, name_gen, upper_bound))]
@@ -142,6 +221,10 @@ impl PyExpr {
             .list()
             .to_struct(width_strat.0, name_gen, upper_bound)
             .into())
+    }
+
+    fn list_n_unique(&self) -> Self {
+        self.inner.clone().list().n_unique().into()
     }
 
     fn list_unique(&self, maintain_order: bool) -> Self {

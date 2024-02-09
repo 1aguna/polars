@@ -8,7 +8,7 @@ from polars import functions as F
 from polars.functions.range._utils import parse_interval_argument
 from polars.utils._parse_expr_input import parse_as_expression
 from polars.utils._wrap import wrap_expr
-from polars.utils.deprecation import issue_deprecation_warning
+from polars.utils.deprecation import deprecate_saturating
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
@@ -18,56 +18,52 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from polars import Expr, Series
-    from polars.type_aliases import ClosedInterval, IntoExpr
+    from polars.type_aliases import ClosedInterval, IntoExprColumn
 
 
 @overload
 def time_range(
-    start: time | IntoExpr | None = ...,
-    end: time | IntoExpr | None = ...,
+    start: time | IntoExprColumn | None = ...,
+    end: time | IntoExprColumn | None = ...,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
     eager: Literal[False] = ...,
-    name: str | None = ...,
 ) -> Expr:
     ...
 
 
 @overload
 def time_range(
-    start: time | IntoExpr | None = ...,
-    end: time | IntoExpr | None = ...,
+    start: time | IntoExprColumn | None = ...,
+    end: time | IntoExprColumn | None = ...,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
     eager: Literal[True],
-    name: str | None = ...,
 ) -> Series:
     ...
 
 
 @overload
 def time_range(
-    start: time | IntoExpr | None = ...,
-    end: time | IntoExpr | None = ...,
+    start: time | IntoExprColumn | None = ...,
+    end: time | IntoExprColumn | None = ...,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
     eager: bool,
-    name: str | None = ...,
 ) -> Series | Expr:
     ...
 
 
 def time_range(
-    start: time | IntoExpr | None = None,
-    end: time | IntoExpr | None = None,
+    start: time | IntoExprColumn | None = None,
+    end: time | IntoExprColumn | None = None,
     interval: str | timedelta = "1h",
     *,
     closed: ClosedInterval = "both",
     eager: bool = False,
-    name: str | None = None,
 ) -> Series | Expr:
     """
     Generate a time range.
@@ -76,23 +72,18 @@ def time_range(
     ----------
     start
         Lower bound of the time range.
-        If omitted, defaults to ``time(0,0,0,0)``.
+        If omitted, defaults to `time(0,0,0,0)`.
     end
         Upper bound of the time range.
-        If omitted, defaults to ``time(23,59,59,999999)``.
+        If omitted, defaults to `time(23,59,59,999999)`.
     interval
-        Interval of the range periods, specified as a Python ``timedelta`` object
+        Interval of the range periods, specified as a Python `timedelta` object
         or using the Polars duration string language (see "Notes" section below).
     closed : {'both', 'left', 'right', 'none'}
         Define which sides of the range are closed (inclusive).
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
-    name
-        Name of the output column.
-
-        .. deprecated:: 0.18.0
-            This argument is deprecated. Use the ``alias`` method instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Returns
     -------
@@ -118,10 +109,6 @@ def time_range(
     Or combine them:
     "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-    Suffix with `"_saturating"` to indicate that dates too large for
-    their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
-    instead of erroring.
-
     By "calendar day", we mean the corresponding time on the next day (which may
     not be 24 hours, due to daylight savings). Similarly for "calendar week",
     "calendar month", "calendar quarter", and "calendar year".
@@ -137,7 +124,7 @@ def time_range(
     ...     start=time(14, 0),
     ...     interval=timedelta(hours=3, minutes=15),
     ...     eager=True,
-    ... )
+    ... ).alias("time")
     shape: (4,)
     Series: 'time' [time]
     [
@@ -146,18 +133,14 @@ def time_range(
         20:30:00
         23:45:00
     ]
-
     """
-    if name is not None:
-        issue_deprecation_warning(
-            "the `name` argument is deprecated. Use the `alias` method instead.",
-            version="0.18.0",
-        )
+    interval = deprecate_saturating(interval)
 
     interval = parse_interval_argument(interval)
     for unit in ("y", "mo", "w", "d"):
         if unit in interval:
-            raise ValueError(f"invalid interval unit for time_range: found {unit!r}")
+            msg = f"invalid interval unit for time_range: found {unit!r}"
+            raise ValueError(msg)
 
     if start is None:
         start = time(0, 0, 0)
@@ -169,9 +152,6 @@ def time_range(
 
     result = wrap_expr(plr.time_range(start_pyexpr, end_pyexpr, interval, closed))
 
-    if name is not None:
-        result = result.alias(name)
-
     if eager:
         return F.select(result).to_series()
 
@@ -180,8 +160,8 @@ def time_range(
 
 @overload
 def time_ranges(
-    start: time | IntoExpr | None = ...,
-    end: time | IntoExpr | None = ...,
+    start: time | IntoExprColumn | None = ...,
+    end: time | IntoExprColumn | None = ...,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -192,8 +172,8 @@ def time_ranges(
 
 @overload
 def time_ranges(
-    start: time | IntoExpr | None = ...,
-    end: time | IntoExpr | None = ...,
+    start: time | IntoExprColumn | None = ...,
+    end: time | IntoExprColumn | None = ...,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -204,8 +184,8 @@ def time_ranges(
 
 @overload
 def time_ranges(
-    start: time | IntoExpr | None = ...,
-    end: time | IntoExpr | None = ...,
+    start: time | IntoExprColumn | None = ...,
+    end: time | IntoExprColumn | None = ...,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -215,8 +195,8 @@ def time_ranges(
 
 
 def time_ranges(
-    start: time | IntoExpr | None = None,
-    end: time | IntoExpr | None = None,
+    start: time | IntoExprColumn | None = None,
+    end: time | IntoExprColumn | None = None,
     interval: str | timedelta = "1h",
     *,
     closed: ClosedInterval = "both",
@@ -229,23 +209,23 @@ def time_ranges(
     ----------
     start
         Lower bound of the time range.
-        If omitted, defaults to ``time(0, 0, 0, 0)``.
+        If omitted, defaults to `time(0, 0, 0, 0)`.
     end
         Upper bound of the time range.
-        If omitted, defaults to ``time(23, 59, 59, 999999)``.
+        If omitted, defaults to `time(23, 59, 59, 999999)`.
     interval
-        Interval of the range periods, specified as a Python ``timedelta`` object
+        Interval of the range periods, specified as a Python `timedelta` object
         or using the Polars duration string language (see "Notes" section below).
     closed : {'both', 'left', 'right', 'none'}
         Define which sides of the range are closed (inclusive).
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Returns
     -------
     Expr or Series
-        Column of data type ``List(Time)``.
+        Column of data type `List(Time)`.
 
     Notes
     -----
@@ -266,10 +246,6 @@ def time_ranges(
     Or combine them:
     "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-    Suffix with `"_saturating"` to indicate that dates too large for
-    their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
-    instead of erroring.
-
     By "calendar day", we mean the corresponding time on the next day (which may
     not be 24 hours, due to daylight savings). Similarly for "calendar week",
     "calendar month", "calendar quarter", and "calendar year".
@@ -287,7 +263,7 @@ def time_ranges(
     ...         "end": time(11, 0),
     ...     }
     ... )
-    >>> df.with_columns(pl.time_ranges("start", "end"))
+    >>> df.with_columns(time_range=pl.time_ranges("start", "end"))
     shape: (2, 3)
     ┌──────────┬──────────┬────────────────────────────────┐
     │ start    ┆ end      ┆ time_range                     │
@@ -297,12 +273,13 @@ def time_ranges(
     │ 09:00:00 ┆ 11:00:00 ┆ [09:00:00, 10:00:00, 11:00:00] │
     │ 10:00:00 ┆ 11:00:00 ┆ [10:00:00, 11:00:00]           │
     └──────────┴──────────┴────────────────────────────────┘
-
     """
+    interval = deprecate_saturating(interval)
     interval = parse_interval_argument(interval)
     for unit in ("y", "mo", "w", "d"):
         if unit in interval:
-            raise ValueError(f"invalid interval unit for time_range: found {unit!r}")
+            msg = f"invalid interval unit for time_range: found {unit!r}"
+            raise ValueError(msg)
 
     if start is None:
         start = time(0, 0, 0)

@@ -9,7 +9,7 @@ use super::*;
 #[test]
 #[cfg(feature = "rank")]
 fn test_filter_sort_diff_2984() -> PolarsResult<()> {
-    // make sort that sort doest not oob if filter returns no values
+    // make sure that sort does not oob if filter returns no values
     let df = df![
     "group"=> ["A" ,"A", "A", "B", "B", "B", "B"],
     "id"=> [1, 2, 1, 4, 5, 4, 6],
@@ -50,7 +50,7 @@ fn test_filter_after_tail() -> PolarsResult<()> {
         "a" => ["bar"],
         "b" => [3]
     ]?;
-    assert!(out.frame_equal(&expected));
+    assert!(out.equals(&expected));
 
     Ok(())
 }
@@ -94,7 +94,7 @@ fn test_group_by_lit_agg() -> PolarsResult<()> {
         .agg([lit("foo").alias("foo")])
         .collect()?;
 
-    assert_eq!(out.column("foo")?.dtype(), &DataType::Utf8);
+    assert_eq!(out.column("foo")?.dtype(), &DataType::String);
 
     Ok(())
 }

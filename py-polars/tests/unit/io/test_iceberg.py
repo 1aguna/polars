@@ -25,6 +25,8 @@ def iceberg_path(io_files_path: Path) -> str:
     return f"file://{iceberg_path.resolve()}"
 
 
+@pytest.mark.slow()
+@pytest.mark.write_disk()
 @pytest.mark.filterwarnings(
     "ignore:No preferred file implementation for scheme*:UserWarning"
 )
@@ -33,11 +35,13 @@ def test_scan_iceberg_plain(iceberg_path: str) -> None:
     assert len(df.collect()) == 3
     assert df.schema == {
         "id": pl.Int32,
-        "str": pl.Utf8,
+        "str": pl.String,
         "ts": pl.Datetime(time_unit="us", time_zone=None),
     }
 
 
+@pytest.mark.slow()
+@pytest.mark.write_disk()
 @pytest.mark.filterwarnings(
     "ignore:No preferred file implementation for scheme*:UserWarning"
 )
@@ -71,6 +75,8 @@ def test_scan_iceberg_filter_on_partition(iceberg_path: str) -> None:
         assert res.collect().rows() == [(1,), (3,)]
 
 
+@pytest.mark.slow()
+@pytest.mark.write_disk()
 @pytest.mark.filterwarnings(
     "ignore:No preferred file implementation for scheme*:UserWarning"
 )

@@ -1,10 +1,7 @@
-use std::ops::{BitAnd, BitOr, Not};
-
-use polars_core::POOL;
-use rayon::prelude::*;
-
 use super::*;
-use crate::{map, wrap};
+#[cfg(feature = "is_in")]
+use crate::wrap;
+use crate::{map, map_as_slice};
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Debug, Eq, Hash)]
@@ -29,19 +26,31 @@ pub enum BooleanFunction {
     IsUnique,
     #[cfg(feature = "is_unique")]
     IsDuplicated,
+    #[cfg(feature = "is_between")]
+    IsBetween {
+        closed: ClosedInterval,
+    },
     #[cfg(feature = "is_in")]
     IsIn,
     AllHorizontal,
     AnyHorizontal,
+    // Also bitwise negate
     Not,
 }
 
 impl BooleanFunction {
     pub(super) fn get_field(&self, mapper: FieldsMapper) -> PolarsResult<Field> {
-        use BooleanFunction::*;
         match self {
-            AllHorizontal => Ok(Field::new("all", DataType::Boolean)),
-            AnyHorizontal => Ok(Field::new("any", DataType::Boolean)),
+            BooleanFunction::Not => {
+                mapper.try_map_dtype(|dtype| {
+                    match dtype {
+                        DataType::Boolean => Ok(DataType::Boolean),
+                        dt if dt.is_integer() => Ok(dt.clone()),
+                        dt => polars_bail!(InvalidOperation: "dtype {:?} not supported in 'not' operation", dt) 
+                    }
+                })
+
+            },
             _ => mapper.with_dtype(DataType::Boolean),
         }
     }
@@ -67,11 +76,13 @@ impl Display for BooleanFunction {
             IsUnique => "is_unique",
             #[cfg(feature = "is_unique")]
             IsDuplicated => "is_duplicated",
+            #[cfg(feature = "is_between")]
+            IsBetween { .. } => "is_between",
             #[cfg(feature = "is_in")]
             IsIn => "is_in",
             AnyHorizontal => "any_horizontal",
             AllHorizontal => "all_horizontal",
-            Not => "not_",
+            Not => "not",
         };
         write!(f, "{s}")
     }
@@ -97,11 +108,13 @@ impl From<BooleanFunction> for SpecialEq<Arc<dyn SeriesUdf>> {
             IsUnique => map!(is_unique),
             #[cfg(feature = "is_unique")]
             IsDuplicated => map!(is_duplicated),
+            #[cfg(feature = "is_between")]
+            IsBetween { closed } => map_as_slice!(is_between, closed),
             #[cfg(feature = "is_in")]
             IsIn => wrap!(is_in),
-            AllHorizontal => wrap!(all_horizontal),
-            AnyHorizontal => wrap!(any_horizontal),
-            Not => map!(not_),
+            AllHorizontal => map_as_slice!(all_horizontal),
+            AnyHorizontal => map_as_slice!(any_horizontal),
+            Not => map!(not),
         }
     }
 }
@@ -174,6 +187,14 @@ fn is_duplicated(s: &Series) -> PolarsResult<Series> {
     polars_ops::prelude::is_duplicated(s).map(|ca| ca.into_series())
 }
 
+#[cfg(feature = "is_between")]
+fn is_between(s: &[Series], closed: ClosedInterval) -> PolarsResult<Series> {
+    let ser = &s[0];
+    let lower = &s[1];
+    let upper = &s[2];
+    polars_ops::prelude::is_between(ser, lower, upper, closed).map(|ca| ca.into_series())
+}
+
 #[cfg(feature = "is_in")]
 fn is_in(s: &mut [Series]) -> PolarsResult<Option<Series>> {
     let left = &s[0];
@@ -181,40 +202,14 @@ fn is_in(s: &mut [Series]) -> PolarsResult<Option<Series>> {
     polars_ops::prelude::is_in(left, other).map(|ca| Some(ca.into_series()))
 }
 
-fn any_horizontal(s: &mut [Series]) -> PolarsResult<Option<Series>> {
-    let mut out = POOL.install(|| {
-        s.par_iter()
-            .try_fold(
-                || BooleanChunked::new("", &[false]),
-                |acc, b| {
-                    let b = b.cast(&DataType::Boolean)?;
-                    let b = b.bool()?;
-                    PolarsResult::Ok((&acc).bitor(b))
-                },
-            )
-            .try_reduce(|| BooleanChunked::new("", [false]), |a, b| Ok(a.bitor(b)))
-    })?;
-    out.rename("any");
-    Ok(Some(out.into_series()))
+fn any_horizontal(s: &[Series]) -> PolarsResult<Series> {
+    polars_ops::prelude::any_horizontal(s)
 }
 
-fn all_horizontal(s: &mut [Series]) -> PolarsResult<Option<Series>> {
-    let mut out = POOL.install(|| {
-        s.par_iter()
-            .try_fold(
-                || BooleanChunked::new("", &[true]),
-                |acc, b| {
-                    let b = b.cast(&DataType::Boolean)?;
-                    let b = b.bool()?;
-                    PolarsResult::Ok((&acc).bitand(b))
-                },
-            )
-            .try_reduce(|| BooleanChunked::new("", [true]), |a, b| Ok(a.bitand(b)))
-    })?;
-    out.rename("all");
-    Ok(Some(out.into_series()))
+fn all_horizontal(s: &[Series]) -> PolarsResult<Series> {
+    polars_ops::prelude::all_horizontal(s)
 }
 
-fn not_(s: &Series) -> PolarsResult<Series> {
-    Ok(s.bool()?.not().into_series())
+fn not(s: &Series) -> PolarsResult<Series> {
+    polars_ops::series::negate_bitwise(s)
 }

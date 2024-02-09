@@ -82,17 +82,17 @@ def test_explode_empty_list_4003() -> None:
             {"id": 3, "nested": [2]},
         ]
     )
-    assert df.explode("nested").to_dict(False) == {
+    assert df.explode("nested").to_dict(as_series=False) == {
         "id": [1, 2, 3],
         "nested": [None, 1, 2],
     }
 
 
 def test_explode_empty_list_4107() -> None:
-    df = pl.DataFrame({"b": [[1], [2], []] * 2}).with_row_count()
+    df = pl.DataFrame({"b": [[1], [2], []] * 2}).with_row_index()
 
     assert_frame_equal(
-        df.explode(["b"]), df.explode(["b"]).drop("row_nr").with_row_count()
+        df.explode(["b"]), df.explode(["b"]).drop("index").with_row_index()
     )
 
 
@@ -112,15 +112,15 @@ def test_explode_correct_for_slice() -> None:
             )
         )
         .sort("group")
-        .with_row_count()
+        .with_row_index()
     )
     expected = pl.DataFrame(
         {
-            "row_nr": [0, 0, 0, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 6, 7, 8, 8, 8, 9],
+            "index": [0, 0, 0, 1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 6, 7, 8, 8, 8, 9],
             "group": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
             "b": [1, 2, 3, 2, 3, 4, 1, 2, 3, 0, 1, 2, 3, 2, 3, 4, 1, 2, 3, 0],
         },
-        schema_overrides={"row_nr": pl.UInt32},
+        schema_overrides={"index": pl.UInt32},
     )
     assert_frame_equal(df.slice(0, 10).explode(["b"]), expected)
 
@@ -145,7 +145,7 @@ def test_sliced_null_explode() -> None:
     assert s.slice(2, 4).list.explode().to_list() == [True, False, None, True]
 
 
-def test_utf8_explode() -> None:
+def test_string_explode() -> None:
     assert pl.Series(["foobar", None]).str.explode().to_list() == [
         "f",
         "o",
@@ -215,12 +215,12 @@ def test_explode_in_agg_context() -> None:
     )
 
     assert (
-        df.with_row_count("row_nr")
+        df.with_row_index()
         .explode("idxs")
-        .group_by("row_nr")
+        .group_by("index")
         .agg(pl.col("array").flatten())
-    ).to_dict(False) == {
-        "row_nr": [0, 1, 2],
+    ).to_dict(as_series=False) == {
+        "index": [0, 1, 2],
         "array": [[0.0, 3.5], [4.6, 0.0], [0.0, 7.8, 0.0, 0.0, 7.8, 0.0]],
     }
 
@@ -234,7 +234,10 @@ def test_explode_inner_lists_3985() -> None:
         df.group_by("id")
         .agg(pl.col("categories"))
         .with_columns(pl.col("categories").list.eval(pl.element().list.explode()))
-    ).collect().to_dict(False) == {"id": [1], "categories": [["a", "b", "a", "c"]]}
+    ).collect().to_dict(as_series=False) == {
+        "id": [1],
+        "categories": [["a", "b", "a", "c"]],
+    }
 
 
 def test_list_struct_explode_6905() -> None:
@@ -267,7 +270,7 @@ def test_explode_binary() -> None:
 
 
 def test_explode_null_list() -> None:
-    assert pl.Series([["a"], None], dtype=pl.List(pl.Utf8))[
+    assert pl.Series([["a"], None], dtype=pl.List(pl.String))[
         1:2
     ].list.min().to_list() == [None]
 
@@ -278,7 +281,7 @@ def test_explode_invalid_element_count() -> None:
             "col1": [["X", "Y", "Z"], ["F", "G"], ["P"]],
             "col2": [["A", "B", "C"], ["C"], ["D", "E"]],
         }
-    ).with_row_count()
+    ).with_row_index()
     with pytest.raises(
         pl.ShapeError, match=r"exploded columns must have matching element counts"
     ):
@@ -309,7 +312,7 @@ def test_explode_inner_null() -> None:
 def test_explode_array() -> None:
     df = pl.LazyFrame(
         {"a": [[1, 2], [2, 3]], "b": [1, 2]},
-        schema_overrides={"a": pl.Array(2, inner=pl.Int64)},
+        schema_overrides={"a": pl.Array(pl.Int64, 2)},
     )
     expected = pl.DataFrame({"a": [1, 2, 2, 3], "b": [1, 1, 2, 2]})
     for ex in ("a", ~cs.integer()):
@@ -317,7 +320,7 @@ def test_explode_array() -> None:
         assert_frame_equal(out, expected)
 
 
-def test_utf8_list_agg_explode() -> None:
+def test_string_list_agg_explode() -> None:
     df = pl.DataFrame({"a": [[None], ["b"]]})
 
     df = df.select(
@@ -342,10 +345,74 @@ def test_explode_null_struct() -> None:
         },
     ]
 
-    assert pl.DataFrame(df).explode("col1").to_dict(False) == {
+    assert pl.DataFrame(df).explode("col1").to_dict(as_series=False) == {
         "col1": [
             {"field1": None, "field2": None, "field3": None},
             {"field1": None, "field2": None, "field3": None},
             {"field1": None, "field2": "some", "field3": "value"},
         ]
     }
+
+
+def test_df_explode_with_array() -> None:
+    df = pl.DataFrame(
+        {
+            "arr": [["a", "b"], ["c", None], None, ["d", "e"]],
+            "list": [[1, 2], [3], [4, None], None],
+            "val": ["x", "y", "z", "q"],
+        },
+        schema={
+            "arr": pl.Array(pl.String, 2),
+            "list": pl.List(pl.Int64),
+            "val": pl.String,
+        },
+    )
+
+    expected_by_arr = pl.DataFrame(
+        {
+            "arr": ["a", "b", "c", None, None, "d", "e"],
+            "list": [[1, 2], [1, 2], [3], [3], [4, None], None, None],
+            "val": ["x", "x", "y", "y", "z", "q", "q"],
+        }
+    )
+    assert_frame_equal(df.explode(pl.col("arr")), expected_by_arr)
+
+    expected_by_list = pl.DataFrame(
+        {
+            "arr": [["a", "b"], ["a", "b"], ["c", None], None, None, ["d", "e"]],
+            "list": [1, 2, 3, 4, None, None],
+            "val": ["x", "x", "y", "z", "z", "q"],
+        },
+        schema={
+            "arr": pl.Array(pl.String, 2),
+            "list": pl.Int64,
+            "val": pl.String,
+        },
+    )
+    assert_frame_equal(df.explode(pl.col("list")), expected_by_list)
+
+    df = pl.DataFrame(
+        {
+            "arr": [["a", "b"], ["c", None], None, ["d", "e"]],
+            "list": [[1, 2], [3, 4], None, [5, None]],
+            "val": [None, 1, 2, None],
+        },
+        schema={
+            "arr": pl.Array(pl.String, 2),
+            "list": pl.List(pl.Int64),
+            "val": pl.Int64,
+        },
+    )
+    expected_by_arr_and_list = pl.DataFrame(
+        {
+            "arr": ["a", "b", "c", None, None, "d", "e"],
+            "list": [1, 2, 3, 4, None, 5, None],
+            "val": [None, None, 1, 1, 2, None, None],
+        },
+        schema={
+            "arr": pl.String,
+            "list": pl.Int64,
+            "val": pl.Int64,
+        },
+    )
+    assert_frame_equal(df.explode("arr", "list"), expected_by_arr_and_list)

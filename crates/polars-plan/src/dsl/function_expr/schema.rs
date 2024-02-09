@@ -11,10 +11,30 @@ impl FunctionExpr {
 
         let mapper = FieldsMapper { fields };
         match self {
+            // Namespaces
+            #[cfg(feature = "dtype-array")]
+            ArrayExpr(func) => func.get_field(mapper),
+            BinaryExpr(s) => s.get_field(mapper),
+            #[cfg(feature = "dtype-categorical")]
+            Categorical(func) => func.get_field(mapper),
+            ListExpr(func) => func.get_field(mapper),
+            #[cfg(feature = "strings")]
+            StringExpr(s) => s.get_field(mapper),
+            #[cfg(feature = "dtype-struct")]
+            StructExpr(s) => s.get_field(mapper),
+            #[cfg(feature = "temporal")]
+            TemporalExpr(fun) => fun.get_field(mapper),
+
+            // Other expressions
+            Boolean(func) => func.get_field(mapper),
             #[cfg(feature = "abs")]
             Abs => mapper.with_same_dtype(),
+            Negate => mapper.with_same_dtype(),
             NullCount => mapper.with_dtype(IDX_DTYPE),
-            Pow(_) => mapper.map_to_float_dtype(),
+            Pow(pow_function) => match pow_function {
+                PowFunction::Generic => mapper.pow_dtype(),
+                _ => mapper.map_to_float_dtype(),
+            },
             Coalesce => mapper.map_to_supertype(),
             #[cfg(feature = "row_hash")]
             Hash(..) => mapper.with_dtype(DataType::UInt64),
@@ -22,61 +42,6 @@ impl FunctionExpr {
             ArgWhere => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "search_sorted")]
             SearchSorted(_) => mapper.with_dtype(IDX_DTYPE),
-            #[cfg(feature = "strings")]
-            StringExpr(s) => s.get_field(mapper),
-            BinaryExpr(s) => {
-                use BinaryFunction::*;
-                match s {
-                    Contains { .. } | EndsWith | StartsWith => mapper.with_dtype(DataType::Boolean),
-                }
-            },
-            #[cfg(feature = "temporal")]
-            TemporalExpr(fun) => {
-                use TemporalFunction::*;
-                let dtype = match fun {
-                    Year | IsoYear => DataType::Int32,
-                    Month | Quarter | Week | WeekDay | Day | OrdinalDay | Hour | Minute
-                    | Millisecond | Microsecond | Nanosecond | Second => DataType::UInt32,
-                    TimeStamp(_) => DataType::Int64,
-                    IsLeapYear => DataType::Boolean,
-                    Time => DataType::Time,
-                    Date => DataType::Date,
-                    Datetime => match mapper.with_same_dtype().unwrap().dtype {
-                        DataType::Datetime(tu, _) => DataType::Datetime(tu, None),
-                        dtype => polars_bail!(ComputeError: "expected Datetime, got {}", dtype),
-                    },
-                    Truncate(_) => mapper.with_same_dtype().unwrap().dtype,
-                    #[cfg(feature = "date_offset")]
-                    MonthStart => mapper.with_same_dtype().unwrap().dtype,
-                    #[cfg(feature = "date_offset")]
-                    MonthEnd => mapper.with_same_dtype().unwrap().dtype,
-                    #[cfg(feature = "timezones")]
-                    BaseUtcOffset => DataType::Duration(TimeUnit::Milliseconds),
-                    #[cfg(feature = "timezones")]
-                    DSTOffset => DataType::Duration(TimeUnit::Milliseconds),
-                    Round(..) => mapper.with_same_dtype().unwrap().dtype,
-                    #[cfg(feature = "timezones")]
-                    ReplaceTimeZone(tz) => return mapper.map_datetime_dtype_timezone(tz.as_ref()),
-                    DatetimeFunction {
-                        time_unit,
-                        time_zone,
-                    } => {
-                        return Ok(Field::new(
-                            "datetime",
-                            DataType::Datetime(*time_unit, time_zone.clone()),
-                        ));
-                    },
-                    Combine(tu) => match mapper.with_same_dtype().unwrap().dtype {
-                        DataType::Datetime(_, tz) => DataType::Datetime(*tu, tz),
-                        DataType::Date => DataType::Datetime(*tu, None),
-                        dtype => {
-                            polars_bail!(ComputeError: "expected Date or Datetime, got {}", dtype)
-                        },
-                    },
-                };
-                mapper.with_dtype(dtype)
-            },
-
             #[cfg(feature = "range")]
             Range(func) => func.get_field(mapper),
             #[cfg(feature = "date_offset")]
@@ -88,76 +53,88 @@ impl FunctionExpr {
             #[cfg(feature = "sign")]
             Sign => mapper.with_dtype(DataType::Int64),
             FillNull { super_type, .. } => mapper.with_dtype(super_type.clone()),
-            #[cfg(all(feature = "rolling_window", feature = "moment"))]
-            RollingSkew { .. } => mapper.map_to_float_dtype(),
-            ShiftAndFill { .. } => mapper.with_same_dtype(),
+            #[cfg(feature = "rolling_window")]
+            RollingExpr(rolling_func, ..) => {
+                use RollingFunction::*;
+                match rolling_func {
+                    Min(_) | MinBy(_) | Max(_) | MaxBy(_) | Sum(_) | SumBy(_) => {
+                        mapper.with_same_dtype()
+                    },
+                    Mean(_) | MeanBy(_) | Quantile(_) | QuantileBy(_) | Var(_) | VarBy(_)
+                    | Std(_) | StdBy(_) => mapper.map_to_float_dtype(),
+                    #[cfg(feature = "moment")]
+                    Skew(..) => mapper.map_to_float_dtype(),
+                }
+            },
+            ShiftAndFill => mapper.with_same_dtype(),
             DropNans => mapper.with_same_dtype(),
+            DropNulls => mapper.with_same_dtype(),
             #[cfg(feature = "round_series")]
             Clip { .. } => mapper.with_same_dtype(),
-            ListExpr(l) => {
-                use ListFunction::*;
-                match l {
-                    Concat => mapper.map_to_list_supertype(),
-                    #[cfg(feature = "is_in")]
-                    Contains => mapper.with_dtype(DataType::Boolean),
-                    Slice => mapper.with_same_dtype(),
-                    Get => mapper.map_to_list_inner_dtype(),
-                    #[cfg(feature = "list_take")]
-                    Take(_) => mapper.with_same_dtype(),
-                    #[cfg(feature = "list_count")]
-                    CountMatches => mapper.with_dtype(IDX_DTYPE),
-                    Sum => mapper.nested_sum_type(),
-                    Min => mapper.map_to_list_inner_dtype(),
-                    Max => mapper.map_to_list_inner_dtype(),
-                    Mean => mapper.with_dtype(DataType::Float64),
-                    Sort(_) => mapper.with_same_dtype(),
-                    Reverse => mapper.with_same_dtype(),
-                    Unique(_) => mapper.with_same_dtype(),
-                    Length => mapper.with_dtype(IDX_DTYPE),
-                    #[cfg(feature = "list_sets")]
-                    SetOperation(_) => mapper.with_same_dtype(),
-                    #[cfg(feature = "list_any_all")]
-                    Any => mapper.with_dtype(DataType::Boolean),
-                    #[cfg(feature = "list_any_all")]
-                    All => mapper.with_dtype(DataType::Boolean),
-                    Join => mapper.with_dtype(DataType::Utf8),
-                }
-            },
-            #[cfg(feature = "dtype-array")]
-            ArrayExpr(af) => {
-                use ArrayFunction::*;
-                match af {
-                    Min | Max => mapper.with_same_dtype(),
-                    Sum => mapper.nested_sum_type(),
-                    Unique(_) => mapper.try_map_dtype(|dt| {
-                        if let DataType::Array(inner, _) = dt {
-                            Ok(DataType::List(inner.clone()))
-                        } else {
-                            polars_bail!(ComputeError: "expected array dtype")
-                        }
-                    }),
-                }
-            },
+            #[cfg(feature = "mode")]
+            Mode => mapper.with_same_dtype(),
+            #[cfg(feature = "moment")]
+            Skew(_) => mapper.with_dtype(DataType::Float64),
+            #[cfg(feature = "moment")]
+            Kurtosis(..) => mapper.with_dtype(DataType::Float64),
+            ArgUnique => mapper.with_dtype(IDX_DTYPE),
+            #[cfg(feature = "rank")]
+            Rank { options, .. } => mapper.with_dtype(match options.method {
+                RankMethod::Average => DataType::Float64,
+                _ => IDX_DTYPE,
+            }),
             #[cfg(feature = "dtype-struct")]
             AsStruct => Ok(Field::new(
                 fields[0].name(),
                 DataType::Struct(fields.to_vec()),
             )),
-            #[cfg(feature = "dtype-struct")]
-            StructExpr(s) => s.get_field(mapper),
             #[cfg(feature = "top_k")]
-            TopK { .. } => mapper.with_same_dtype(),
-            Shift(..) | Reverse => mapper.with_same_dtype(),
-            Boolean(func) => func.get_field(mapper),
-            #[cfg(feature = "dtype-categorical")]
-            Categorical(func) => func.get_field(mapper),
-            Cumcount { .. } => mapper.with_dtype(IDX_DTYPE),
-            Cumsum { .. } => mapper.map_dtype(cum::dtypes::cumsum),
-            Cumprod { .. } => mapper.map_dtype(cum::dtypes::cumprod),
-            Cummin { .. } => mapper.with_same_dtype(),
-            Cummax { .. } => mapper.with_same_dtype(),
+            TopK(_) => mapper.with_same_dtype(),
+            #[cfg(feature = "dtype-struct")]
+            ValueCounts { .. } => mapper.map_dtype(|dt| {
+                DataType::Struct(vec![
+                    Field::new(fields[0].name().as_str(), dt.clone()),
+                    Field::new("count", IDX_DTYPE),
+                ])
+            }),
+            #[cfg(feature = "unique_counts")]
+            UniqueCounts => mapper.with_dtype(IDX_DTYPE),
+            Shift | Reverse => mapper.with_same_dtype(),
+            #[cfg(feature = "cum_agg")]
+            CumCount { .. } => mapper.with_dtype(IDX_DTYPE),
+            #[cfg(feature = "cum_agg")]
+            CumSum { .. } => mapper.map_dtype(cum::dtypes::cum_sum),
+            #[cfg(feature = "cum_agg")]
+            CumProd { .. } => mapper.map_dtype(cum::dtypes::cum_prod),
+            #[cfg(feature = "cum_agg")]
+            CumMin { .. } => mapper.with_same_dtype(),
+            #[cfg(feature = "cum_agg")]
+            CumMax { .. } => mapper.with_same_dtype(),
             #[cfg(feature = "approx_unique")]
             ApproxNUnique => mapper.with_dtype(IDX_DTYPE),
+            #[cfg(feature = "hist")]
+            Hist {
+                include_category,
+                include_breakpoint,
+                ..
+            } => {
+                if *include_breakpoint || *include_category {
+                    let mut fields = Vec::with_capacity(3);
+                    if *include_breakpoint {
+                        fields.push(Field::new("break_point", DataType::Float64));
+                    }
+                    if *include_category {
+                        fields.push(Field::new(
+                            "category",
+                            DataType::Categorical(None, Default::default()),
+                        ));
+                    }
+                    fields.push(Field::new("count", IDX_DTYPE));
+                    mapper.with_dtype(DataType::Struct(fields))
+                } else {
+                    mapper.with_dtype(IDX_DTYPE)
+                }
+            },
             #[cfg(feature = "diff")]
             Diff(_, _) => mapper.map_dtype(|dt| match dt {
                 #[cfg(feature = "dtype-datetime")]
@@ -171,8 +148,16 @@ impl FunctionExpr {
                 DataType::UInt8 => DataType::Int16,
                 dt => dt.clone(),
             }),
+            #[cfg(feature = "pct_change")]
+            PctChange => mapper.map_dtype(|dt| match dt {
+                DataType::Float64 | DataType::Float32 => dt.clone(),
+                _ => DataType::Float64,
+            }),
             #[cfg(feature = "interpolate")]
-            Interpolate(_) => mapper.with_same_dtype(),
+            Interpolate(method) => match method {
+                InterpolationMethod::Linear => mapper.map_numeric_to_float_dtype(),
+                InterpolationMethod::Nearest => mapper.with_same_dtype(),
+            },
             ShrinkType => {
                 // we return the smallest type this can return
                 // this might not be correct once the actual data
@@ -186,7 +171,7 @@ impl FunctionExpr {
                     if dt.is_numeric() {
                         if dt.is_float() {
                             DataType::Float32
-                        } else if dt.is_unsigned() {
+                        } else if dt.is_unsigned_integer() {
                             DataType::Int8
                         } else {
                             DataType::UInt8
@@ -200,16 +185,69 @@ impl FunctionExpr {
             Entropy { .. } | Log { .. } | Log1p | Exp => mapper.map_to_float_dtype(),
             Unique(_) => mapper.with_same_dtype(),
             #[cfg(feature = "round_series")]
-            Round { .. } | Floor | Ceil => mapper.with_same_dtype(),
+            Round { .. } | RoundSF { .. } | Floor | Ceil => mapper.with_same_dtype(),
             UpperBound | LowerBound => mapper.with_same_dtype(),
             #[cfg(feature = "fused")]
             Fused(_) => mapper.map_to_supertype(),
             ConcatExpr(_) => mapper.map_to_supertype(),
+            #[cfg(feature = "cov")]
             Correlation { .. } => mapper.map_to_float_dtype(),
+            #[cfg(feature = "peaks")]
+            PeakMin => mapper.with_same_dtype(),
+            #[cfg(feature = "peaks")]
+            PeakMax => mapper.with_same_dtype(),
             #[cfg(feature = "cutqcut")]
-            Cut { .. } => mapper.with_dtype(DataType::Categorical(None)),
+            Cut {
+                include_breaks: false,
+                ..
+            } => mapper.with_dtype(DataType::Categorical(None, Default::default())),
             #[cfg(feature = "cutqcut")]
-            QCut { .. } => mapper.with_dtype(DataType::Categorical(None)),
+            Cut {
+                include_breaks: true,
+                ..
+            } => {
+                let name = fields[0].name();
+                let name_bin = format!("{}_bin", name);
+                let struct_dt = DataType::Struct(vec![
+                    Field::new("brk", DataType::Float64),
+                    Field::new(
+                        name_bin.as_str(),
+                        DataType::Categorical(None, Default::default()),
+                    ),
+                ]);
+                mapper.with_dtype(struct_dt)
+            },
+            #[cfg(feature = "repeat_by")]
+            RepeatBy => mapper.map_dtype(|dt| DataType::List(dt.clone().into())),
+            Reshape(dims) => mapper.map_dtype(|dt| {
+                let dtype = dt.inner_dtype().unwrap_or(dt).clone();
+                if dims.len() == 1 {
+                    dtype
+                } else {
+                    DataType::List(Box::new(dtype))
+                }
+            }),
+            #[cfg(feature = "cutqcut")]
+            QCut {
+                include_breaks: false,
+                ..
+            } => mapper.with_dtype(DataType::Categorical(None, Default::default())),
+            #[cfg(feature = "cutqcut")]
+            QCut {
+                include_breaks: true,
+                ..
+            } => {
+                let name = fields[0].name();
+                let name_bin = format!("{}_bin", name);
+                let struct_dt = DataType::Struct(vec![
+                    Field::new("brk", DataType::Float64),
+                    Field::new(
+                        name_bin.as_str(),
+                        DataType::Categorical(None, Default::default()),
+                    ),
+                ]);
+                mapper.with_dtype(struct_dt)
+            },
             #[cfg(feature = "rle")]
             RLE => mapper.map_dtype(|dt| {
                 DataType::Struct(vec![
@@ -224,9 +262,37 @@ impl FunctionExpr {
             Random { .. } => mapper.with_same_dtype(),
             SetSortedFlag(_) => mapper.with_same_dtype(),
             #[cfg(feature = "ffi_plugin")]
-            FfiPlugin { lib, symbol } => unsafe {
-                plugin::plugin_field(fields, lib, &format!("__polars_field_{}", symbol.as_ref()))
+            FfiPlugin {
+                lib,
+                symbol,
+                kwargs,
+            } => unsafe { plugin::plugin_field(fields, lib, symbol.as_ref(), kwargs) },
+            BackwardFill { .. } => mapper.with_same_dtype(),
+            ForwardFill { .. } => mapper.with_same_dtype(),
+            MaxHorizontal => mapper.map_to_supertype(),
+            MinHorizontal => mapper.map_to_supertype(),
+            SumHorizontal => mapper.map_to_supertype(),
+            MeanHorizontal => mapper.map_to_float_dtype(),
+            #[cfg(feature = "ewma")]
+            EwmMean { .. } => mapper.map_to_float_dtype(),
+            #[cfg(feature = "ewma")]
+            EwmStd { .. } => mapper.map_to_float_dtype(),
+            #[cfg(feature = "ewma")]
+            EwmVar { .. } => mapper.map_to_float_dtype(),
+            #[cfg(feature = "replace")]
+            Replace { return_dtype } => mapper.replace_dtype(return_dtype.clone()),
+            FillNullWithStrategy(_) => mapper.with_same_dtype(),
+            GatherEvery { .. } => mapper.with_same_dtype(),
+            #[cfg(feature = "reinterpret")]
+            Reinterpret(signed) => {
+                let dt = if *signed {
+                    DataType::Int64
+                } else {
+                    DataType::UInt64
+                };
+                mapper.with_dtype(dt)
             },
+            ExtendConstant => mapper.with_same_dtype(),
         }
     }
 }
@@ -251,7 +317,7 @@ impl<'a> FieldsMapper<'a> {
     }
 
     /// Map a single dtype.
-    pub fn map_dtype(&self, func: impl Fn(&DataType) -> DataType) -> PolarsResult<Field> {
+    pub fn map_dtype(&self, func: impl FnOnce(&DataType) -> DataType) -> PolarsResult<Field> {
         let dtype = func(self.fields[0].data_type());
         Ok(Field::new(self.fields[0].name(), dtype))
     }
@@ -263,7 +329,7 @@ impl<'a> FieldsMapper<'a> {
     /// Map a single field with a potentially failing mapper function.
     pub fn try_map_field(
         &self,
-        func: impl Fn(&Field) -> PolarsResult<Field>,
+        func: impl FnOnce(&Field) -> PolarsResult<Field>,
     ) -> PolarsResult<Field> {
         func(&self.fields[0])
     }
@@ -276,16 +342,29 @@ impl<'a> FieldsMapper<'a> {
         })
     }
 
+    /// Map to a float supertype if numeric, else preserve
+    pub fn map_numeric_to_float_dtype(&self) -> PolarsResult<Field> {
+        self.map_dtype(|dtype| {
+            if dtype.is_numeric() {
+                match dtype {
+                    DataType::Float32 => DataType::Float32,
+                    _ => DataType::Float64,
+                }
+            } else {
+                dtype.clone()
+            }
+        })
+    }
+
     /// Map to a physical type.
     pub fn to_physical_type(&self) -> PolarsResult<Field> {
         self.map_dtype(|dtype| dtype.to_physical())
     }
 
     /// Map a single dtype with a potentially failing mapper function.
-    #[cfg(any(feature = "timezones", feature = "dtype-array"))]
     pub fn try_map_dtype(
         &self,
-        func: impl Fn(&DataType) -> PolarsResult<DataType>,
+        func: impl FnOnce(&DataType) -> PolarsResult<DataType>,
     ) -> PolarsResult<Field> {
         let dtype = func(self.fields[0].data_type())?;
         Ok(Field::new(self.fields[0].name(), dtype))
@@ -294,7 +373,7 @@ impl<'a> FieldsMapper<'a> {
     /// Map all dtypes with a potentially failing mapper function.
     pub fn try_map_dtypes(
         &self,
-        func: impl Fn(&[&DataType]) -> PolarsResult<DataType>,
+        func: impl FnOnce(&[&DataType]) -> PolarsResult<DataType>,
     ) -> PolarsResult<Field> {
         let mut fld = self.fields[0].clone();
         let dtypes = self
@@ -318,8 +397,8 @@ impl<'a> FieldsMapper<'a> {
         Ok(first)
     }
 
-    /// Map the dtype to the dtype of the list elements.
-    pub fn map_to_list_inner_dtype(&self) -> PolarsResult<Field> {
+    /// Map the dtype to the dtype of the list/array elements.
+    pub fn map_to_list_and_array_inner_dtype(&self) -> PolarsResult<Field> {
         let mut first = self.fields[0].clone();
         let dt = first
             .data_type()
@@ -380,9 +459,38 @@ impl<'a> FieldsMapper<'a> {
         Ok(first)
     }
 
+    pub(super) fn pow_dtype(&self) -> PolarsResult<Field> {
+        // base, exponent
+        match (self.fields[0].data_type(), self.fields[1].data_type()) {
+            (
+                base_dtype,
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
+            ) => Ok(Field::new(self.fields[0].name(), base_dtype.clone())),
+            (DataType::Float32, _) => Ok(Field::new(self.fields[0].name(), DataType::Float32)),
+            (_, _) => Ok(Field::new(self.fields[0].name(), DataType::Float64)),
+        }
+    }
+
     #[cfg(feature = "extract_jsonpath")]
     pub fn with_opt_dtype(&self, dtype: Option<DataType>) -> PolarsResult<Field> {
         let dtype = dtype.unwrap_or(DataType::Unknown);
+        self.with_dtype(dtype)
+    }
+
+    #[cfg(feature = "replace")]
+    pub fn replace_dtype(&self, return_dtype: Option<DataType>) -> PolarsResult<Field> {
+        let dtype = match return_dtype {
+            Some(dtype) => dtype,
+            // Supertype of `new` and `default`
+            None => {
+                let default = if let Some(default) = self.fields.get(3) {
+                    default
+                } else {
+                    &self.fields[0]
+                };
+                try_get_supertype(self.fields[2].data_type(), default.data_type())?
+            },
+        };
         self.with_dtype(dtype)
     }
 }

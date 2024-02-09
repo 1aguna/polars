@@ -63,25 +63,24 @@ def datetime_(
     use_earliest
         Determine how to deal with ambiguous datetimes:
 
-        - ``None`` (default): raise
-        - ``True``: use the earliest datetime
-        - ``False``: use the latest datetime
+        - `None` (default): raise
+        - `True`: use the earliest datetime
+        - `False`: use the latest datetime
 
         .. deprecated:: 0.19.0
             Use `ambiguous` instead
     ambiguous
         Determine how to deal with ambiguous datetimes:
 
-        - ``'raise'`` (default): raise
-        - ``'earliest'``: use the earliest datetime
-        - ``'latest'``: use the latest datetime
+        - `'raise'` (default): raise
+        - `'earliest'`: use the earliest datetime
+        - `'latest'`: use the latest datetime
 
 
     Returns
     -------
     Expr
         Expression of data type :class:`Datetime`.
-
     """
     ambiguous = parse_as_expression(
         rename_use_earliest_to_ambiguous(use_earliest, ambiguous), str_as_lit=True
@@ -136,7 +135,6 @@ def date_(
     -------
     Expr
         Expression of data type :class:`Date`.
-
     """
     return datetime_(year, month, day).cast(Date).alias("date")
 
@@ -165,7 +163,6 @@ def time_(
     -------
     Expr
         Expression of data type :class:`Date`.
-
     """
     epoch_start = (1970, 1, 1)
     return (
@@ -177,17 +174,39 @@ def time_(
 
 def duration(
     *,
-    days: Expr | str | int | None = None,
-    seconds: Expr | str | int | None = None,
-    nanoseconds: Expr | str | int | None = None,
-    microseconds: Expr | str | int | None = None,
-    milliseconds: Expr | str | int | None = None,
-    minutes: Expr | str | int | None = None,
-    hours: Expr | str | int | None = None,
     weeks: Expr | str | int | None = None,
+    days: Expr | str | int | None = None,
+    hours: Expr | str | int | None = None,
+    minutes: Expr | str | int | None = None,
+    seconds: Expr | str | int | None = None,
+    milliseconds: Expr | str | int | None = None,
+    microseconds: Expr | str | int | None = None,
+    nanoseconds: Expr | str | int | None = None,
+    time_unit: TimeUnit = "us",
 ) -> Expr:
     """
     Create polars `Duration` from distinct time components.
+
+    Parameters
+    ----------
+    weeks
+        Number of weeks.
+    days
+        Number of days.
+    hours
+        Number of hours.
+    minutes
+        Number of minutes.
+    seconds
+        Number of seconds.
+    milliseconds
+        Number of milliseconds.
+    microseconds
+        Number of microseconds.
+    nanoseconds
+        Number of nanoseconds.
+    time_unit : {'us', 'ms', 'ns'}
+        Time unit of the resulting expression.
 
     Returns
     -------
@@ -197,8 +216,8 @@ def duration(
     Notes
     -----
     A `duration` represents a fixed amount of time. For example,
-    ``pl.duration(days=1)`` means "exactly 24 hours". By contrast,
-    ``Expr.dt.offset_by('1d')`` means "1 calendar day", which could sometimes be
+    `pl.duration(days=1)` means "exactly 24 hours". By contrast,
+    `Expr.dt.offset_by('1d')` means "1 calendar day", which could sometimes be
     23 hours or 25 hours depending on Daylight Savings Time.
     For non-fixed durations such as "calendar month" or "calendar day",
     please use :meth:`polars.Expr.dt.offset_by` instead.
@@ -230,7 +249,6 @@ def duration(
     ...         (pl.col("dt") + pl.duration(milliseconds="add")).alias("add_millis"),
     ...         (pl.col("dt") + pl.duration(hours="add")).alias("add_hours"),
     ...     )
-    ...
     shape: (2, 5)
     ┌─────────────────────┬─────────────────────┬─────────────────────┬─────────────────────────┬─────────────────────┐
     │ add_weeks           ┆ add_days            ┆ add_seconds         ┆ add_millis              ┆ add_hours           │
@@ -255,7 +273,6 @@ def duration(
     ...             pl.format("{}y", pl.col("add"))
     ...         ),
     ...     )
-    ...
     shape: (2, 3)
     ┌─────────────────────┬─────────────────────┬─────────────────────┐
     │ add_calendar_days   ┆ add_calendar_months ┆ add_calendar_years  │
@@ -265,8 +282,11 @@ def duration(
     │ 2022-01-02 00:00:00 ┆ 2022-02-01 00:00:00 ┆ 2023-01-01 00:00:00 │
     │ 2022-01-04 00:00:00 ┆ 2022-03-02 00:00:00 ┆ 2024-01-02 00:00:00 │
     └─────────────────────┴─────────────────────┴─────────────────────┘
-
     """  # noqa: W505
+    if weeks is not None:
+        weeks = parse_as_expression(weeks)
+    if days is not None:
+        days = parse_as_expression(days)
     if hours is not None:
         hours = parse_as_expression(hours)
     if minutes is not None:
@@ -279,21 +299,18 @@ def duration(
         microseconds = parse_as_expression(microseconds)
     if nanoseconds is not None:
         nanoseconds = parse_as_expression(nanoseconds)
-    if days is not None:
-        days = parse_as_expression(days)
-    if weeks is not None:
-        weeks = parse_as_expression(weeks)
 
     return wrap_expr(
         plr.duration(
-            days,
-            seconds,
-            nanoseconds,
-            microseconds,
-            milliseconds,
-            minutes,
-            hours,
             weeks,
+            days,
+            hours,
+            minutes,
+            seconds,
+            milliseconds,
+            microseconds,
+            nanoseconds,
+            time_unit,
         )
     )
 
@@ -335,7 +352,6 @@ def concat_list(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> 
     │ [2.0, 9.0, 2.0]   │
     │ [9.0, 2.0, 13.0]  │
     └───────────────────┘
-
     """
     exprs = parse_as_list_of_expressions(exprs, *more_exprs)
     return wrap_expr(plr.concat_list(exprs))
@@ -390,7 +406,7 @@ def struct(
         Optional schema that explicitly defines the struct field dtypes. If no columns
         or expressions are provided, schema keys are used to define columns.
     eager
-        Evaluate immediately and return a ``Series``. If set to ``False`` (default),
+        Evaluate immediately and return a `Series`. If set to `False` (default),
         return an expression instead.
     **named_exprs
         Additional columns to collect into the struct column, specified as keyword
@@ -398,7 +414,7 @@ def struct(
 
     Examples
     --------
-    Collect all columns of a dataframe into a struct by passing ``pl.all()``.
+    Collect all columns of a dataframe into a struct by passing `pl.all()`.
 
     >>> df = pl.DataFrame(
     ...     {
@@ -436,8 +452,7 @@ def struct(
     Use keyword arguments to easily name each struct field.
 
     >>> df.select(pl.struct(p="int", q="bool").alias("my_struct")).schema
-    {'my_struct': Struct([Field('p', Int64), Field('q', Boolean)])}
-
+    OrderedDict({'my_struct': Struct({'p': Int64, 'q': Boolean})})
     """
     pyexprs = parse_as_list_of_expressions(*exprs, **named_exprs)
     expr = wrap_expr(plr.as_struct(pyexprs))
@@ -460,6 +475,7 @@ def concat_str(
     exprs: IntoExpr | Iterable[IntoExpr],
     *more_exprs: IntoExpr,
     separator: str = "",
+    ignore_nulls: bool = False,
 ) -> Expr:
     """
     Horizontally concatenate columns into a single string column.
@@ -471,12 +487,17 @@ def concat_str(
     exprs
         Columns to concatenate into a single string column. Accepts expression input.
         Strings are parsed as column names, other non-expression inputs are parsed as
-        literals. Non-``Utf8`` columns are cast to ``Utf8``.
+        literals. Non-`String` columns are cast to `String`.
     *more_exprs
         Additional columns to concatenate into a single string column, specified as
         positional arguments.
     separator
         String that will be used to separate the values of each column.
+    ignore_nulls
+        Ignore null values (default).
+
+        If set to ``False``, null values will be propagated.
+        if the row contains any null values, the output is ``None``.
 
     Examples
     --------
@@ -507,10 +528,9 @@ def concat_str(
     │ 2   ┆ cats ┆ swim ┆ 4 cats swim   │
     │ 3   ┆ null ┆ walk ┆ null          │
     └─────┴──────┴──────┴───────────────┘
-
     """
     exprs = parse_as_list_of_expressions(exprs, *more_exprs)
-    return wrap_expr(plr.concat_str(exprs, separator))
+    return wrap_expr(plr.concat_str(exprs, separator, ignore_nulls))
 
 
 def format(f_string: str, *args: Expr | str) -> Expr:
@@ -548,10 +568,10 @@ def format(f_string: str, *args: Expr | str) -> Expr:
     │ foo_b_bar_2 │
     │ foo_c_bar_3 │
     └─────────────┘
-
     """
     if f_string.count("{}") != len(args):
-        raise ValueError("number of placeholders should equal the number of arguments")
+        msg = "number of placeholders should equal the number of arguments"
+        raise ValueError(msg)
 
     exprs = []
 

@@ -3,8 +3,33 @@ use super::*;
 fn is_count(node: Node, expr_arena: &Arena<AExpr>) -> bool {
     match expr_arena.get(node) {
         AExpr::Alias(node, _) => is_count(*node, expr_arena),
-        AExpr::Count => true,
+        AExpr::Len => true,
         _ => false,
+    }
+}
+
+/// In this function we check a double projection case
+/// df
+///   .select(col("foo").alias("bar"))
+///   .select(col("bar")
+///
+/// In this query, bar cannot pass this projection, as it would not exist in DF.
+/// THE ORDER IS IMPORTANT HERE!
+/// this removes projection names, so any checks to upstream names should
+/// be done before this branch.
+fn check_double_projection(
+    expr: &Node,
+    expr_arena: &mut Arena<AExpr>,
+    acc_projections: &mut Vec<Node>,
+    projected_names: &mut PlHashSet<Arc<str>>,
+) {
+    for (_, ae) in (&*expr_arena).iter(*expr) {
+        if let AExpr::Alias(_, name) = ae {
+            if projected_names.remove(name) {
+                acc_projections
+                    .retain(|expr| !aexpr_to_leaf_names(*expr, expr_arena).contains(name));
+            }
+        }
     }
 }
 
@@ -29,6 +54,14 @@ pub(super) fn process_projection(
         // simply select the first column
         let (first_name, _) = input_schema.try_get_at_index(0)?;
         let expr = expr_arena.add(AExpr::Column(Arc::from(first_name.as_str())));
+        if !acc_projections.is_empty() {
+            check_double_projection(
+                &exprs[0],
+                expr_arena,
+                &mut acc_projections,
+                &mut projected_names,
+            );
+        }
         add_expr_to_accumulated(expr, &mut acc_projections, &mut projected_names, expr_arena);
         local_projection.push(exprs[0]);
     } else {
@@ -48,24 +81,7 @@ pub(super) fn process_projection(
                     continue;
                 }
 
-                // in this branch we check a double projection case
-                // df
-                //   .select(col("foo").alias("bar"))
-                //   .select(col("bar")
-                //
-                // In this query, bar cannot pass this projection, as it would not exist in DF.
-                // THE ORDER IS IMPORTANT HERE!
-                // this removes projection names, so any checks to upstream names should
-                // be done before this branch.
-                for (_, ae) in (&*expr_arena).iter(*e) {
-                    if let AExpr::Alias(_, name) = ae {
-                        if projected_names.remove(name) {
-                            acc_projections.retain(|expr| {
-                                !aexpr_to_leaf_names(*expr, expr_arena).contains(name)
-                            });
-                        }
-                    }
-                }
+                check_double_projection(e, expr_arena, &mut acc_projections, &mut projected_names);
             }
             // do local as we still need the effect of the projection
             // e.g. a projection is more than selecting a column, it can

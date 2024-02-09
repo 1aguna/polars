@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use arrow::array::*;
 use arrow::bitmap::Bitmap;
-use polars_arrow::prelude::ValueSize;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -48,9 +47,9 @@ pub mod upstream_traits;
 use std::mem;
 use std::slice::Iter;
 
+use arrow::legacy::kernels::concatenate::concatenate_owned_unchecked;
+use arrow::legacy::prelude::*;
 use bitflags::bitflags;
-use polars_arrow::kernels::concatenate::concatenate_owned_unchecked;
-use polars_arrow::prelude::*;
 
 use crate::series::IsSorted;
 use crate::utils::{first_non_null, last_non_null, CustomIterTools};
@@ -97,12 +96,12 @@ pub type ChunkIdIter<'a> = std::iter::Map<std::slice::Iter<'a, ArrayRef>, fn(&Ar
 /// # use polars_core::prelude::*;
 ///
 /// fn iter_forward(ca: &Float32Chunked) {
-///     ca.into_iter()
+///     ca.iter()
 ///         .for_each(|opt_v| println!("{:?}", opt_v))
 /// }
 ///
 /// fn iter_backward(ca: &Float32Chunked) {
-///     ca.into_iter()
+///     ca.iter()
 ///         .rev()
 ///         .for_each(|opt_v| println!("{:?}", opt_v))
 /// }
@@ -140,6 +139,7 @@ pub struct ChunkedArray<T: PolarsDataType> {
     phantom: PhantomData<T>,
     pub(crate) bit_settings: Settings,
     length: IdxSize,
+    null_count: IdxSize,
 }
 
 bitflags! {
@@ -211,6 +211,13 @@ impl<T: PolarsDataType> ChunkedArray<T> {
         self.bit_settings.set_sorted_flag(sorted)
     }
 
+    /// Set the 'sorted' bit meta info.
+    pub fn with_sorted_flag(&self, sorted: IsSorted) -> Self {
+        let mut out = self.clone();
+        out.bit_settings.set_sorted_flag(sorted);
+        out
+    }
+
     /// Get the index of the first non null value in this [`ChunkedArray`].
     pub fn first_non_null(&self) -> Option<usize> {
         if self.is_empty() {
@@ -245,6 +252,19 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     /// Shrink the capacity of this array to fit its length.
     pub fn shrink_to_fit(&mut self) {
         self.chunks = vec![concatenate_owned_unchecked(self.chunks.as_slice()).unwrap()];
+    }
+
+    pub fn clear(&self) -> Self {
+        // SAFETY: we keep the correct dtype
+        unsafe {
+            self.copy_with_chunks(
+                vec![new_empty_array(
+                    self.chunks.first().unwrap().data_type().clone(),
+                )],
+                true,
+                true,
+            )
+        }
     }
 
     /// Unpack a [`Series`] to the same physical type.
@@ -303,6 +323,7 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     ///
     /// # Safety
     /// The caller must ensure to not change the [`DataType`] or `length` of any of the chunks.
+    /// And the `null_count` remains correct.
     #[inline]
     pub unsafe fn chunks_mut(&mut self) -> &mut Vec<ArrayRef> {
         &mut self.chunks
@@ -311,12 +332,6 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     /// Returns true if contains a single chunk and has no null values
     pub fn is_optimal_aligned(&self) -> bool {
         self.chunks.len() == 1 && self.null_count() == 0
-    }
-
-    /// Count the null values.
-    #[inline]
-    pub fn null_count(&self) -> usize {
-        self.chunks.iter().map(|arr| arr.null_count()).sum()
     }
 
     /// Create a new [`ChunkedArray`] from self, where the chunks are replaced.
@@ -473,7 +488,8 @@ where
                 })
                 .collect();
 
-            unsafe { Self::from_chunks(self.name(), chunks) }
+            // SAFETY: We just slice the original chunks, their type will not change.
+            unsafe { Self::from_chunks_and_dtype(self.name(), chunks, self.dtype().clone()) }
         };
 
         if self.chunks.len() != 1 {
@@ -515,7 +531,7 @@ impl AsSinglePtr for BooleanChunked {}
 impl AsSinglePtr for ListChunked {}
 #[cfg(feature = "dtype-array")]
 impl AsSinglePtr for ArrayChunked {}
-impl AsSinglePtr for Utf8Chunked {}
+impl AsSinglePtr for StringChunked {}
 impl AsSinglePtr for BinaryChunked {}
 #[cfg(feature = "object")]
 impl<T: PolarsObject> AsSinglePtr for ObjectChunked<T> {}
@@ -576,20 +592,15 @@ where
     /// Get slices of the underlying arrow data.
     /// NOTE: null values should be taken into account by the user of these slices as they are handled
     /// separately
-    pub fn data_views(&self) -> impl Iterator<Item = &[T::Native]> + DoubleEndedIterator {
+    pub fn data_views(&self) -> impl DoubleEndedIterator<Item = &[T::Native]> {
         self.downcast_iter().map(|arr| arr.values().as_slice())
     }
 
     #[allow(clippy::wrong_self_convention)]
     pub fn into_no_null_iter(
         &self,
-    ) -> impl Iterator<Item = T::Native>
-           + '_
-           + Send
-           + Sync
-           + ExactSizeIterator
-           + DoubleEndedIterator
-           + TrustedLen {
+    ) -> impl '_ + Send + Sync + ExactSizeIterator<Item = T::Native> + DoubleEndedIterator + TrustedLen
+    {
         // .copied was significantly slower in benchmark, next call did not inline?
         #[allow(clippy::map_clone)]
         // we know the iterators len
@@ -610,6 +621,7 @@ impl<T: PolarsDataType> Clone for ChunkedArray<T> {
             phantom: PhantomData,
             bit_settings: self.bit_settings,
             length: self.length,
+            null_count: self.null_count,
         }
     }
 }
@@ -636,7 +648,7 @@ impl ValueSize for ArrayChunked {
             .fold(0usize, |acc, arr| acc + arr.get_values_size())
     }
 }
-impl ValueSize for Utf8Chunked {
+impl ValueSize for StringChunked {
     fn get_values_size(&self) -> usize {
         self.chunks
             .iter()
@@ -644,7 +656,7 @@ impl ValueSize for Utf8Chunked {
     }
 }
 
-impl ValueSize for BinaryChunked {
+impl ValueSize for BinaryOffsetChunked {
     fn get_values_size(&self) -> usize {
         self.chunks
             .iter()
@@ -656,7 +668,7 @@ pub(crate) fn to_primitive<T: PolarsNumericType>(
     values: Vec<T::Native>,
     validity: Option<Bitmap>,
 ) -> PrimitiveArray<T::Native> {
-    PrimitiveArray::new(T::get_dtype().to_arrow(), values.into(), validity)
+    PrimitiveArray::new(T::get_dtype().to_arrow(true), values.into(), validity)
 }
 
 pub(crate) fn to_array<T: PolarsNumericType>(
@@ -683,7 +695,7 @@ pub(crate) mod test {
             .map(|opt| opt.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(b, [1, 2, 3, 9]);
-        let a = Utf8Chunked::new("a", &["b", "a", "c"]);
+        let a = StringChunked::new("a", &["b", "a", "c"]);
         let a = a.sort(false);
         let b = a.into_iter().collect::<Vec<_>>();
         assert_eq!(b, [Some("a"), Some("b"), Some("c")]);
@@ -754,10 +766,7 @@ pub(crate) mod test {
     where
         T: PolarsNumericType,
     {
-        assert_eq!(
-            ca.into_iter().map(|opt| opt.unwrap()).collect::<Vec<_>>(),
-            eq
-        )
+        assert_eq!(ca.iter().map(|opt| opt.unwrap()).collect::<Vec<_>>(), eq)
     }
 
     #[test]
@@ -787,7 +796,7 @@ pub(crate) mod test {
         let sorted = s.sort(true);
         assert_slice_equal(&sorted, &[9, 4, 2]);
 
-        let s: Utf8Chunked = ["b", "a", "z"].iter().collect();
+        let s: StringChunked = ["b", "a", "z"].iter().collect();
         let sorted = s.sort(false);
         assert_eq!(
             sorted.into_iter().collect::<Vec<_>>(),
@@ -798,7 +807,7 @@ pub(crate) mod test {
             sorted.into_iter().collect::<Vec<_>>(),
             &[Some("z"), Some("b"), Some("a")]
         );
-        let s: Utf8Chunked = [Some("b"), None, Some("z")].iter().copied().collect();
+        let s: StringChunked = [Some("b"), None, Some("z")].iter().copied().collect();
         let sorted = s.sort(false);
         assert_eq!(
             sorted.into_iter().collect::<Vec<_>>(),
@@ -817,30 +826,32 @@ pub(crate) mod test {
         let s = BooleanChunked::new("", &[true, false]);
         assert_eq!(Vec::from(&s.reverse()), &[Some(false), Some(true)]);
 
-        let s = Utf8Chunked::new("", &["a", "b", "c"]);
+        let s = StringChunked::new("", &["a", "b", "c"]);
         assert_eq!(Vec::from(&s.reverse()), &[Some("c"), Some("b"), Some("a")]);
 
-        let s = Utf8Chunked::new("", &[Some("a"), None, Some("c")]);
+        let s = StringChunked::new("", &[Some("a"), None, Some("c")]);
         assert_eq!(Vec::from(&s.reverse()), &[Some("c"), None, Some("a")]);
     }
 
     #[test]
     #[cfg(feature = "dtype-categorical")]
     fn test_iter_categorical() {
-        use crate::{reset_string_cache, SINGLE_LOCK};
+        use crate::{disable_string_cache, SINGLE_LOCK};
         let _lock = SINGLE_LOCK.lock();
-        reset_string_cache();
-        let ca = Utf8Chunked::new("", &[Some("foo"), None, Some("bar"), Some("ham")]);
-        let ca = ca.cast(&DataType::Categorical(None)).unwrap();
+        disable_string_cache();
+        let ca = StringChunked::new("", &[Some("foo"), None, Some("bar"), Some("ham")]);
+        let ca = ca
+            .cast(&DataType::Categorical(None, Default::default()))
+            .unwrap();
         let ca = ca.categorical().unwrap();
-        let v: Vec<_> = ca.logical().into_iter().collect();
+        let v: Vec<_> = ca.physical().into_iter().collect();
         assert_eq!(v, &[Some(0), None, Some(1), Some(2)]);
     }
 
     #[test]
     #[ignore]
     fn test_shrink_to_fit() {
-        let mut builder = Utf8ChunkedBuilder::new("foo", 2048, 100 * 2048);
+        let mut builder = StringChunkedBuilder::new("foo", 2048);
         builder.append_value("foo");
         let mut arr = builder.finish();
         let before = arr

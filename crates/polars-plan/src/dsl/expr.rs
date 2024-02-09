@@ -26,7 +26,8 @@ pub enum AggExpr {
     Last(Box<Expr>),
     Mean(Box<Expr>),
     Implode(Box<Expr>),
-    Count(Box<Expr>),
+    // include_nulls
+    Count(Box<Expr>, bool),
     Quantile {
         expr: Box<Expr>,
         quantile: Box<Expr>,
@@ -50,7 +51,7 @@ impl AsRef<Expr> for AggExpr {
             Last(e) => e,
             Mean(e) => e,
             Implode(e) => e,
-            Count(e) => e,
+            Count(e, _) => e,
             Quantile { expr, .. } => expr,
             Sum(e) => e,
             AggGroups(e) => e,
@@ -86,9 +87,10 @@ pub enum Expr {
         expr: Box<Expr>,
         options: SortOptions,
     },
-    Take {
+    Gather {
         expr: Box<Expr>,
         idx: Box<Expr>,
+        returns_scalar: bool,
     },
     SortBy {
         expr: Box<Expr>,
@@ -120,8 +122,7 @@ pub enum Expr {
         /// Also has the input. i.e. avg("foo")
         function: Box<Expr>,
         partition_by: Vec<Expr>,
-        order_by: Option<Box<Expr>>,
-        options: WindowOptions,
+        options: WindowType,
     },
     Wildcard,
     Slice {
@@ -134,8 +135,7 @@ pub enum Expr {
     Exclude(Box<Expr>, Vec<Excluded>),
     /// Set root name as Alias
     KeepName(Box<Expr>),
-    /// Special case that does not need columns
-    Count,
+    Len,
     /// Take the nth column in the `DataFrame`
     Nth(i64),
     // skipped fields must be last otherwise serde fails in pickle
@@ -154,6 +154,7 @@ pub enum Expr {
         output_type: GetOutput,
         options: FunctionOptions,
     },
+    SubPlan(SpecialEq<Arc<LogicalPlan>>, Vec<String>),
     /// Expressions in this node should only be expanding
     /// e.g.
     /// `Expr::Columns`
@@ -221,7 +222,7 @@ impl Hash for Expr {
                 options.hash(state);
             },
             // already hashed by discriminant
-            Expr::Wildcard | Expr::Count => {},
+            Expr::Wildcard | Expr::Len => {},
             #[allow(unreachable_code)]
             _ => {
                 // the panic checks if we hit this
@@ -295,6 +296,8 @@ pub enum Operator {
     And,
     Or,
     Xor,
+    LogicalAnd,
+    LogicalOr,
 }
 
 impl Display for Operator {
@@ -316,8 +319,8 @@ impl Display for Operator {
             TrueDivide => "/",
             FloorDivide => "floor_div",
             Modulus => "%",
-            And => "&",
-            Or => "|",
+            And | LogicalAnd => "&",
+            Or | LogicalOr => "|",
             Xor => "^",
         };
         write!(f, "{tkn}")

@@ -106,7 +106,7 @@
 //!
 //! ## Groupby
 //!
-//! This example is from the polars [user guide](https://pola-rs.github.io/polars/user-guide/concepts/contexts/#group_by-aggregation).
+//! This example is from the polars [user guide](https://docs.pola.rs/user-guide/concepts/contexts/#group_by-aggregation).
 //!
 //! ```
 //! use polars::prelude::*;
@@ -114,7 +114,7 @@
 //!
 //!  let df = LazyCsvReader::new("reddit.csv")
 //!     .has_header(true)
-//!     .with_delimiter(b',')
+//!     .with_separator(b',')
 //!     .finish()?
 //!     .group_by([col("comment_karma")])
 //!     .agg([col("name").n_unique().alias("unique_names"), col("link_karma").max()])

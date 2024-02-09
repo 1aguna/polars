@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use polars_core::datatypes::Field;
 use polars_core::error::PolarsResult;
+use polars_core::frame::DataFrame;
 use polars_core::prelude::{DataType, SchemaRef, Series, IDX_DTYPE};
 use polars_core::schema::Schema;
+use polars_io::predicates::PhysicalIoExpr;
 use polars_plan::dsl::Expr;
 use polars_plan::logical_plan::{ArenaExprIter, Context};
 use polars_plan::prelude::{AAggExpr, AExpr};
@@ -21,9 +23,14 @@ use crate::executors::sinks::group_by::aggregates::{AggregateFunction, SumAgg};
 use crate::expressions::PhysicalPipedExpr;
 use crate::operators::DataChunk;
 
-struct Count {}
+struct Len {}
 
-impl PhysicalPipedExpr for Count {
+impl PhysicalIoExpr for Len {
+    fn evaluate_io(&self, _df: &DataFrame) -> PolarsResult<Series> {
+        unimplemented!()
+    }
+}
+impl PhysicalPipedExpr for Len {
     fn evaluate(&self, chunk: &DataChunk, _lazy_state: &dyn Any) -> PolarsResult<Series> {
         // the length must match the chunks as the operators expect that
         // so we fill a null series.
@@ -35,7 +42,7 @@ impl PhysicalPipedExpr for Count {
     }
 
     fn expression(&self) -> Expr {
-        Expr::Count
+        Expr::Len
     }
 }
 
@@ -50,7 +57,7 @@ pub fn can_convert_to_hash_agg(
         .map(|(_, ae)| {
             match ae {
                 AExpr::Agg(_)
-                | AExpr::Count
+                | AExpr::Len
                 | AExpr::Cast { .. }
                 | AExpr::Literal(_)
                 | AExpr::Column(_)
@@ -63,7 +70,7 @@ pub fn can_convert_to_hash_agg(
             }
             ae
         })
-        .filter(|ae| matches!(ae, AExpr::Agg(_) | AExpr::Count))
+        .filter(|ae| matches!(ae, AExpr::Agg(_) | AExpr::Len))
         .count()
         == 1
         && can_run_partitioned
@@ -73,7 +80,7 @@ pub fn can_convert_to_hash_agg(
             node = *input
         }
         match expr_arena.get(node) {
-            AExpr::Count => true,
+            AExpr::Len => true,
             ae @ AExpr::Agg(agg_fn) => {
                 matches!(
                     agg_fn,
@@ -81,7 +88,7 @@ pub fn can_convert_to_hash_agg(
                         | AAggExpr::First(_)
                         | AAggExpr::Last(_)
                         | AAggExpr::Mean(_)
-                        | AAggExpr::Count(_)
+                        | AAggExpr::Count(_, false)
                 ) || (matches!(
                     agg_fn,
                     AAggExpr::Max {
@@ -121,9 +128,9 @@ where
 {
     match expr_arena.get(node) {
         AExpr::Alias(input, _) => convert_to_hash_agg(*input, expr_arena, schema, to_physical),
-        AExpr::Count => (
+        AExpr::Len => (
             IDX_DTYPE,
-            Arc::new(Count {}),
+            Arc::new(Len {}),
             AggregateFunction::Count(CountAgg::new()),
         ),
         AExpr::Agg(agg) => match agg {
@@ -170,7 +177,10 @@ where
                 let logical_dtype = phys_expr.field(schema).unwrap().dtype;
 
                 #[cfg(feature = "dtype-categorical")]
-                if matches!(logical_dtype, DataType::Categorical(_)) {
+                if matches!(
+                    logical_dtype,
+                    DataType::Categorical(_, _) | DataType::Enum(_, _)
+                ) {
                     return (
                         logical_dtype.clone(),
                         phys_expr,
@@ -208,7 +218,10 @@ where
 
                 let logical_dtype = phys_expr.field(schema).unwrap().dtype;
                 #[cfg(feature = "dtype-categorical")]
-                if matches!(logical_dtype, DataType::Categorical(_)) {
+                if matches!(
+                    logical_dtype,
+                    DataType::Categorical(_, _) | DataType::Enum(_, _)
+                ) {
                     return (
                         logical_dtype.clone(),
                         phys_expr,
@@ -241,7 +254,7 @@ where
                     AggregateFunction::Last(LastAgg::new(logical_dtype.to_physical())),
                 )
             },
-            AAggExpr::Count(input) => {
+            AAggExpr::Count(input, _) => {
                 let phys_expr = to_physical(*input, expr_arena, Some(schema)).unwrap();
                 let logical_dtype = phys_expr.field(schema).unwrap().dtype;
                 (

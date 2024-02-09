@@ -1,9 +1,10 @@
-//! Used to speed up PartialEq and PartialOrd of elements within an array
+//! Used to speed up TotalEq and TotalOrd of elements within an array.
 
-use std::cmp::{Ordering, PartialEq};
+use std::cmp::Ordering;
 
 use crate::chunked_array::ChunkedArrayLayout;
 use crate::prelude::*;
+use crate::series::implementations::null::NullChunked;
 
 #[repr(transparent)]
 struct NonNull<T>(T);
@@ -41,42 +42,54 @@ impl<'a, T: StaticArray> GetInner for NonNull<&'a T> {
     }
 }
 
-pub trait PartialEqInner: Send + Sync {
+pub trait TotalEqInner: Send + Sync {
     /// # Safety
     /// Does not do any bound checks.
     unsafe fn eq_element_unchecked(&self, idx_a: usize, idx_b: usize) -> bool;
 }
 
-pub trait PartialOrdInner: Send + Sync {
+pub trait TotalOrdInner: Send + Sync {
     /// # Safety
     /// Does not do any bound checks.
     unsafe fn cmp_element_unchecked(&self, idx_a: usize, idx_b: usize) -> Ordering;
 }
 
-impl<T> PartialEqInner for T
+impl<T> TotalEqInner for T
 where
     T: GetInner + Send + Sync,
-    T::Item: PartialEq,
+    T::Item: TotalEq,
 {
     #[inline]
     unsafe fn eq_element_unchecked(&self, idx_a: usize, idx_b: usize) -> bool {
-        self.get_unchecked(idx_a) == self.get_unchecked(idx_b)
+        self.get_unchecked(idx_a).tot_eq(&self.get_unchecked(idx_b))
     }
 }
 
-/// Create a type that implements PartialEqInner.
-pub(crate) trait IntoPartialEqInner<'a> {
+impl TotalEqInner for &NullChunked {
+    unsafe fn eq_element_unchecked(&self, _idx_a: usize, _idx_b: usize) -> bool {
+        true
+    }
+}
+
+/// Create a type that implements TotalEqInner.
+pub(crate) trait IntoTotalEqInner<'a> {
     /// Create a type that implements `TakeRandom`.
-    fn into_partial_eq_inner(self) -> Box<dyn PartialEqInner + 'a>;
+    fn into_total_eq_inner(self) -> Box<dyn TotalEqInner + 'a>;
+}
+
+impl<'a> IntoTotalEqInner<'a> for &'a NullChunked {
+    fn into_total_eq_inner(self) -> Box<dyn TotalEqInner + 'a> {
+        Box::new(self)
+    }
 }
 
 /// We use a trait object because we want to call this from Series and cannot use a typed enum.
-impl<'a, T> IntoPartialEqInner<'a> for &'a ChunkedArray<T>
+impl<'a, T> IntoTotalEqInner<'a> for &'a ChunkedArray<T>
 where
     T: PolarsDataType,
-    T::Physical<'a>: PartialEq,
+    T::Physical<'a>: TotalEq,
 {
-    fn into_partial_eq_inner(self) -> Box<dyn PartialEqInner + 'a> {
+    fn into_total_eq_inner(self) -> Box<dyn TotalEqInner + 'a> {
         match self.layout() {
             ChunkedArrayLayout::SingleNoNull(arr) => Box::new(NonNull(arr)),
             ChunkedArrayLayout::Single(arr) => Box::new(arr),
@@ -86,44 +99,31 @@ where
     }
 }
 
-// Partial ordering implementations.
-#[inline]
-fn fallback<T: PartialEq>(a: T) -> Ordering {
-    // This is a simple way to check if it is nan
-    // without convincing the compiler we deal with floats.
-    #[allow(clippy::eq_op)]
-    if a != a {
-        Ordering::Less
-    } else {
-        Ordering::Greater
-    }
-}
-
-impl<T> PartialOrdInner for T
+impl<T> TotalOrdInner for T
 where
     T: GetInner + Send + Sync,
-    T::Item: PartialOrd,
+    T::Item: TotalOrd,
 {
     #[inline]
     unsafe fn cmp_element_unchecked(&self, idx_a: usize, idx_b: usize) -> Ordering {
         let a = self.get_unchecked(idx_a);
         let b = self.get_unchecked(idx_b);
-        a.partial_cmp(&b).unwrap_or_else(|| fallback(a))
+        a.tot_cmp(&b)
     }
 }
 
-/// Create a type that implements PartialOrdInner.
-pub(crate) trait IntoPartialOrdInner<'a> {
+/// Create a type that implements TotalOrdInner.
+pub(crate) trait IntoTotalOrdInner<'a> {
     /// Create a type that implements `TakeRandom`.
-    fn into_partial_ord_inner(self) -> Box<dyn PartialOrdInner + 'a>;
+    fn into_total_ord_inner(self) -> Box<dyn TotalOrdInner + 'a>;
 }
 
-impl<'a, T> IntoPartialOrdInner<'a> for &'a ChunkedArray<T>
+impl<'a, T> IntoTotalOrdInner<'a> for &'a ChunkedArray<T>
 where
     T: PolarsDataType,
-    T::Physical<'a>: PartialOrd,
+    T::Physical<'a>: TotalOrd,
 {
-    fn into_partial_ord_inner(self) -> Box<dyn PartialOrdInner + 'a> {
+    fn into_total_ord_inner(self) -> Box<dyn TotalOrdInner + 'a> {
         match self.layout() {
             ChunkedArrayLayout::SingleNoNull(arr) => Box::new(NonNull(arr)),
             ChunkedArrayLayout::Single(arr) => Box::new(arr),
@@ -135,7 +135,7 @@ where
 
 #[cfg(feature = "dtype-categorical")]
 struct LocalCategorical<'a> {
-    rev_map: &'a Utf8Array<i64>,
+    rev_map: &'a Utf8ViewArray,
     cats: &'a UInt32Chunked,
 }
 
@@ -151,7 +151,7 @@ impl<'a> GetInner for LocalCategorical<'a> {
 #[cfg(feature = "dtype-categorical")]
 struct GlobalCategorical<'a> {
     p1: &'a PlHashMap<u32, u32>,
-    p2: &'a Utf8Array<i64>,
+    p2: &'a Utf8ViewArray,
     cats: &'a UInt32Chunked,
 }
 
@@ -166,12 +166,12 @@ impl<'a> GetInner for GlobalCategorical<'a> {
 }
 
 #[cfg(feature = "dtype-categorical")]
-impl<'a> IntoPartialOrdInner<'a> for &'a CategoricalChunked {
-    fn into_partial_ord_inner(self) -> Box<dyn PartialOrdInner + 'a> {
-        let cats = self.logical();
+impl<'a> IntoTotalOrdInner<'a> for &'a CategoricalChunked {
+    fn into_total_ord_inner(self) -> Box<dyn TotalOrdInner + 'a> {
+        let cats = self.physical();
         match &**self.get_rev_map() {
             RevMapping::Global(p1, p2, _) => Box::new(GlobalCategorical { p1, p2, cats }),
-            RevMapping::Local(rev_map) => Box::new(LocalCategorical { rev_map, cats }),
+            RevMapping::Local(rev_map, _) => Box::new(LocalCategorical { rev_map, cats }),
         }
     }
 }

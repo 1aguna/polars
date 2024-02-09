@@ -1,16 +1,18 @@
 mod aggregation;
 mod arithmetic;
 mod buffers;
+mod c_interface;
 mod comparison;
 mod construction;
 mod export;
 mod numpy_ufunc;
-mod set_at_idx;
+mod scatter;
 
-use polars_algo::hist;
+use std::io::Cursor;
+
 use polars_core::series::IsSorted;
 use polars_core::utils::flatten::flatten_series;
-use polars_core::with_match_physical_numeric_polars_type;
+use polars_core::{with_match_physical_numeric_polars_type, with_match_physical_numeric_type};
 use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -116,7 +118,7 @@ impl PySeries {
     #[cfg(feature = "object")]
     fn get_object(&self, index: usize) -> PyObject {
         Python::with_gil(|py| {
-            if matches!(self.series.dtype(), DataType::Object(_)) {
+            if matches!(self.series.dtype(), DataType::Object(_, _)) {
                 let obj: Option<&ObjectValue> = self.series.get_object(index).map(|any| any.into());
                 obj.to_object(py)
             } else {
@@ -127,7 +129,9 @@ impl PySeries {
 
     fn get_fmt(&self, index: usize, str_lengths: usize) -> String {
         let val = format!("{}", self.series.get(index).unwrap());
-        if let DataType::Utf8 | DataType::Categorical(_) = self.series.dtype() {
+        if let DataType::String | DataType::Categorical(_, _) | DataType::Enum(_, _) =
+            self.series.dtype()
+        {
             let v_trunc = &val[..val
                 .char_indices()
                 .take(str_lengths)
@@ -163,17 +167,20 @@ impl PySeries {
             Err(e) => return Err(PyPolarsErr::from(e).into()),
         };
 
-        if let AnyValue::List(s) = av {
-            let pyseries = PySeries::new(s);
-            let out = POLARS
-                .getattr(py, "wrap_s")
-                .unwrap()
-                .call1(py, (pyseries,))
-                .unwrap();
-            return Ok(out.into_py(py));
-        }
+        let out = match av {
+            AnyValue::List(s) | AnyValue::Array(s, _) => {
+                let pyseries = PySeries::new(s);
+                let out = POLARS
+                    .getattr(py, "wrap_s")
+                    .unwrap()
+                    .call1(py, (pyseries,))
+                    .unwrap();
+                out.into_py(py)
+            },
+            _ => Wrap(av).into_py(py),
+        };
 
-        Ok(Wrap(av).into_py(py))
+        Ok(out)
     }
 
     /// Get index but allow negative indices
@@ -232,13 +239,6 @@ impl PySeries {
         Wrap(self.series.dtype().clone()).to_object(py)
     }
 
-    fn inner_dtype(&self, py: Python) -> Option<PyObject> {
-        self.series
-            .dtype()
-            .inner_dtype()
-            .map(|dt| Wrap(dt.clone()).to_object(py))
-    }
-
     fn set_sorted_flag(&self, descending: bool) -> Self {
         let mut out = self.series.clone();
         if descending {
@@ -285,8 +285,8 @@ impl PySeries {
         }
     }
 
-    fn sort(&mut self, descending: bool) -> Self {
-        self.series.sort(descending).into()
+    fn sort(&mut self, descending: bool, nulls_last: bool) -> Self {
+        self.series.sort(descending, nulls_last).into()
     }
 
     fn take_with_series(&self, indices: &PySeries) -> PyResult<Self> {
@@ -303,14 +303,14 @@ impl PySeries {
         self.series.has_validity()
     }
 
-    fn series_equal(&self, other: &PySeries, null_equal: bool, strict: bool) -> bool {
+    fn equals(&self, other: &PySeries, null_equal: bool, strict: bool) -> bool {
         if strict && (self.series.dtype() != other.series.dtype()) {
             return false;
         }
         if null_equal {
-            self.series.series_equal_missing(&other.series)
+            self.series.equals_missing(&other.series)
         } else {
-            self.series.series_equal(&other.series)
+            self.series.equals(&other.series)
         }
     }
 
@@ -346,7 +346,7 @@ impl PySeries {
             if let Some(output_type) = output_type {
                 return Ok(Series::full_null(series.name(), series.len(), &output_type.0).into());
             }
-            let msg = "The output type of 'apply' function cannot determined.\n\
+            let msg = "The output type of the 'apply' function cannot be determined.\n\
             The function was never called because 'skip_nulls=True' and all values are null.\n\
             Consider setting 'skip_nulls=False' or setting the 'return_dtype'.";
             raise_err!(msg, ComputeError)
@@ -358,7 +358,7 @@ impl PySeries {
             ($self:expr, $method:ident, $($args:expr),*) => {
                 match $self.dtype() {
                     #[cfg(feature = "object")]
-                    DataType::Object(_) => {
+                    DataType::Object(_, _) => {
                         let ca = $self.0.unpack::<ObjectType<ObjectValue>>().unwrap();
                         ca.$method($($args),*)
                     },
@@ -381,7 +381,8 @@ impl PySeries {
                 DataType::Datetime(_, _)
                     | DataType::Date
                     | DataType::Duration(_)
-                    | DataType::Categorical(_)
+                    | DataType::Categorical(_, _)
+                    | DataType::Enum(_, _)
                     | DataType::Binary
                     | DataType::Array(_, _)
                     | DataType::Time
@@ -523,10 +524,10 @@ impl PySeries {
                     )?;
                     ca.into_series()
                 },
-                Some(DataType::Utf8) => {
+                Some(DataType::String) => {
                     let ca = dispatch_apply!(
                         series,
-                        apply_lambda_with_utf8_out_type,
+                        apply_lambda_with_string_out_type,
                         py,
                         lambda,
                         0,
@@ -536,7 +537,7 @@ impl PySeries {
                     ca.into_series()
                 },
                 #[cfg(feature = "object")]
-                Some(DataType::Object(_)) => {
+                Some(DataType::Object(_, _)) => {
                     let ca = dispatch_apply!(
                         series,
                         apply_lambda_with_object_out_type,
@@ -579,14 +580,6 @@ impl PySeries {
         Some(ca.get_as_series(index)?.into())
     }
 
-    fn peak_max(&self) -> Self {
-        self.series.peak_max().into_series().into()
-    }
-
-    fn peak_min(&self) -> Self {
-        self.series.peak_min().into_series().into()
-    }
-
     fn n_unique(&self) -> PyResult<usize> {
         let n = self.series.n_unique().map_err(PyPolarsErr::from)?;
         Ok(n)
@@ -601,26 +594,43 @@ impl PySeries {
         self.series.shrink_to_fit();
     }
 
-    fn dot(&self, other: &PySeries) -> Option<f64> {
-        self.series.dot(&other.series)
+    fn dot(&self, other: &PySeries) -> PyResult<f64> {
+        let out = self.series.dot(&other.series).map_err(PyPolarsErr::from)?;
+        Ok(out)
     }
 
+    #[cfg(feature = "ipc_streaming")]
     fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
         // Used in pickle/pickling
-        let mut writer: Vec<u8> = vec![];
-        ciborium::ser::into_writer(&self.series, &mut writer)
-            .map_err(|e| PyPolarsErr::Other(format!("{}", e)))?;
-
-        Ok(PyBytes::new(py, &writer).to_object(py))
+        let mut buf: Vec<u8> = vec![];
+        // IPC only support DataFrames so we need to convert it
+        let mut df = self.series.clone().into_frame();
+        IpcStreamWriter::new(&mut buf)
+            .with_pl_flavor(true)
+            .finish(&mut df)
+            .expect("ipc writer");
+        Ok(PyBytes::new(py, &buf).to_object(py))
     }
 
+    #[cfg(feature = "ipc_streaming")]
     fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
         // Used in pickle/pickling
         match state.extract::<&PyBytes>(py) {
             Ok(s) => {
-                self.series = ciborium::de::from_reader(s.as_bytes())
-                    .map_err(|e| PyPolarsErr::Other(format!("{}", e)))?;
-                Ok(())
+                let c = Cursor::new(s.as_bytes());
+                let reader = IpcStreamReader::new(c);
+                let mut df = reader.finish().map_err(PyPolarsErr::from)?;
+
+                df.pop()
+                    .map(|s| {
+                        self.series = s;
+                    })
+                    .ok_or_else(|| {
+                        PyPolarsErr::from(PolarsError::NoData(
+                            "No columns found in IPC byte stream".into(),
+                        ))
+                        .into()
+                    })
             },
             Err(e) => Err(e),
         }
@@ -674,9 +684,29 @@ impl PySeries {
         self.series.clear().into()
     }
 
-    fn hist(&self, bins: Option<Self>, bin_count: Option<usize>) -> PyResult<PyDataFrame> {
-        let bins = bins.map(|s| s.series);
-        let out = hist(&self.series, bins.as_ref(), bin_count).map_err(PyPolarsErr::from)?;
+    fn head(&self, n: usize) -> Self {
+        self.series.head(Some(n)).into()
+    }
+
+    fn tail(&self, n: usize) -> Self {
+        self.series.tail(Some(n)).into()
+    }
+
+    fn value_counts(&self, sort: bool, parallel: bool) -> PyResult<PyDataFrame> {
+        let out = self
+            .series
+            .value_counts(sort, parallel)
+            .map_err(PyPolarsErr::from)?;
+        Ok(out.into())
+    }
+
+    fn slice(&self, offset: i64, length: Option<usize>) -> Self {
+        let length = length.unwrap_or_else(|| self.series.len());
+        self.series.slice(offset, length).into()
+    }
+
+    pub fn not_(&self) -> PyResult<Self> {
+        let out = polars_ops::series::negate_bitwise(&self.series).map_err(PyPolarsErr::from)?;
         Ok(out.into())
     }
 }
@@ -704,7 +734,7 @@ macro_rules! impl_set_with_mask {
     };
 }
 
-impl_set_with_mask!(set_with_mask_str, &str, utf8, Utf8);
+impl_set_with_mask!(set_with_mask_str, &str, str, String);
 impl_set_with_mask!(set_with_mask_f64, f64, f64, Float64);
 impl_set_with_mask!(set_with_mask_f32, f32, f32, Float32);
 impl_set_with_mask!(set_with_mask_u8, u8, u8, UInt8);
@@ -747,7 +777,7 @@ impl_get!(get_i8, i8, i8);
 impl_get!(get_i16, i16, i16);
 impl_get!(get_i32, i32, i32);
 impl_get!(get_i64, i64, i64);
-impl_get!(get_str, utf8, &str);
+impl_get!(get_str, str, &str);
 impl_get!(get_date, date, i32);
 impl_get!(get_datetime, datetime, i64);
 impl_get!(get_duration, duration, i64);
@@ -766,12 +796,14 @@ mod test {
 
         let s = unsafe { std::mem::transmute::<PySeries, Series>(ps.clone()) };
 
-        assert_eq!(s.sum::<i32>(), Some(6));
+        assert_eq!(s.sum::<i32>().unwrap(), 6);
         let collection = vec![ps];
         let s = collection.to_series();
         assert_eq!(
-            s.iter().map(|s| s.sum::<i32>()).collect::<Vec<_>>(),
-            vec![Some(6)]
+            s.iter()
+                .map(|s| s.sum::<i32>().unwrap())
+                .collect::<Vec<_>>(),
+            vec![6]
         );
     }
 }

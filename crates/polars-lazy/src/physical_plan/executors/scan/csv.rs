@@ -29,7 +29,7 @@ impl CsvExec {
             .unwrap()
             .has_header(self.options.has_header)
             .with_dtypes(Some(self.schema.clone()))
-            .with_delimiter(self.options.delimiter)
+            .with_separator(self.options.separator)
             .with_ignore_errors(self.options.ignore_errors)
             .with_skip_rows(self.options.skip_rows)
             .with_n_rows(n_rows)
@@ -38,13 +38,14 @@ impl CsvExec {
             .with_null_values(std::mem::take(&mut self.options.null_values))
             .with_predicate(predicate)
             .with_encoding(CsvEncoding::LossyUtf8)
-            .with_comment_char(self.options.comment_char)
+            ._with_comment_prefix(std::mem::take(&mut self.options.comment_prefix))
             .with_quote_char(self.options.quote_char)
             .with_end_of_line_char(self.options.eol_char)
             .with_encoding(self.options.encoding)
             .with_rechunk(self.file_options.rechunk)
-            .with_row_count(std::mem::take(&mut self.file_options.row_count))
+            .with_row_index(std::mem::take(&mut self.file_options.row_index))
             .with_try_parse_dates(self.options.try_parse_dates)
+            .with_n_threads(self.options.n_threads)
             .truncate_ragged_lines(self.options.truncate_ragged_lines)
             .raise_if_empty(self.options.raise_if_empty)
             .finish()
@@ -53,8 +54,9 @@ impl CsvExec {
 
 impl Executor for CsvExec {
     fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
+        #[allow(clippy::useless_asref)]
         let finger_print = FileFingerPrint {
-            path: self.path.clone(),
+            paths: Arc::new([self.path.clone()]),
             predicate: self
                 .predicate
                 .as_ref()

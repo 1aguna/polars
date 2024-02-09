@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 
-use polars_arrow::utils::CustomIterTools;
+use arrow::array::ValueSize;
+use arrow::legacy::utils::CustomIterTools;
 use polars_core::prelude::*;
 use polars_plan::constants::MAP_LIST_NAME;
 use polars_plan::dsl::*;
@@ -23,11 +24,9 @@ impl IntoListNameSpace for ListNameSpace {
 fn offsets_to_groups(offsets: &[i64]) -> Option<GroupsProxy> {
     let mut start = offsets[0];
     let end = *offsets.last().unwrap();
-    let fits_into_idx = (end - start) <= IdxSize::MAX as i64;
-    if !fits_into_idx {
+    if IdxSize::try_from(end - start).is_err() {
         return None;
     }
-
     let groups = offsets
         .iter()
         .skip(1)
@@ -121,8 +120,9 @@ fn run_on_group_by_engine(
     // List elements in a series.
     let values = Series::try_from(("", arr.values().clone())).unwrap();
     let inner_dtype = lst.inner_dtype();
-    // Ensure we use the logical type.
-    let values = values.cast(&inner_dtype).unwrap();
+    // SAFETY
+    // Invariant in List means values physicals can be cast to inner dtype
+    let values = unsafe { values.cast_unchecked(&inner_dtype).unwrap() };
 
     let df_context = DataFrame::new_no_checks(vec![values]);
     let phys_expr = prepare_expression_for_context("", expr, &inner_dtype, Context::Aggregation)?;
@@ -130,7 +130,7 @@ fn run_on_group_by_engine(
     let state = ExecutionState::new();
     let mut ac = phys_expr.evaluate_on_groups(&df_context, &groups, &state)?;
     let out = match ac.agg_state() {
-        AggState::AggregatedFlat(_) | AggState::Literal(_) => {
+        AggState::AggregatedScalar(_) | AggState::Literal(_) => {
             let out = ac.aggregated();
             out.as_list().into_series()
         },
@@ -150,7 +150,7 @@ pub trait ListNameSpaceExtension: IntoListNameSpace + Sized {
                 match e {
                     #[cfg(feature = "dtype-categorical")]
                     Expr::Cast {
-                        data_type: DataType::Categorical(_),
+                        data_type: DataType::Categorical(_, _) | DataType::Enum(_, _),
                         ..
                     } => {
                         polars_bail!(
@@ -176,7 +176,7 @@ pub trait ListNameSpaceExtension: IntoListNameSpace + Sized {
                 return Ok(Some(Series::new_empty(s.name(), output_field.data_type())));
             }
             if lst.null_count() == lst.len() {
-                return Ok(Some(s));
+                return Ok(Some(s.cast(output_field.data_type())?));
             }
 
             let fits_idx_size = lst.get_values_size() <= (IdxSize::MAX as usize);

@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use polars::io::RowCount;
+use polars::io::RowIndex;
 
 use super::*;
 
@@ -12,7 +12,7 @@ fn write_csv() {
     let mut df = create_df();
 
     CsvWriter::new(&mut buf)
-        .has_header(true)
+        .include_header(true)
         .finish(&mut df)
         .expect("csv written");
     let csv = std::str::from_utf8(&buf).unwrap();
@@ -20,7 +20,7 @@ fn write_csv() {
 
     let mut buf: Vec<u8> = Vec::new();
     CsvWriter::new(&mut buf)
-        .has_header(false)
+        .include_header(false)
         .finish(&mut df)
         .expect("csv written");
     let csv = std::str::from_utf8(&buf).unwrap();
@@ -28,7 +28,7 @@ fn write_csv() {
 
     let mut buf: Vec<u8> = Vec::new();
     CsvWriter::new(&mut buf)
-        .has_header(false)
+        .include_header(false)
         .with_line_terminator("\r\n".into())
         .finish(&mut df)
         .expect("csv written");
@@ -103,8 +103,8 @@ fn test_parser() -> PolarsResult<()> {
         .unwrap();
 
     let col = df.column("variety").unwrap();
-    assert_eq!(col.get(0)?, AnyValue::Utf8("Setosa"));
-    assert_eq!(col.get(2)?, AnyValue::Utf8("Setosa"));
+    assert_eq!(col.get(0)?, AnyValue::String("Setosa"));
+    assert_eq!(col.get(2)?, AnyValue::String("Setosa"));
 
     assert_eq!("sepal.length", df.get_columns()[0].name());
     assert_eq!(1, df.column("sepal.length").unwrap().chunks().len());
@@ -153,7 +153,7 @@ fn test_tab_sep() {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
         .infer_schema(Some(100))
-        .with_delimiter(b'\t')
+        .with_separator(b'\t')
         .has_header(false)
         .with_ignore_errors(true)
         .finish()
@@ -169,9 +169,9 @@ fn test_projection() -> PolarsResult<()> {
         .finish()
         .unwrap();
     let col_1 = df.select_at_idx(0).unwrap();
-    assert_eq!(col_1.get(0)?, AnyValue::Utf8("vegetables"));
-    assert_eq!(col_1.get(1)?, AnyValue::Utf8("seafood"));
-    assert_eq!(col_1.get(2)?, AnyValue::Utf8("meat"));
+    assert_eq!(col_1.get(0)?, AnyValue::String("vegetables"));
+    assert_eq!(col_1.get(1)?, AnyValue::String("seafood"));
+    assert_eq!(col_1.get(2)?, AnyValue::String("meat"));
 
     let col_2 = df.select_at_idx(1).unwrap();
     assert_eq!(col_2.get(0)?, AnyValue::Float64(0.5));
@@ -184,8 +184,8 @@ fn test_projection() -> PolarsResult<()> {
 fn test_missing_data() {
     // missing data should not lead to parser error.
     let csv = r#"column_1,column_2,column_3
-        1,2,3
-        1,,3
+1,2,3
+1,,3
 "#;
 
     let file = Cursor::new(csv);
@@ -193,15 +193,15 @@ fn test_missing_data() {
     assert!(df
         .column("column_1")
         .unwrap()
-        .series_equal(&Series::new("column_1", &[1_i64, 1])));
+        .equals(&Series::new("column_1", &[1_i64, 1])));
     assert!(df
         .column("column_2")
         .unwrap()
-        .series_equal_missing(&Series::new("column_2", &[Some(2_i64), None])));
+        .equals_missing(&Series::new("column_2", &[Some(2_i64), None])));
     assert!(df
         .column("column_3")
         .unwrap()
-        .series_equal(&Series::new("column_3", &[3_i64, 3])));
+        .equals(&Series::new("column_3", &[3_i64, 3])));
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn test_escape_comma() {
     assert!(df
         .column("column_3")
         .unwrap()
-        .series_equal(&Series::new("column_3", &[11_i64, 12])));
+        .equals(&Series::new("column_3", &[11_i64, 12])));
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn test_escape_double_quotes() {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).finish().unwrap();
     assert_eq!(df.shape(), (2, 3));
-    assert!(df.column("column_2").unwrap().series_equal(&Series::new(
+    assert!(df.column("column_2").unwrap().equals(&Series::new(
         "column_2",
         &[
             r#"with "double quotes" US"#,
@@ -285,7 +285,7 @@ hello,","," ",world,"!"
         assert!(df
             .column(col)
             .unwrap()
-            .series_equal(&Series::new(col, &[&**val; 4])));
+            .equals(&Series::new(col, &[&**val; 4])));
     }
 }
 
@@ -304,7 +304,7 @@ versions of Lorem Ipsum.",11
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).finish().unwrap();
 
-    assert!(df.column("column_2").unwrap().series_equal(&Series::new(
+    assert!(df.column("column_2").unwrap().equals(&Series::new(
         "column_2",
         &[
             r#"Lorem Ipsum is simply dummy text of the printing and typesetting
@@ -380,7 +380,7 @@ fn test_quoted_numeric() {
 
 #[test]
 fn test_empty_bytes_to_dataframe() {
-    let fields = vec![Field::new("test_field", DataType::Utf8)];
+    let fields = vec![Field::new("test_field", DataType::String)];
     let schema = Schema::from_iter(fields);
     let file = Cursor::new(vec![]);
 
@@ -448,7 +448,7 @@ AUDCAD,1616455921,0.96212,0.95666,1
     assert_eq!(
         df.dtypes(),
         &[
-            DataType::Utf8,
+            DataType::String,
             DataType::Datetime(TimeUnit::Nanoseconds, None),
             DataType::Float64,
             DataType::Float64,
@@ -472,10 +472,9 @@ fn test_skip_rows() -> PolarsResult<()> {
     let df = CsvReader::new(file)
         .has_header(false)
         .with_skip_rows(3)
-        .with_delimiter(b' ')
+        .with_separator(b' ')
         .finish()?;
 
-    dbg!(&df);
     assert_eq!(df.height(), 3);
     Ok(())
 }
@@ -491,7 +490,7 @@ fn test_projection_idx() -> PolarsResult<()> {
     let df = CsvReader::new(file)
         .has_header(false)
         .with_projection(Some(vec![4, 5]))
-        .with_delimiter(b' ')
+        .with_separator(b' ')
         .finish()?;
 
     assert_eq!(df.width(), 2);
@@ -501,7 +500,7 @@ fn test_projection_idx() -> PolarsResult<()> {
     let out = CsvReader::new(file)
         .has_header(false)
         .with_projection(Some(vec![4, 6]))
-        .with_delimiter(b' ')
+        .with_separator(b' ')
         .finish();
 
     assert!(out.is_err());
@@ -527,7 +526,7 @@ fn test_missing_fields() -> PolarsResult<()> {
         "column_4" => [Some(4), None, Some(4), None],
         "column_5" => [Some(5), None, Some(5), None]
     ]?;
-    assert!(df.frame_equal_missing(&expect));
+    assert!(df.equals_missing(&expect));
     Ok(())
 }
 
@@ -543,7 +542,21 @@ fn test_comment_lines() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
         .has_header(false)
-        .with_comment_char(Some(b'#'))
+        .with_comment_prefix(Some("#"))
+        .finish()?;
+    assert_eq!(df.shape(), (3, 5));
+
+    let csv = r"!str,2,3,4,5
+!#& this is a comment
+!str,2,3,4,5
+!#& this is also a comment
+!str,2,3,4,5
+";
+
+    let file = Cursor::new(csv);
+    let df = CsvReader::new(file)
+        .has_header(false)
+        .with_comment_prefix(Some("!#&"))
         .finish()?;
     assert_eq!(df.shape(), (3, 5));
 
@@ -558,7 +571,7 @@ fn test_comment_lines() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
         .has_header(true)
-        .with_comment_char(Some(b'%'))
+        .with_comment_prefix(Some("%"))
         .finish()?;
     assert_eq!(df.shape(), (3, 5));
 
@@ -594,7 +607,7 @@ bar,bar";
         "a" => ["foo", "bar"],
         "b" => ["foo", "bar"]
     ]?;
-    assert!(df.frame_equal(&expect));
+    assert!(df.equals(&expect));
     Ok(())
 }
 
@@ -689,7 +702,7 @@ fn test_header_inference() -> PolarsResult<()> {
 "#;
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).has_header(false).finish()?;
-    assert_eq!(df.dtypes(), vec![DataType::Utf8; 4]);
+    assert_eq!(df.dtypes(), vec![DataType::String; 4]);
     Ok(())
 }
 
@@ -699,7 +712,7 @@ fn test_header_with_comments() -> PolarsResult<()> {
 
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
-        .with_comment_char(Some(b'#'))
+        .with_comment_prefix(Some("#"))
         .finish()?;
     // 1 row.
     assert_eq!(df.shape(), (1, 3));
@@ -721,10 +734,10 @@ fn test_ignore_parse_dates() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
         .with_try_parse_dates(true)
-        .with_dtypes_slice(Some(&[Utf8, Utf8, Utf8]))
+        .with_dtypes_slice(Some(&[String, String, String]))
         .finish()?;
 
-    assert_eq!(df.dtypes(), &[Utf8, Utf8, Utf8]);
+    assert_eq!(df.dtypes(), &[String, String, String]);
     Ok(())
 }
 
@@ -768,10 +781,10 @@ fn test_infer_schema_0_rows() -> PolarsResult<()> {
     assert_eq!(
         df.dtypes(),
         &[
-            DataType::Utf8,
-            DataType::Utf8,
-            DataType::Utf8,
-            DataType::Utf8
+            DataType::String,
+            DataType::String,
+            DataType::String,
+            DataType::String
         ]
     );
     Ok(())
@@ -783,12 +796,12 @@ fn test_infer_schema_eol() -> PolarsResult<()> {
     let no_eol = "colx,coly\nabcdef,1234";
     let file = Cursor::new(no_eol);
     let df = CsvReader::new(file).finish()?;
-    assert_eq!(df.dtypes(), &[DataType::Utf8, DataType::Int64,]);
+    assert_eq!(df.dtypes(), &[DataType::String, DataType::Int64,]);
     Ok(())
 }
 
 #[test]
-fn test_whitespace_delimiters() -> PolarsResult<()> {
+fn test_whitespace_separators() -> PolarsResult<()> {
     let tsv = "\ta\tb\tc\n1\ta1\tb1\tc1\n2\ta2\tb2\tc2\n".to_string();
 
     let contents = vec![
@@ -799,7 +812,7 @@ fn test_whitespace_delimiters() -> PolarsResult<()> {
 
     for (content, sep) in contents {
         let file = Cursor::new(&content);
-        let df = CsvReader::new(file).with_delimiter(sep).finish()?;
+        let df = CsvReader::new(file).with_separator(sep).finish()?;
 
         assert_eq!(df.shape(), (2, 4));
         assert_eq!(df.get_column_names(), &["", "a", "b", "c"]);
@@ -828,13 +841,13 @@ fn test_tsv_header_offset() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
         .truncate_ragged_lines(true)
-        .with_delimiter(b'\t')
+        .with_separator(b'\t')
         .finish()?;
 
     assert_eq!(df.shape(), (3, 2));
-    assert_eq!(df.dtypes(), &[DataType::Utf8, DataType::Int64]);
+    assert_eq!(df.dtypes(), &[DataType::String, DataType::Int64]);
     let a = df.column("foo")?;
-    let a = a.utf8()?;
+    let a = a.str()?;
     assert_eq!(a.get(0), None);
 
     Ok(())
@@ -859,8 +872,8 @@ fn test_null_values_infer_schema() -> PolarsResult<()> {
 fn test_comma_separated_field_in_tsv() -> PolarsResult<()> {
     let csv = "first\tsecond\n1\t2.3,2.4\n3\t4.5,4.6\n";
     let file = Cursor::new(csv);
-    let df = CsvReader::new(file).with_delimiter(b'\t').finish()?;
-    assert_eq!(df.dtypes(), &[DataType::Int64, DataType::Utf8]);
+    let df = CsvReader::new(file).with_separator(b'\t').finish()?;
+    assert_eq!(df.dtypes(), &[DataType::Int64, DataType::String]);
     Ok(())
 }
 
@@ -904,7 +917,7 @@ fn test_quoted_bool_ints() -> PolarsResult<()> {
         "bar" => [4, 5, 6],
         "baz" => [false, false, true],
     ]?;
-    assert!(df.frame_equal_missing(&expected));
+    assert!(df.equals_missing(&expected));
 
     Ok(())
 }
@@ -935,9 +948,9 @@ foo,bar
 }
 
 #[test]
-fn test_with_row_count() -> PolarsResult<()> {
+fn test_with_row_index() -> PolarsResult<()> {
     let df = CsvReader::from_path(FOODS_CSV)?
-        .with_row_count(Some(RowCount {
+        .with_row_index(Some(RowIndex {
             name: "rc".into(),
             offset: 0,
         }))
@@ -948,7 +961,7 @@ fn test_with_row_count() -> PolarsResult<()> {
         (0 as IdxSize..27).collect::<Vec<_>>()
     );
     let df = CsvReader::from_path(FOODS_CSV)?
-        .with_row_count(Some(RowCount {
+        .with_row_index(Some(RowIndex {
             name: "rc_2".into(),
             offset: 10,
         }))
@@ -967,9 +980,9 @@ fn test_empty_string_cols() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).has_header(false).finish()?;
     let s = df.column("column_1")?;
-    let ca = s.utf8()?;
+    let ca = s.str()?;
     assert_eq!(
-        ca.into_iter().collect::<Vec<_>>(),
+        ca.iter().collect::<Vec<_>>(),
         &[None, Some("abc"), None, Some("xyz")]
     );
 
@@ -980,7 +993,51 @@ fn test_empty_string_cols() -> PolarsResult<()> {
         "column_1" => [None, Some("abc"), None, Some("xyz")],
         "column_2" => [None, Some(333i64), Some(666), Some(999)]
     ]?;
-    assert!(df.frame_equal_missing(&expected));
+    assert!(df.equals_missing(&expected));
+    Ok(())
+}
+
+#[test]
+fn test_empty_col_names() -> PolarsResult<()> {
+    let csv = "a,b,c\n1,2,3";
+    let file = Cursor::new(csv);
+    let df = CsvReader::new(file).finish()?;
+    let expected = df![
+        "a" => [1i64],
+        "b" => [2i64],
+        "c" => [3i64]
+    ]?;
+    assert!(df.equals(&expected));
+
+    let csv = "a,,c\n1,2,3";
+    let file = Cursor::new(csv);
+    let df = CsvReader::new(file).finish()?;
+    let expected = df![
+        "a" => [1i64],
+        "" => [2i64],
+        "c" => [3i64]
+    ]?;
+    assert!(df.equals(&expected));
+
+    let csv = "a,b,\n1,2,3";
+    let file = Cursor::new(csv);
+    let df = CsvReader::new(file).finish()?;
+    let expected = df![
+        "a" => [1i64],
+        "b" => [2i64],
+        "" => [3i64]
+    ]?;
+    assert!(df.equals(&expected));
+
+    let csv = "a,b,,\n1,2,3";
+    let file = Cursor::new(csv);
+    let df_result = CsvReader::new(file).finish()?;
+    assert_eq!(df_result.shape(), (1, 4));
+
+    let csv = "a,b\n1,2,3";
+    let file = Cursor::new(csv);
+    let df_result = CsvReader::new(file).finish();
+    assert!(df_result.is_err());
     Ok(())
 }
 
@@ -990,7 +1047,7 @@ fn test_trailing_empty_string_cols() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).finish()?;
     let col = df.column("colx")?;
-    let col = col.utf8()?;
+    let col = col.str()?;
     assert_eq!(
         col.into_no_null_iter().collect::<Vec<_>>(),
         &["abc", "xyz", ""]
@@ -1002,7 +1059,7 @@ fn test_trailing_empty_string_cols() -> PolarsResult<()> {
 
     assert_eq!(
         df.get(1).unwrap(),
-        &[AnyValue::Utf8("xyz"), AnyValue::Utf8("mno")]
+        &[AnyValue::String("xyz"), AnyValue::String("mno")]
     );
     assert_eq!(df.get(2).unwrap(), &[AnyValue::Null, AnyValue::Null]);
 
@@ -1015,7 +1072,7 @@ fn test_escaping_quotes() -> PolarsResult<()> {
     let file = Cursor::new(csv);
     let df = CsvReader::new(file).finish()?;
     let col = df.column("a")?;
-    let col = col.utf8()?;
+    let col = col.str()?;
     assert_eq!(col.into_no_null_iter().collect::<Vec<_>>(), &["\""]);
     Ok(())
 }
@@ -1037,7 +1094,7 @@ fn test_header_only() -> PolarsResult<()> {
         assert_eq!(df.shape(), (0, 3));
         assert_eq!(
             df.dtypes(),
-            &[DataType::Utf8, DataType::Utf8, DataType::Utf8]
+            &[DataType::String, DataType::String, DataType::String]
         );
     }
 
@@ -1063,7 +1120,7 @@ fn test_try_parse_dates() -> PolarsResult<()> {
 1742-03-21
 1743-06-16
 1730-07-22
-''
+
 1739-03-16
 ";
     let file = Cursor::new(csv);
@@ -1075,28 +1132,13 @@ fn test_try_parse_dates() -> PolarsResult<()> {
 }
 
 #[test]
-fn test_whitespace_skipping() -> PolarsResult<()> {
-    let csv = "a,b
-  12,   1435";
-    let file = Cursor::new(csv);
-    let out = CsvReader::new(file).finish()?;
-    let expected = df![
-        "a" => [12i64],
-        "b" => [1435i64],
-    ]?;
-    assert!(out.frame_equal(&expected));
-
-    Ok(())
-}
-
-#[test]
 fn test_try_parse_dates_3380() -> PolarsResult<()> {
     let csv = "lat;lon;validdate;t_2m:C;precip_1h:mm
 46.685;7.953;2022-05-10T07:07:12Z;6.1;0.00
 46.685;7.953;2022-05-10T08:07:12Z;8.8;0.00";
     let file = Cursor::new(csv);
     let df = CsvReader::new(file)
-        .with_delimiter(b';')
+        .with_separator(b';')
         .with_try_parse_dates(true)
         .finish()?;
     assert_eq!(df.column("validdate")?.null_count(), 0);
@@ -1114,6 +1156,6 @@ fn test_leading_whitespace_with_quote() -> PolarsResult<()> {
     let col_1 = df.column("ABC").unwrap();
     let col_2 = df.column("DEF").unwrap();
     assert_eq!(col_1.get(0)?, AnyValue::Float64(24.5));
-    assert_eq!(col_2.get(0)?, AnyValue::Float64(4.1));
+    assert_eq!(col_2.get(0)?, AnyValue::String("  4.1"));
     Ok(())
 }

@@ -89,9 +89,12 @@ impl SortSink {
                 self.dump(true)?;
             }
         };
-        self.current_chunks_size += chunk_bytes;
-        self.current_chunk_rows += chunk.data.height();
-        self.chunks.push(chunk.data);
+        // don't add empty dataframes
+        if chunk.data.height() > 0 || self.chunks.is_empty() {
+            self.current_chunks_size += chunk_bytes;
+            self.current_chunk_rows += chunk.data.height();
+            self.chunks.push(chunk.data);
+        }
         Ok(())
     }
 
@@ -170,7 +173,7 @@ impl Sink for SortSink {
             let lock = self.io_thread.read().unwrap();
             let io_thread = lock.as_ref().unwrap();
 
-            let dist = Series::from_any_values("", &self.dist_sample, false).unwrap();
+            let dist = Series::from_any_values("", &self.dist_sample, true).unwrap();
             let dist = dist.sort_with(SortOptions {
                 descending: self.sort_args.descending[0],
                 nulls_last: self.sort_args.nulls_last,
@@ -211,11 +214,13 @@ impl Sink for SortSink {
 }
 
 pub(super) fn sort_accumulated(
-    df: DataFrame,
+    mut df: DataFrame,
     sort_idx: usize,
     descending: bool,
     slice: Option<(i64, usize)>,
 ) -> PolarsResult<DataFrame> {
+    // This is needed because we can have empty blocks and we require chunks to have single chunks.
+    df.as_single_chunk_par();
     let sort_column = df.get_columns()[sort_idx].clone();
     df.sort_impl(
         vec![sort_column],

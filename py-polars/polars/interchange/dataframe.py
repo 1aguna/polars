@@ -24,9 +24,8 @@ class PolarsDataFrame(InterchangeDataFrame):
     column
         The Polars DataFrame backing the dataframe object.
     allow_copy
-        Allow data to be copied during operations on this column. If set to ``False``,
+        Allow data to be copied during operations on this column. If set to `False`,
         a RuntimeError is raised if data would be copied.
-
     """
 
     version = 0
@@ -36,7 +35,9 @@ class PolarsDataFrame(InterchangeDataFrame):
         self._allow_copy = allow_copy
 
     def __dataframe__(
-        self, nan_as_null: bool = False, allow_copy: bool = True  # noqa: FBT001
+        self,
+        nan_as_null: bool = False,  # noqa: FBT001
+        allow_copy: bool = True,  # noqa: FBT001
     ) -> PolarsDataFrame:
         """
         Construct a new dataframe object, potentially changing the parameters.
@@ -44,23 +45,23 @@ class PolarsDataFrame(InterchangeDataFrame):
         Parameters
         ----------
         nan_as_null
-            Overwrite null values in the data with ``NaN``.
+            Overwrite null values in the data with `NaN`.
 
             .. warning::
                 This functionality has not been implemented and the parameter will be
                 removed in a future version.
-                Setting this to ``True`` will raise a ``NotImplementedError``.
+                Setting this to `True` will raise a `NotImplementedError`.
         allow_copy
-            Allow memory to be copied to perform the conversion. If set to ``False``,
+            Allow memory to be copied to perform the conversion. If set to `False`,
             causes conversions that are not zero-copy to fail.
-
         """
         if nan_as_null:
-            raise NotImplementedError(
+            msg = (
                 "functionality for `nan_as_null` has not been implemented and the"
                 " parameter will be removed in a future version"
                 "\n\nUse the default `nan_as_null=False`."
             )
+            raise NotImplementedError(msg)
         return PolarsDataFrame(self._df, allow_copy=allow_copy)
 
     @property
@@ -80,14 +81,13 @@ class PolarsDataFrame(InterchangeDataFrame):
         """
         Return the number of chunks the dataframe consists of.
 
-        It is possible for a Polars dataframe to consist of columns with a varying
+        It is possible for a Polars DataFrame to consist of columns with a varying
         number of chunks. This method returns the number of chunks of the first
         column.
 
         See Also
         --------
         polars.dataframe.frame.DataFrame.n_chunks
-
         """
         return self._df.n_chunks("first")
 
@@ -103,7 +103,6 @@ class PolarsDataFrame(InterchangeDataFrame):
         ----------
         i
             Index of the column.
-
         """
         s = self._df.to_series(i)
         return PolarsColumn(s, allow_copy=self._allow_copy)
@@ -116,7 +115,6 @@ class PolarsDataFrame(InterchangeDataFrame):
         ----------
         name
             Name of the column.
-
         """
         s = self._df.get_column(name)
         return PolarsColumn(s, allow_copy=self._allow_copy)
@@ -134,10 +132,10 @@ class PolarsDataFrame(InterchangeDataFrame):
         ----------
         indices
             Column indices
-
         """
         if not isinstance(indices, Sequence):
-            raise TypeError("`indices` is not a sequence")
+            msg = "`indices` is not a sequence"
+            raise TypeError(msg)
         if not isinstance(indices, list):
             indices = list(indices)
 
@@ -154,10 +152,10 @@ class PolarsDataFrame(InterchangeDataFrame):
         ----------
         names
             Column names.
-
         """
         if not isinstance(names, Sequence):
-            raise TypeError("`names` is not a sequence")
+            msg = "`names` is not a sequence"
+            raise TypeError(msg)
 
         return PolarsDataFrame(
             self._df.select(names),
@@ -172,15 +170,14 @@ class PolarsDataFrame(InterchangeDataFrame):
         ----------
         n_chunks
             The number of chunks to return. Must be a multiple of the number of chunks
-            in the dataframe. If set to ``None`` (default), returns all chunks.
+            in the dataframe. If set to `None` (default), returns all chunks.
 
         Notes
         -----
-        When the columns in the dataframe are chunked unevenly, or when ``n_chunks`` is
+        When the columns in the dataframe are chunked unevenly, or when `n_chunks` is
         higher than the number of chunks in the dataframe, a slice must be performed
         that is not on the chunk boundary. This will trigger some compute for columns
         that contain null values and boolean columns.
-
         """
         total_n_chunks = self.num_chunks()
         chunks = self._get_chunks_from_col_chunks()
@@ -190,10 +187,11 @@ class PolarsDataFrame(InterchangeDataFrame):
                 yield PolarsDataFrame(chunk, allow_copy=self._allow_copy)
 
         elif (n_chunks <= 0) or (n_chunks % total_n_chunks != 0):
-            raise ValueError(
+            msg = (
                 "`n_chunks` must be a multiple of the number of chunks of this"
                 f" dataframe ({total_n_chunks})"
             )
+            raise ValueError(msg)
 
         else:
             subchunks_per_chunk = n_chunks // total_n_chunks
@@ -214,7 +212,6 @@ class PolarsDataFrame(InterchangeDataFrame):
 
         If columns are not all chunked identically, they will be rechunked like the
         first column. If copy is not allowed, this raises a RuntimeError.
-
         """
         col_chunks = self.get_column(0).get_chunks()
         chunk_sizes = [chunk.size() for chunk in col_chunks]
@@ -226,9 +223,8 @@ class PolarsDataFrame(InterchangeDataFrame):
 
             if not all(x == 1 for x in chunk.n_chunks("all")):
                 if not self._allow_copy:
-                    raise CopyNotAllowedError(
-                        "unevenly chunked columns must be rechunked"
-                    )
+                    msg = "unevenly chunked columns must be rechunked"
+                    raise CopyNotAllowedError(msg)
                 chunk = chunk.rechunk()
 
             yield chunk

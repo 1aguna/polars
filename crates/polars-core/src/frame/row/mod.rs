@@ -76,21 +76,11 @@ pub fn coerce_data_type<A: Borrow<DataType>>(datatypes: &[A]) -> DataType {
         return datatypes[0].borrow().clone();
     }
     if datatypes.len() > 2 {
-        return Utf8;
+        return String;
     }
 
     let (lhs, rhs) = (datatypes[0].borrow(), datatypes[1].borrow());
-    try_get_supertype(lhs, rhs).unwrap_or(Utf8)
-}
-
-fn is_nested_null(av: &AnyValue) -> bool {
-    match av {
-        AnyValue::Null => true,
-        AnyValue::List(s) => s.null_count() == s.len(),
-        #[cfg(feature = "dtype-struct")]
-        AnyValue::Struct(_, _, _) => av._iter_struct_av().all(|av| is_nested_null(&av)),
-        _ => false,
-    }
+    try_get_supertype(lhs, rhs).unwrap_or(String)
 }
 
 pub fn any_values_to_dtype(column: &[AnyValue]) -> PolarsResult<(DataType, usize)> {
@@ -108,7 +98,7 @@ fn types_set_to_dtype(types_set: PlIndexSet<DataType>) -> PolarsResult<DataType>
     types_set
         .into_iter()
         .map(Ok)
-        .fold_first_(|a, b| try_get_supertype(&a?, &b?))
+        .reduce(|a, b| try_get_supertype(&a?, &b?))
         .unwrap()
 }
 
@@ -173,7 +163,7 @@ pub fn rows_to_schema_first_non_null(rows: &[Row], infer_schema_length: Option<u
             for i in nulls {
                 let val = &row.0[i];
 
-                if !is_nested_null(val) {
+                if !val.is_nested_null() {
                     let dtype = val.into();
                     schema.set_dtype_at_index(i, dtype).unwrap();
                 }

@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use polars_core::prelude::*;
 use polars_utils::arena::{Arena, Node};
+use polars_utils::idx_vec::UnitVec;
+use polars_utils::unitvec;
 
 use super::projection_expr::*;
 use crate::logical_plan::functions::FunctionNode;
@@ -15,13 +17,6 @@ use crate::utils::PushNode;
 /// [`ALogicalPlan`] is a representation of [`LogicalPlan`] with [`Node`]s which are allocated in an [`Arena`]
 #[derive(Clone, Debug)]
 pub enum ALogicalPlan {
-    AnonymousScan {
-        function: Arc<dyn AnonymousScan>,
-        file_info: FileInfo,
-        output_schema: Option<SchemaRef>,
-        predicate: Option<Node>,
-        options: Arc<AnonymousScanOptions>,
-    },
     #[cfg(feature = "python")]
     PythonScan {
         options: PythonOptions,
@@ -37,7 +32,7 @@ pub enum ALogicalPlan {
         predicate: Node,
     },
     Scan {
-        path: PathBuf,
+        paths: Arc<[PathBuf]>,
         file_info: FileInfo,
         predicate: Option<Node>,
         /// schema of the projected file
@@ -105,6 +100,11 @@ pub enum ALogicalPlan {
         inputs: Vec<Node>,
         options: UnionOptions,
     },
+    HConcat {
+        inputs: Vec<Node>,
+        schema: SchemaRef,
+        options: HConcatOptions,
+    },
     ExtContext {
         input: Node,
         contexts: Vec<Node>,
@@ -136,7 +136,6 @@ impl ALogicalPlan {
             Scan { file_info, .. } => &file_info.schema,
             #[cfg(feature = "python")]
             PythonScan { options, .. } => &options.schema,
-            AnonymousScan { file_info, .. } => &file_info.schema,
             _ => unreachable!(),
         }
     }
@@ -145,7 +144,6 @@ impl ALogicalPlan {
         use ALogicalPlan::*;
         match self {
             Scan { scan_type, .. } => scan_type.into(),
-            AnonymousScan { .. } => "anonymous_scan",
             #[cfg(feature = "python")]
             PythonScan { .. } => "python_scan",
             Slice { .. } => "slice",
@@ -160,6 +158,7 @@ impl ALogicalPlan {
             Distinct { .. } => "distinct",
             MapFunction { .. } => "map_function",
             Union { .. } => "union",
+            HConcat { .. } => "hconcat",
             ExtContext { .. } => "ext_context",
             Sink { payload, .. } => match payload {
                 SinkType::Memory => "sink (memory)",
@@ -175,8 +174,9 @@ impl ALogicalPlan {
         use ALogicalPlan::*;
         let schema = match self {
             #[cfg(feature = "python")]
-            PythonScan { options, .. } => &options.schema,
+            PythonScan { options, .. } => options.output_schema.as_ref().unwrap_or(&options.schema),
             Union { inputs, .. } => return arena.get(inputs[0]).schema(arena),
+            HConcat { schema, .. } => schema,
             Cache { input, .. } => return arena.get(*input).schema(arena),
             Sort { input, .. } => return arena.get(*input).schema(arena),
             Scan {
@@ -189,11 +189,6 @@ impl ALogicalPlan {
                 output_schema,
                 ..
             } => output_schema.as_ref().unwrap_or(schema),
-            AnonymousScan {
-                file_info,
-                output_schema,
-                ..
-            } => output_schema.as_ref().unwrap_or(&file_info.schema),
             Selection { input, .. } => return arena.get(*input).schema(arena),
             Projection { schema, .. } => schema,
             Aggregate { schema, .. } => schema,
@@ -234,6 +229,13 @@ impl ALogicalPlan {
             },
             Union { options, .. } => Union {
                 inputs,
+                options: *options,
+            },
+            HConcat {
+                schema, options, ..
+            } => HConcat {
+                inputs,
+                schema: schema.clone(),
                 options: *options,
             },
             Slice { offset, len, .. } => Slice {
@@ -307,7 +309,7 @@ impl ALogicalPlan {
                 options: *options,
             },
             Scan {
-                path,
+                paths,
                 file_info,
                 output_schema,
                 predicate,
@@ -319,7 +321,7 @@ impl ALogicalPlan {
                     new_predicate = exprs.pop()
                 }
                 Scan {
-                    path: path.clone(),
+                    paths: paths.clone(),
                     file_info: file_info.clone(),
                     output_schema: output_schema.clone(),
                     file_options: options.clone(),
@@ -345,26 +347,6 @@ impl ALogicalPlan {
                     output_schema: output_schema.clone(),
                     projection: projection.clone(),
                     selection: new_selection,
-                }
-            },
-            AnonymousScan {
-                function,
-                file_info,
-                output_schema,
-                predicate,
-                options,
-            } => {
-                let mut new_predicate = None;
-                if predicate.is_some() {
-                    new_predicate = exprs.pop()
-                }
-
-                AnonymousScan {
-                    function: function.clone(),
-                    file_info: file_info.clone(),
-                    output_schema: output_schema.clone(),
-                    predicate: new_predicate,
-                    options: options.clone(),
                 }
             },
             MapFunction { function, .. } => MapFunction {
@@ -414,11 +396,7 @@ impl ALogicalPlan {
             },
             #[cfg(feature = "python")]
             PythonScan { .. } => {},
-            AnonymousScan { predicate, .. } => {
-                if let Some(node) = predicate {
-                    container.push(*node)
-                }
-            },
+            HConcat { .. } => {},
             ExtContext { .. } | Sink { .. } => {},
         }
     }
@@ -440,6 +418,12 @@ impl ALogicalPlan {
         use ALogicalPlan::*;
         let input = match self {
             Union { inputs, .. } => {
+                for node in inputs {
+                    container.push_node(*node);
+                }
+                return;
+            },
+            HConcat { inputs, .. } => {
                 for node in inputs {
                     container.push_node(*node);
                 }
@@ -474,7 +458,6 @@ impl ALogicalPlan {
             },
             Scan { .. } => return,
             DataFrameScan { .. } => return,
-            AnonymousScan { .. } => return,
             #[cfg(feature = "python")]
             PythonScan { .. } => return,
         };
@@ -493,9 +476,9 @@ impl ALogicalPlan {
         feature = "fused"
     ))]
     pub(crate) fn get_input(&self) -> Option<Node> {
-        let mut inputs = [None, None];
+        let mut inputs: UnitVec<Node> = unitvec!();
         self.copy_inputs(&mut inputs);
-        inputs[0]
+        inputs.first().copied()
     }
 }
 

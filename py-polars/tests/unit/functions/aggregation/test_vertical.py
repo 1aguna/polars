@@ -23,7 +23,6 @@ def assert_expr_equal(
     context
         The context in which the expressions will be evaluated. Defaults to an empty
         context.
-
     """
     if context is None:
         context = pl.DataFrame()
@@ -48,7 +47,7 @@ def test_alias_for_col_agg_bool(function: str, input: str) -> None:
     assert_expr_equal(result, expected, context)
 
 
-@pytest.mark.parametrize("function", ["min", "max", "sum", "cumsum"])
+@pytest.mark.parametrize("function", ["min", "max", "sum", "cum_sum"])
 @pytest.mark.parametrize("input", ["a", "^a|b$"])
 def test_alias_for_col_agg(function: str, input: str) -> None:
     result = getattr(pl, function)(input)  # e.g. pl.min(input)

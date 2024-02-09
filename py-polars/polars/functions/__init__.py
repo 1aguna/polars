@@ -3,10 +3,13 @@ from polars.functions.aggregation import (
     all_horizontal,
     any,
     any_horizontal,
+    cum_sum,
+    cum_sum_horizontal,
     cumsum,
     cumsum_horizontal,
     max,
     max_horizontal,
+    mean_horizontal,
     min,
     min_horizontal,
     sum,
@@ -31,13 +34,15 @@ from polars.functions.lazy import (
     arctan2d,
     arg_sort_by,
     arg_where,
-    avg,
     coalesce,
     collect_all,
     collect_all_async,
     corr,
     count,
     cov,
+    cum_count,
+    cum_fold,
+    cum_reduce,
     cumfold,
     cumreduce,
     element,
@@ -65,6 +70,7 @@ from polars.functions.lazy import (
     tail,
     var,
 )
+from polars.functions.len import len
 from polars.functions.lit import lit
 from polars.functions.random import set_random_seed
 from polars.functions.range import (
@@ -85,12 +91,14 @@ __all__ = [
     # polars.functions.aggregation
     "all",
     "any",
+    "cum_sum",
     "cumsum",
     "max",
     "min",
     "sum",
     "all_horizontal",
     "any_horizontal",
+    "cum_sum_horizontal",
     "cumsum_horizontal",
     "max_horizontal",
     "min_horizontal",
@@ -116,7 +124,6 @@ __all__ = [
     "arctan2",
     "arctan2d",
     "arg_sort_by",
-    "avg",
     "coalesce",
     "col",
     "collect_all",
@@ -126,6 +133,9 @@ __all__ = [
     "corr",
     "count",
     "cov",
+    "cum_count",
+    "cum_fold",
+    "cum_reduce",
     "cumfold",
     "cumreduce",
     "date",  # named date_, see import above
@@ -147,6 +157,7 @@ __all__ = [
     "map_batches",
     "map_groups",
     "mean",
+    "mean_horizontal",
     "median",
     "n_unique",
     "quantile",
@@ -160,6 +171,8 @@ __all__ = [
     "tail",
     "time",
     "var",
+    # polars.functions.len
+    "len",
     # polars.functions.whenthen
     "when",
     "sql_expr",

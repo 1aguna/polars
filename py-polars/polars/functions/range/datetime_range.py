@@ -7,22 +7,23 @@ from polars import functions as F
 from polars.functions.range._utils import parse_interval_argument
 from polars.utils._parse_expr_input import parse_as_expression
 from polars.utils._wrap import wrap_expr
+from polars.utils.deprecation import deprecate_saturating
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
 
 if TYPE_CHECKING:
-    from datetime import datetime, timedelta
+    from datetime import date, datetime, timedelta
     from typing import Literal
 
     from polars import Expr, Series
-    from polars.type_aliases import ClosedInterval, IntoExpr, TimeUnit
+    from polars.type_aliases import ClosedInterval, IntoExprColumn, TimeUnit
 
 
 @overload
 def datetime_range(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -35,8 +36,8 @@ def datetime_range(
 
 @overload
 def datetime_range(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -49,8 +50,8 @@ def datetime_range(
 
 @overload
 def datetime_range(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -62,8 +63,8 @@ def datetime_range(
 
 
 def datetime_range(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = "1d",
     *,
     closed: ClosedInterval = "both",
@@ -81,17 +82,17 @@ def datetime_range(
     end
         Upper bound of the datetime range.
     interval
-        Interval of the range periods, specified as a Python ``timedelta`` object
+        Interval of the range periods, specified as a Python `timedelta` object
         or using the Polars duration string language (see "Notes" section below).
     closed : {'both', 'left', 'right', 'none'}
         Define which sides of the range are closed (inclusive).
     time_unit : {None, 'ns', 'us', 'ms'}
-        Time unit of the resulting ``Datetime`` data type.
+        Time unit of the resulting `Datetime` data type.
     time_zone
-        Time zone of the resulting ``Datetime`` data type.
+        Time zone of the resulting `Datetime` data type.
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Returns
     -------
@@ -117,10 +118,6 @@ def datetime_range(
     Or combine them:
     "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-    Suffix with `"_saturating"` to indicate that dates too large for
-    their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
-    instead of erroring.
-
     By "calendar day", we mean the corresponding time on the next day (which may
     not be 24 hours, due to daylight savings). Similarly for "calendar week",
     "calendar month", "calendar quarter", and "calendar year".
@@ -130,7 +127,9 @@ def datetime_range(
     Using Polars duration string to specify the interval:
 
     >>> from datetime import datetime
-    >>> pl.datetime_range(datetime(2022, 1, 1), datetime(2022, 3, 1), "1mo", eager=True)
+    >>> pl.datetime_range(
+    ...     datetime(2022, 1, 1), datetime(2022, 3, 1), "1mo", eager=True
+    ... ).alias("datetime")
     shape: (3,)
     Series: 'datetime' [datetime[μs]]
     [
@@ -139,7 +138,7 @@ def datetime_range(
         2022-03-01 00:00:00
     ]
 
-    Using ``timedelta`` object to specify the interval:
+    Using `timedelta` object to specify the interval:
 
     >>> from datetime import date, timedelta
     >>> pl.datetime_range(
@@ -148,7 +147,7 @@ def datetime_range(
     ...     timedelta(days=1, hours=12),
     ...     time_unit="ms",
     ...     eager=True,
-    ... )
+    ... ).alias("datetime")
     shape: (7,)
     Series: 'datetime' [datetime[ms]]
     [
@@ -169,7 +168,7 @@ def datetime_range(
     ...     "1mo",
     ...     time_zone="America/New_York",
     ...     eager=True,
-    ... )
+    ... ).alias("datetime")
     shape: (3,)
     Series: 'datetime' [datetime[μs, America/New_York]]
     [
@@ -177,8 +176,8 @@ def datetime_range(
         2022-02-01 00:00:00 EST
         2022-03-01 00:00:00 EST
     ]
-
     """
+    interval = deprecate_saturating(interval)
     interval = parse_interval_argument(interval)
     if time_unit is None and "ns" in interval:
         time_unit = "ns"
@@ -199,8 +198,8 @@ def datetime_range(
 
 @overload
 def datetime_ranges(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -213,8 +212,8 @@ def datetime_ranges(
 
 @overload
 def datetime_ranges(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -227,8 +226,8 @@ def datetime_ranges(
 
 @overload
 def datetime_ranges(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = ...,
     *,
     closed: ClosedInterval = ...,
@@ -240,8 +239,8 @@ def datetime_ranges(
 
 
 def datetime_ranges(
-    start: datetime | IntoExpr,
-    end: datetime | IntoExpr,
+    start: datetime | date | IntoExprColumn,
+    end: datetime | date | IntoExprColumn,
     interval: str | timedelta = "1d",
     *,
     closed: ClosedInterval = "both",
@@ -259,17 +258,17 @@ def datetime_ranges(
     end
         Upper bound of the datetime range.
     interval
-        Interval of the range periods, specified as a Python ``timedelta`` object
+        Interval of the range periods, specified as a Python `timedelta` object
         or using the Polars duration string language (see "Notes" section below).
     closed : {'both', 'left', 'right', 'none'}
         Define which sides of the range are closed (inclusive).
     time_unit : {None, 'ns', 'us', 'ms'}
-        Time unit of the resulting ``Datetime`` data type.
+        Time unit of the resulting `Datetime` data type.
     time_zone
-        Time zone of the resulting ``Datetime`` data type.
+        Time zone of the resulting `Datetime` data type.
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Notes
     -----
@@ -290,10 +289,6 @@ def datetime_ranges(
     Or combine them:
     "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-    Suffix with `"_saturating"` to indicate that dates too large for
-    their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
-    instead of erroring.
-
     By "calendar day", we mean the corresponding time on the next day (which may
     not be 24 hours, due to daylight savings). Similarly for "calendar week",
     "calendar month", "calendar quarter", and "calendar year".
@@ -301,9 +296,30 @@ def datetime_ranges(
     Returns
     -------
     Expr or Series
-        Column of data type ``List(Datetime)``.
+        Column of data type `List(Datetime)`.
 
+    Examples
+    --------
+    >>> from datetime import datetime
+    >>> df = pl.DataFrame(
+    ...     {
+    ...         "start": [datetime(2022, 1, 1), datetime(2022, 1, 2)],
+    ...         "end": datetime(2022, 1, 3),
+    ...     }
+    ... )
+    >>> with pl.Config(fmt_str_lengths=100):
+    ...     df.select(datetime_range=pl.datetime_ranges("start", "end"))
+    shape: (2, 1)
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ datetime_range                                                  │
+    │ ---                                                             │
+    │ list[datetime[μs]]                                              │
+    ╞═════════════════════════════════════════════════════════════════╡
+    │ [2022-01-01 00:00:00, 2022-01-02 00:00:00, 2022-01-03 00:00:00] │
+    │ [2022-01-02 00:00:00, 2022-01-03 00:00:00]                      │
+    └─────────────────────────────────────────────────────────────────┘
     """
+    interval = deprecate_saturating(interval)
     interval = parse_interval_argument(interval)
     if time_unit is None and "ns" in interval:
         time_unit = "ns"

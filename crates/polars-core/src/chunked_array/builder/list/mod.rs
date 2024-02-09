@@ -8,15 +8,15 @@ mod null;
 mod primitive;
 
 pub use anonymous::*;
+use arrow::legacy::array::list::AnonymousBuilder;
+use arrow::legacy::array::null::MutableNullArray;
+use arrow::legacy::prelude::*;
 pub use binary::*;
 pub use boolean::*;
 #[cfg(feature = "dtype-categorical")]
 use categorical::*;
 use dtypes::*;
 use null::*;
-use polars_arrow::array::list::AnonymousBuilder;
-use polars_arrow::array::null::MutableNullArray;
-use polars_arrow::prelude::*;
 pub use primitive::*;
 
 use super::*;
@@ -83,8 +83,7 @@ where
 }
 
 type LargePrimitiveBuilder<T> = MutableListArray<i64, MutablePrimitiveArray<T>>;
-type LargeListUtf8Builder = MutableListArray<i64, MutableUtf8Array<i64>>;
-type LargeListBinaryBuilder = MutableListArray<i64, MutableBinaryArray<i64>>;
+type LargeListBinViewBuilder<T> = MutableListArray<i64, MutableBinaryViewArray<T>>;
 type LargeListBooleanBuilder = MutableListArray<i64, MutableBooleanArray>;
 type LargeListNullBuilder = MutableListArray<i64, MutableNullArray>;
 
@@ -96,13 +95,25 @@ pub fn get_list_builder(
 ) -> PolarsResult<Box<dyn ListBuilderTrait>> {
     match inner_type_logical {
         #[cfg(feature = "dtype-categorical")]
-        DataType::Categorical(_) => {
-            return Ok(Box::new(ListCategoricalChunkedBuilder::new(
+        DataType::Categorical(Some(rev_map), ordering) => {
+            return Ok(create_categorical_chunked_listbuilder(
                 name,
+                *ordering,
                 list_capacity,
                 value_capacity,
-                inner_type_logical.clone(),
-            )))
+                rev_map.clone(),
+            ))
+        },
+        #[cfg(feature = "dtype-categorical")]
+        DataType::Enum(Some(rev_map), ordering) => {
+            let list_builder = ListEnumCategoricalChunkedBuilder::new(
+                name,
+                *ordering,
+                list_capacity,
+                value_capacity,
+                (**rev_map).clone(),
+            );
+            return Ok(Box::new(list_builder));
         },
         _ => {},
     }
@@ -111,7 +122,7 @@ pub fn get_list_builder(
 
     match &physical_type {
         #[cfg(feature = "object")]
-        DataType::Object(_) => polars_bail!(opq = list_builder, &physical_type),
+        DataType::Object(_, _) => polars_bail!(opq = list_builder, &physical_type),
         #[cfg(feature = "dtype-struct")]
         DataType::Struct(_) => Ok(Box::new(AnonymousOwnedListBuilder::new(
             name,
@@ -124,6 +135,22 @@ pub fn get_list_builder(
             list_capacity,
             Some(inner_type_logical.clone()),
         ))),
+        #[cfg(feature = "dtype-array")]
+        DataType::Array(..) => Ok(Box::new(AnonymousOwnedListBuilder::new(
+            name,
+            list_capacity,
+            Some(inner_type_logical.clone()),
+        ))),
+        #[cfg(feature = "dtype-decimal")]
+        DataType::Decimal(_, _) => Ok(Box::new(
+            ListPrimitiveChunkedBuilder::<Int128Type>::new_with_values_type(
+                name,
+                list_capacity,
+                value_capacity,
+                physical_type,
+                inner_type_logical.clone(),
+            ),
+        )),
         _ => {
             macro_rules! get_primitive_builder {
                 ($type:ty) => {{
@@ -143,10 +170,10 @@ pub fn get_list_builder(
                     Box::new(builder)
                 }};
             }
-            macro_rules! get_utf8_builder {
+            macro_rules! get_string_builder {
                 () => {{
                     let builder =
-                        ListUtf8ChunkedBuilder::new(&name, list_capacity, 5 * value_capacity);
+                        ListStringChunkedBuilder::new(&name, list_capacity, 5 * value_capacity);
                     Box::new(builder)
                 }};
             }
@@ -160,7 +187,7 @@ pub fn get_list_builder(
             Ok(match_dtype_to_logical_apply_macro!(
                 physical_type,
                 get_primitive_builder,
-                get_utf8_builder,
+                get_string_builder,
                 get_binary_builder,
                 get_bool_builder
             ))

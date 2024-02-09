@@ -23,13 +23,14 @@ polars/vendor
 .hypothesis/
 .mypy_cache/
 .pytest_cache/
-.venv/
+.ruff_cache/
+.venv*/
 __pycache__/
 .coverage
 
 # Rust
+.cargo/
 target/
-Cargo.lock
 
 # Project
 /docs/data/

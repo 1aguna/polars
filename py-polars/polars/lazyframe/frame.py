@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections import OrderedDict
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache, reduce
 from io import BytesIO, StringIO
+from operator import and_
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -21,34 +24,43 @@ from typing import (
 
 import polars._reexport as pl
 from polars import functions as F
+from polars.convert import from_dict
 from polars.datatypes import (
     DTYPE_TEMPORAL_UNITS,
     N_INFER_DEFAULT,
     Boolean,
     Categorical,
+    DataTypeGroup,
     Date,
     Datetime,
     Duration,
+    Enum,
     Float32,
     Float64,
     Int8,
     Int16,
     Int32,
     Int64,
+    Null,
+    Object,
+    String,
     Time,
     UInt8,
     UInt16,
     UInt32,
     UInt64,
-    Utf8,
+    Unknown,
+    is_polars_dtype,
     py_type_to_dtype,
 )
-from polars.dependencies import dataframe_api_compat, subprocess
+from polars.dependencies import subprocess
 from polars.io._utils import _is_local_file, _is_supported_cloud
+from polars.io.csv._utils import _check_arg_is_1byte
 from polars.io.ipc.anonymous_scan import _scan_ipc_fsspec
 from polars.io.parquet.anonymous_scan import _scan_parquet_fsspec
 from polars.lazyframe.group_by import LazyGroupBy
-from polars.selectors import _expand_selectors, expand_selector
+from polars.lazyframe.in_process import InProcessQuery
+from polars.selectors import _expand_selectors, by_dtype, expand_selector
 from polars.slice import LazyPolarsSlice
 from polars.utils._async import _AioDataFrameResult, _GeventDataFrameResult
 from polars.utils._parse_expr_input import (
@@ -59,14 +71,21 @@ from polars.utils._wrap import wrap_df, wrap_expr
 from polars.utils.convert import _negate_duration, _timedelta_to_pl_duration
 from polars.utils.deprecation import (
     deprecate_function,
+    deprecate_parameter_as_positional,
     deprecate_renamed_function,
     deprecate_renamed_parameter,
+    deprecate_saturating,
+    issue_deprecation_warning,
 )
+from polars.utils.unstable import issue_unstable_warning, unstable
 from polars.utils.various import (
     _in_notebook,
-    _prepare_row_count_args,
+    _prepare_row_index_args,
     _process_null_values,
+    is_bool_sequence,
+    is_sequence,
     normalize_filepath,
+    parse_percentiles,
 )
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
@@ -79,7 +98,8 @@ if TYPE_CHECKING:
 
     import pyarrow as pa
 
-    from polars import DataFrame, Expr
+    from polars import DataFrame, DataType, Expr
+    from polars.dependencies import numpy as np
     from polars.type_aliases import (
         AsofJoinStrategy,
         ClosedInterval,
@@ -89,8 +109,10 @@ if TYPE_CHECKING:
         FillNullStrategy,
         FrameInitTypes,
         IntoExpr,
+        IntoExprColumn,
         JoinStrategy,
         JoinValidation,
+        Label,
         Orientation,
         ParallelStrategy,
         PolarsDataType,
@@ -126,9 +148,9 @@ class LazyFrame:
     ----------
     data : dict, Sequence, ndarray, Series, or pandas.DataFrame
         Two-dimensional data in various forms; dict input must contain Sequences,
-        Generators, or a ``range``. Sequence may contain Series or other Sequences.
+        Generators, or a `range`. Sequence may contain Series or other Sequences.
     schema : Sequence of str, (str,DataType) pairs, or a {str:DataType,} dict
-        The DataFrame schema may be declared in several ways:
+        The LazyFrame schema may be declared in several ways:
 
         * As a dict of {name:type} pairs; if type is None, it will be auto-inferred.
         * As a list of column names; in this case types are automatically inferred.
@@ -140,11 +162,10 @@ class LazyFrame:
     schema_overrides : dict, default None
         Support type specification or override of one or more columns; note that
         any dtypes inferred from the schema param will be overridden.
-        underlying data, the names given here will overwrite them.
 
         The number of entries in the schema should match the underlying data
         dimensions, unless a sequence of dictionaries is being passed, in which case
-        a _partial_ schema can be declared to prevent specific fields from being loaded.
+        a *partial* schema can be declared to prevent specific fields from being loaded.
     orient : {'col', 'row'}, default None
         Whether to interpret two-dimensional data as columns or as rows. If None,
         the orientation is inferred by matching the columns and data dimensions. If
@@ -158,7 +179,7 @@ class LazyFrame:
 
     Notes
     -----
-    Initialising ``LazyFrame(...)`` directly is equivalent to ``DataFrame(...).lazy()``.
+    Initialising `LazyFrame(...)` directly is equivalent to `DataFrame(...).lazy()`.
 
     Examples
     --------
@@ -261,7 +282,6 @@ class LazyFrame:
     │ 1   ┆ 2   ┆ 3   │
     │ 4   ┆ 5   ┆ 6   │
     └─────┴─────┴─────┘
-
     """
 
     _ldf: PyLazyFrame
@@ -308,12 +328,12 @@ class LazyFrame:
     @classmethod
     def _scan_csv(
         cls,
-        source: str,
+        source: str | list[str] | list[Path],
         *,
         has_header: bool = True,
         separator: str = ",",
-        comment_char: str | None = None,
-        quote_char: str | None = r'"',
+        comment_prefix: str | None = None,
+        quote_char: str | None = '"',
         skip_rows: int = 0,
         dtypes: SchemaDict | None = None,
         schema: SchemaDict | None = None,
@@ -328,8 +348,8 @@ class LazyFrame:
         low_memory: bool = False,
         rechunk: bool = True,
         skip_rows_after_header: int = 0,
-        row_count_name: str | None = None,
-        row_count_offset: int = 0,
+        row_index_name: str | None = None,
+        row_index_offset: int = 0,
         try_parse_dates: bool = False,
         eol_char: str = "\n",
         raise_if_empty: bool = True,
@@ -338,12 +358,11 @@ class LazyFrame:
         """
         Lazily read from a CSV file or multiple files via glob patterns.
 
-        Use ``pl.scan_csv`` to dispatch to this method.
+        Use `pl.scan_csv` to dispatch to this method.
 
         See Also
         --------
         polars.io.scan_csv
-
         """
         dtype_list: list[tuple[str, PolarsDataType]] | None = None
         if dtypes is not None:
@@ -352,9 +371,16 @@ class LazyFrame:
                 dtype_list.append((k, py_type_to_dtype(v)))
         processed_null_values = _process_null_values(null_values)
 
+        if isinstance(source, list):
+            sources = source
+            source = None  # type: ignore[assignment]
+        else:
+            sources = []
+
         self = cls.__new__(cls)
         self._ldf = PyLazyFrame.new_from_csv(
             source,
+            sources,
             separator,
             has_header,
             ignore_errors,
@@ -363,7 +389,7 @@ class LazyFrame:
             cache,
             dtype_list,
             low_memory,
-            comment_char,
+            comment_prefix,
             quote_char,
             processed_null_values,
             missing_utf8_is_empty_string,
@@ -372,7 +398,7 @@ class LazyFrame:
             rechunk,
             skip_rows_after_header,
             encoding,
-            _prepare_row_count_args(row_count_name, row_count_offset),
+            _prepare_row_index_args(row_index_name, row_index_offset),
             try_parse_dates,
             eol_char=eol_char,
             raise_if_empty=raise_if_empty,
@@ -384,96 +410,121 @@ class LazyFrame:
     @classmethod
     def _scan_parquet(
         cls,
-        source: str,
+        source: str | list[str] | list[Path],
         *,
         n_rows: int | None = None,
         cache: bool = True,
         parallel: ParallelStrategy = "auto",
         rechunk: bool = True,
-        row_count_name: str | None = None,
-        row_count_offset: int = 0,
+        row_index_name: str | None = None,
+        row_index_offset: int = 0,
         storage_options: dict[str, object] | None = None,
         low_memory: bool = False,
         use_statistics: bool = True,
+        hive_partitioning: bool = True,
+        retries: int = 0,
     ) -> Self:
         """
         Lazily read from a parquet file or multiple files via glob patterns.
 
-        Use ``pl.scan_parquet`` to dispatch to this method.
+        Use `pl.scan_parquet` to dispatch to this method.
 
         See Also
         --------
         polars.io.scan_parquet
-
         """
+        if isinstance(source, list):
+            sources = source
+            source = None  # type: ignore[assignment]
+            can_use_fsspec = False
+        else:
+            can_use_fsspec = True
+            sources = []
+
         # try fsspec scanner
-        if not _is_local_file(source) and not _is_supported_cloud(source):
-            scan = _scan_parquet_fsspec(source, storage_options)
+        if (
+            can_use_fsspec
+            and not _is_local_file(source)  # type: ignore[arg-type]
+            and not _is_supported_cloud(source)  # type: ignore[arg-type]
+        ):
+            scan = _scan_parquet_fsspec(source, storage_options)  # type: ignore[arg-type]
             if n_rows:
                 scan = scan.head(n_rows)
-            if row_count_name is not None:
-                scan = scan.with_row_count(row_count_name, row_count_offset)
+            if row_index_name is not None:
+                scan = scan.with_row_index(row_index_name, row_index_offset)
             return scan  # type: ignore[return-value]
 
-        if storage_options is not None:
-            storage_options = list(storage_options.items())  #  type: ignore[assignment]
+        if storage_options:
+            storage_options = list(storage_options.items())  # type: ignore[assignment]
+        else:
+            # Handle empty dict input
+            storage_options = None
 
         self = cls.__new__(cls)
         self._ldf = PyLazyFrame.new_from_parquet(
             source,
+            sources,
             n_rows,
             cache,
             parallel,
             rechunk,
-            _prepare_row_count_args(row_count_name, row_count_offset),
+            _prepare_row_index_args(row_index_name, row_index_offset),
             low_memory,
             cloud_options=storage_options,
             use_statistics=use_statistics,
+            hive_partitioning=hive_partitioning,
+            retries=retries,
         )
         return self
 
     @classmethod
     def _scan_ipc(
         cls,
-        source: str | Path,
+        source: str | Path | list[str] | list[Path],
         *,
         n_rows: int | None = None,
         cache: bool = True,
         rechunk: bool = True,
-        row_count_name: str | None = None,
-        row_count_offset: int = 0,
+        row_index_name: str | None = None,
+        row_index_offset: int = 0,
         storage_options: dict[str, object] | None = None,
         memory_map: bool = True,
     ) -> Self:
         """
         Lazily read from an Arrow IPC (Feather v2) file.
 
-        Use ``pl.scan_ipc`` to dispatch to this method.
+        Use `pl.scan_ipc` to dispatch to this method.
 
         See Also
         --------
         polars.io.scan_ipc
-
         """
         if isinstance(source, (str, Path)):
+            can_use_fsspec = True
             source = normalize_filepath(source)
+            sources = []
+        else:
+            can_use_fsspec = False
+            sources = [normalize_filepath(source) for source in source]
+            source = None  # type: ignore[assignment]
 
         # try fsspec scanner
-        if not _is_local_file(source):
-            scan = _scan_ipc_fsspec(source, storage_options)
+        if can_use_fsspec and not _is_local_file(source):  # type: ignore[arg-type]
+            scan = _scan_ipc_fsspec(source, storage_options)  # type: ignore[arg-type]
             if n_rows:
                 scan = scan.head(n_rows)
-            if row_count_name is not None:
-                scan = scan.with_row_count(row_count_name, row_count_offset)
+            if row_index_name is not None:
+                scan = scan.with_row_index(row_index_name, row_index_offset)
             return scan  # type: ignore[return-value]
 
         self = cls.__new__(cls)
         self._ldf = PyLazyFrame.new_from_ipc(
             source,
+            sources,
             n_rows,
             cache,
             rechunk,
-            _prepare_row_count_args(row_count_name, row_count_offset),
+            _prepare_row_index_args(row_index_name, row_index_offset),
             memory_map=memory_map,
         )
         return self
@@ -481,48 +532,59 @@ class LazyFrame:
     @classmethod
     def _scan_ndjson(
         cls,
-        source: str,
+        source: str | Path | list[str] | list[Path],
         *,
         infer_schema_length: int | None = None,
+        schema: SchemaDefinition | None = None,
         batch_size: int | None = None,
         n_rows: int | None = None,
         low_memory: bool = False,
-        rechunk: bool = True,
-        row_count_name: str | None = None,
-        row_count_offset: int = 0,
+        rechunk: bool = False,
+        row_index_name: str | None = None,
+        row_index_offset: int = 0,
+        ignore_errors: bool = False,
     ) -> Self:
         """
         Lazily read from a newline delimited JSON file.
 
-        Use ``pl.scan_ndjson`` to dispatch to this method.
+        Use `pl.scan_ndjson` to dispatch to this method.
 
         See Also
         --------
         polars.io.scan_ndjson
-
         """
+        if isinstance(source, (str, Path)):
+            source = normalize_filepath(source)
+            sources = []
+        else:
+            sources = [normalize_filepath(source) for source in source]
+            source = None  # type: ignore[assignment]
+
         self = cls.__new__(cls)
         self._ldf = PyLazyFrame.new_from_ndjson(
             source,
+            sources,
             infer_schema_length,
+            schema,
             batch_size,
             n_rows,
             low_memory,
             rechunk,
-            _prepare_row_count_args(row_count_name, row_count_offset),
+            _prepare_row_index_args(row_index_name, row_index_offset),
+            ignore_errors,
         )
         return self
 
     @classmethod
     def _scan_python_function(
         cls,
-        schema: pa.schema | dict[str, PolarsDataType],
+        schema: pa.schema | Mapping[str, PolarsDataType],
         scan_fn: Any,
         *,
         pyarrow: bool = False,
     ) -> Self:
         self = cls.__new__(cls)
-        if isinstance(schema, dict):
+        if isinstance(schema, Mapping):
             self._ldf = PyLazyFrame.scan_from_python_function_pl_schema(
                 list(schema.items()), scan_fn, pyarrow
             )
@@ -533,55 +595,6 @@ class LazyFrame:
         return self
 
     @classmethod
-    @deprecate_function(
-        "Convert the JSON string to `StringIO` and then use `LazyFrame.deserialize`.",
-        version="0.18.12",
-    )
-    def from_json(cls, json: str) -> Self:
-        """
-        Read a logical plan from a JSON string to construct a LazyFrame.
-
-        .. deprecated:: 0.18.12
-            This method is deprecated. Convert the JSON string to ``StringIO``
-            and then use ``LazyFrame.deserialize``.
-
-        Parameters
-        ----------
-        json
-            String in JSON format.
-
-        See Also
-        --------
-        deserialize
-
-        """
-        return cls.deserialize(StringIO(json))
-
-    @classmethod
-    @deprecate_renamed_function("deserialize", version="0.18.12")
-    @deprecate_renamed_parameter("file", "source", version="0.18.12")
-    def read_json(cls, source: str | Path | IOBase) -> Self:
-        """
-        Read a logical plan from a JSON file to construct a LazyFrame.
-
-        .. deprecated:: 0.18.12
-            This class method has been renamed to ``deserialize``.
-
-        Parameters
-        ----------
-        source
-            Path to a file or a file-like object (by file-like object, we refer to
-            objects that have a ``read()`` method, such as a file handler (e.g.
-            via builtin ``open`` function) or ``BytesIO``).
-
-        See Also
-        --------
-        deserialize
-
-        """
-        return cls.deserialize(source)
-
-    @classmethod
     def deserialize(cls, source: str | Path | IOBase) -> Self:
         """
         Read a logical plan from a JSON file to construct a LazyFrame.
@@ -590,8 +603,8 @@ class LazyFrame:
         ----------
         source
             Path to a file or a file-like object (by file-like object, we refer to
-            objects that have a ``read()`` method, such as a file handler (e.g.
-            via builtin ``open`` function) or ``BytesIO``).
+            objects that have a `read()` method, such as a file handler (e.g.
+            via builtin `open` function) or `BytesIO`).
 
         See Also
         --------
@@ -611,7 +624,6 @@ class LazyFrame:
         ╞═════╡
         │ 6   │
         └─────┘
-
         """
         if isinstance(source, StringIO):
             source = BytesIO(source.getvalue().encode())
@@ -633,15 +645,14 @@ class LazyFrame:
         ...         "bar": [6, 7, 8],
         ...         "ham": ["a", "b", "c"],
         ...     }
-        ... ).select(["foo", "bar"])
+        ... ).select("foo", "bar")
         >>> lf.columns
         ['foo', 'bar']
-
         """
         return self._ldf.columns()
 
     @property
-    def dtypes(self) -> list[PolarsDataType]:
+    def dtypes(self) -> list[DataType]:
         """
         Get dtypes of columns in LazyFrame.
 
@@ -659,13 +670,12 @@ class LazyFrame:
         ...     }
         ... )
         >>> lf.dtypes
-        [Int64, Float64, Utf8]
-
+        [Int64, Float64, String]
         """
         return self._ldf.dtypes()
 
     @property
-    def schema(self) -> SchemaDict:
+    def schema(self) -> OrderedDict[str, DataType]:
         """
         Get a dict[column name, DataType].
 
@@ -679,23 +689,9 @@ class LazyFrame:
         ...     }
         ... )
         >>> lf.schema
-        {'foo': Int64, 'bar': Float64, 'ham': Utf8}
-
+        OrderedDict({'foo': Int64, 'bar': Float64, 'ham': String})
         """
-        return self._ldf.schema()
-
-    def __dataframe_consortium_standard__(
-        self, *, api_version: str | None = None
-    ) -> Any:
-        """
-        Provide entry point to the Consortium DataFrame Standard API.
-
-        This is developed and maintained outside of polars.
-        Please report any issues to https://github.com/data-apis/dataframe-api-compat.
-        """
-        return dataframe_api_compat.polars_standard.convert_to_standard_compliant_dataframe(
-            self, api_version=api_version
-        )
+        return OrderedDict(self._ldf.schema())
 
     @property
     def width(self) -> int:
@@ -712,20 +708,19 @@ class LazyFrame:
         ... )
         >>> lf.width
         2
-
         """
         return self._ldf.width()
 
     def __bool__(self) -> NoReturn:
-        raise TypeError(
+        msg = (
             "the truth value of a LazyFrame is ambiguous"
             "\n\nLazyFrames cannot be used in boolean context with and/or/not operators."
         )
+        raise TypeError(msg)
 
     def _comparison_error(self, operator: str) -> NoReturn:
-        raise TypeError(
-            f'"{operator!r}" comparison not supported for LazyFrame objects'
-        )
+        msg = f'"{operator!r}" comparison not supported for LazyFrame objects'
+        raise TypeError(msg)
 
     def __eq__(self, other: Any) -> NoReturn:
         self._comparison_error("==")
@@ -756,10 +751,11 @@ class LazyFrame:
 
     def __getitem__(self, item: int | range | slice) -> LazyFrame:
         if not isinstance(item, slice):
-            raise TypeError(
+            msg = (
                 "'LazyFrame' object is not subscriptable (aside from slicing)"
                 "\n\nUse `select()` or `filter()` instead."
             )
+            raise TypeError(msg)
         return LazyPolarsSlice(self).apply(item)
 
     def __str__(self) -> str:
@@ -815,7 +811,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Parameters
         ----------
         file
-            File path to which the result should be written. If set to ``None``
+            File path to which the result should be written. If set to `None`
             (default), the output is returned as a string instead.
 
         See Also
@@ -843,7 +839,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╡
         │ 6   │
         └─────┘
-
         """
         if isinstance(file, (str, Path)):
             file = normalize_filepath(file)
@@ -861,30 +856,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         else:
             self._ldf.serialize(file)
         return None
-
-    @overload
-    def write_json(self, file: None = ...) -> str:
-        ...
-
-    @overload
-    def write_json(self, file: IOBase | str | Path) -> None:
-        ...
-
-    @deprecate_renamed_function("serialize", version="0.18.12")
-    def write_json(self, file: IOBase | str | Path | None = None) -> str | None:
-        """
-        Serialize the logical plan of this LazyFrame to a file or string in JSON format.
-
-        .. deprecated:: 0.18.12
-            This method has been renamed to :func:`LazyFrame.serialize`.
-
-        Parameters
-        ----------
-        file
-            File path to which the result should be written. If set to ``None``
-            (default), the output is returned as a string instead.
-        """
-        return self.serialize(file)
 
     def pipe(
         self,
@@ -909,7 +880,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         --------
         >>> def cast_str_to_int(data, col_name):
         ...     return data.with_columns(pl.col(col_name).cast(pl.Int64))
-        ...
         >>> lf = pl.LazyFrame(
         ...     {
         ...         "a": [1, 2, 3, 4],
@@ -955,13 +925,208 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 3   ┆ 1   │
         │ 4   ┆ 2   │
         └─────┴─────┘
-
         """
         return function(self, *args, **kwargs)
 
-    @deprecate_renamed_parameter(
-        "common_subplan_elimination", "comm_subplan_elim", version="0.18.9"
-    )
+    def describe(
+        self,
+        percentiles: Sequence[float] | float | None = (0.25, 0.50, 0.75),
+        *,
+        interpolation: RollingInterpolationMethod = "nearest",
+    ) -> DataFrame:
+        """
+        Creates a summary of statistics for a LazyFrame, returning a DataFrame.
+
+        Parameters
+        ----------
+        percentiles
+            One or more percentiles to include in the summary statistics.
+            All values must be in the range `[0, 1]`.
+
+        interpolation : {'nearest', 'higher', 'lower', 'midpoint', 'linear'}
+            Interpolation method used when calculating percentiles.
+
+        Returns
+        -------
+        DataFrame
+
+        Notes
+        -----
+        The median is included by default as the 50% percentile.
+
+        Warnings
+        --------
+        * This method does *not* maintain the laziness of the frame, and will `collect`
+          the final result. This could potentially be an expensive operation.
+        * We do not guarantee the output of `describe` to be stable. It will show
+          statistics that we deem informative, and may be updated in the future.
+          Using `describe` programmatically (versus interactive exploration) is
+          not recommended for this reason.
+
+        Examples
+        --------
+        >>> from datetime import date, time
+        >>> lf = pl.LazyFrame(
+        ...     {
+        ...         "float": [1.0, 2.8, 3.0],
+        ...         "int": [40, 50, None],
+        ...         "bool": [True, False, True],
+        ...         "str": ["zz", "xx", "yy"],
+        ...         "date": [date(2020, 1, 1), date(2021, 7, 5), date(2022, 12, 31)],
+        ...         "time": [time(10, 20, 30), time(14, 45, 50), time(23, 15, 10)],
+        ...     }
+        ... )
+
+        Show default frame statistics:
+
+        >>> lf.describe()
+        shape: (9, 7)
+        ┌────────────┬──────────┬──────────┬──────────┬──────┬────────────┬──────────┐
+        │ statistic  ┆ float    ┆ int      ┆ bool     ┆ str  ┆ date       ┆ time     │
+        │ ---        ┆ ---      ┆ ---      ┆ ---      ┆ ---  ┆ ---        ┆ ---      │
+        │ str        ┆ f64      ┆ f64      ┆ f64      ┆ str  ┆ str        ┆ str      │
+        ╞════════════╪══════════╪══════════╪══════════╪══════╪════════════╪══════════╡
+        │ count      ┆ 3.0      ┆ 2.0      ┆ 3.0      ┆ 3    ┆ 3          ┆ 3        │
+        │ null_count ┆ 0.0      ┆ 1.0      ┆ 0.0      ┆ 0    ┆ 0          ┆ 0        │
+        │ mean       ┆ 2.266667 ┆ 45.0     ┆ 0.666667 ┆ null ┆ 2021-07-02 ┆ 16:07:10 │
+        │ std        ┆ 1.101514 ┆ 7.071068 ┆ null     ┆ null ┆ null       ┆ null     │
+        │ min        ┆ 1.0      ┆ 40.0     ┆ 0.0      ┆ xx   ┆ 2020-01-01 ┆ 10:20:30 │
+        │ 25%        ┆ 2.8      ┆ 40.0     ┆ null     ┆ null ┆ 2021-07-05 ┆ 14:45:50 │
+        │ 50%        ┆ 2.8      ┆ 50.0     ┆ null     ┆ null ┆ 2021-07-05 ┆ 14:45:50 │
+        │ 75%        ┆ 3.0      ┆ 50.0     ┆ null     ┆ null ┆ 2022-12-31 ┆ 23:15:10 │
+        │ max        ┆ 3.0      ┆ 50.0     ┆ 1.0      ┆ zz   ┆ 2022-12-31 ┆ 23:15:10 │
+        └────────────┴──────────┴──────────┴──────────┴──────┴────────────┴──────────┘
+
+        Customize which percentiles are displayed, applying linear interpolation:
+
+        >>> lf.describe(
+        ...     percentiles=[0.1, 0.3, 0.5, 0.7, 0.9],
+        ...     interpolation="linear",
+        ... )
+        shape: (11, 7)
+        ┌────────────┬──────────┬──────────┬──────────┬──────┬────────────┬──────────┐
+        │ statistic  ┆ float    ┆ int      ┆ bool     ┆ str  ┆ date       ┆ time     │
+        │ ---        ┆ ---      ┆ ---      ┆ ---      ┆ ---  ┆ ---        ┆ ---      │
+        │ str        ┆ f64      ┆ f64      ┆ f64      ┆ str  ┆ str        ┆ str      │
+        ╞════════════╪══════════╪══════════╪══════════╪══════╪════════════╪══════════╡
+        │ count      ┆ 3.0      ┆ 2.0      ┆ 3.0      ┆ 3    ┆ 3          ┆ 3        │
+        │ null_count ┆ 0.0      ┆ 1.0      ┆ 0.0      ┆ 0    ┆ 0          ┆ 0        │
+        │ mean       ┆ 2.266667 ┆ 45.0     ┆ 0.666667 ┆ null ┆ 2021-07-02 ┆ 16:07:10 │
+        │ std        ┆ 1.101514 ┆ 7.071068 ┆ null     ┆ null ┆ null       ┆ null     │
+        │ min        ┆ 1.0      ┆ 40.0     ┆ 0.0      ┆ xx   ┆ 2020-01-01 ┆ 10:20:30 │
+        │ 10%        ┆ 1.36     ┆ 41.0     ┆ null     ┆ null ┆ 2020-04-20 ┆ 11:13:34 │
+        │ 30%        ┆ 2.08     ┆ 43.0     ┆ null     ┆ null ┆ 2020-11-26 ┆ 12:59:42 │
+        │ 50%        ┆ 2.8      ┆ 45.0     ┆ null     ┆ null ┆ 2021-07-05 ┆ 14:45:50 │
+        │ 70%        ┆ 2.88     ┆ 47.0     ┆ null     ┆ null ┆ 2022-02-07 ┆ 18:09:34 │
+        │ 90%        ┆ 2.96     ┆ 49.0     ┆ null     ┆ null ┆ 2022-09-13 ┆ 21:33:18 │
+        │ max        ┆ 3.0      ┆ 50.0     ┆ 1.0      ┆ zz   ┆ 2022-12-31 ┆ 23:15:10 │
+        └────────────┴──────────┴──────────┴──────────┴──────┴────────────┴──────────┘
+        """
+        if not self.columns:
+            msg = "cannot describe a LazyFrame that has no columns"
+            raise TypeError(msg)
+
+        # create list of metrics
+        metrics = ["count", "null_count", "mean", "std", "min"]
+        if quantiles := parse_percentiles(percentiles):
+            metrics.extend(f"{q * 100:g}%" for q in quantiles)
+        metrics.append("max")
+
+        @lru_cache
+        def skip_minmax(dt: PolarsDataType) -> bool:
+            return dt.is_nested() or dt in (Categorical, Enum, Null, Object, Unknown)
+
+        # determine which columns will produce std/mean/percentile/etc
+        # statistics in a single pass over the frame schema
+        has_numeric_result, sort_cols = set(), set()
+        metric_exprs: list[Expr] = []
+        null = F.lit(None)
+
+        for c, dtype in self.schema.items():
+            is_numeric = dtype.is_numeric()
+            is_temporal = not is_numeric and dtype.is_temporal()
+
+            # counts
+            count_exprs = [
+                F.col(c).count().name.prefix("count:"),
+                F.col(c).null_count().name.prefix("null_count:"),
+            ]
+            # mean
+            mean_expr = (
+                F.col(c).to_physical().mean().cast(dtype)
+                if is_temporal
+                else (F.col(c).mean() if is_numeric or dtype == Boolean else null)
+            )
+
+            # standard deviation, min, max
+            expr_std = F.col(c).std() if is_numeric else null
+            min_expr = F.col(c).min() if not skip_minmax(dtype) else null
+            max_expr = F.col(c).max() if not skip_minmax(dtype) else null
+
+            # percentiles
+            pct_exprs = []
+            for p in quantiles:
+                if is_numeric or is_temporal:
+                    pct_expr = (
+                        F.col(c).to_physical().quantile(p, interpolation).cast(dtype)
+                        if is_temporal
+                        else F.col(c).quantile(p, interpolation)
+                    )
+                    sort_cols.add(c)
+                else:
+                    pct_expr = null
+                pct_exprs.append(pct_expr.alias(f"{p}:{c}"))
+
+            if is_numeric or dtype.is_nested() or dtype in (Null, Boolean):
+                has_numeric_result.add(c)
+
+            # add column expressions (in end-state 'metrics' list order)
+            metric_exprs.extend(
+                [
+                    *count_exprs,
+                    mean_expr.alias(f"mean:{c}"),
+                    expr_std.alias(f"std:{c}"),
+                    min_expr.alias(f"min:{c}"),
+                    *pct_exprs,
+                    max_expr.alias(f"max:{c}"),
+                ]
+            )
+
+        # calculate requested metrics in parallel, then collect the result
+        df_metrics = (
+            (
+                # if more than one quantile, sort the relevant columns to make them O(1)
+                # TODO: drop sort once we have efficient retrieval of multiple quantiles
+                self.with_columns(F.col(c).sort() for c in sort_cols)
+                if sort_cols
+                else self
+            )
+            .select(*metric_exprs)
+            .collect()
+        )
+
+        # reshape wide result
+        n_metrics = len(metrics)
+        column_metrics = [
+            df_metrics.row(0)[(n * n_metrics) : (n + 1) * n_metrics]
+            for n in range(self.width)
+        ]
+        summary = dict(zip(self.columns, column_metrics))
+
+        # cast by column type (numeric/bool -> float), (other -> string)
+        for c in self.columns:
+            summary[c] = [  # type: ignore[assignment]
+                None
+                if (v is None or isinstance(v, dict))
+                else (float(v) if (c in has_numeric_result) else str(v))
+                for v in summary[c]
+            ]
+
+        # return results as a DataFrame
+        df_summary = from_dict(summary)
+        df_summary.insert_column(0, pl.Series("statistic", metrics))
+        return df_summary
+
     def explain(
         self,
         *,
@@ -974,6 +1139,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         comm_subplan_elim: bool = True,
         comm_subexpr_elim: bool = True,
         streaming: bool = False,
+        tree_format: bool = False,
     ) -> str:
         """
         Create a string representation of the query plan.
@@ -983,8 +1149,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Parameters
         ----------
         optimized
-            Return an optimized query plan. Defaults to ``True``.
-            If this is set to ``True`` the subsequent
+            Return an optimized query plan. Defaults to `True`.
+            If this is set to `True` the subsequent
             optimization flags control which optimizations
             run.
         type_coercion
@@ -1003,6 +1169,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Common subexpressions will be cached and reused.
         streaming
             Run parts of the query in a streaming fashion (this is in an alpha state)
+        tree_format
+            Format the output as a tree
 
         Examples
         --------
@@ -1027,14 +1195,16 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                 comm_subplan_elim,
                 comm_subexpr_elim,
                 streaming,
-                eager=False,
+                _eager=False,
             )
+            if tree_format:
+                return ldf.describe_optimized_plan_tree()
             return ldf.describe_optimized_plan()
+
+        if tree_format:
+            return self._ldf.describe_plan_tree()
         return self._ldf.describe_plan()
 
-    @deprecate_renamed_parameter(
-        "common_subplan_elimination", "comm_subplan_elim", version="0.18.9"
-    )
     def show_graph(
         self,
         *,
@@ -1096,7 +1266,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         >>> lf.group_by("a", maintain_order=True).agg(pl.all().sum()).sort(
         ...     "a"
         ... ).show_graph()  # doctest: +SKIP
-
         """
         _ldf = self._ldf.optimization_toggle(
             type_coercion,
@@ -1107,7 +1276,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subplan_elim,
             comm_subexpr_elim,
             streaming,
-            eager=False,
+            _eager=False,
         )
 
         dot = _ldf.to_dot(optimized)
@@ -1123,7 +1292,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                 ["dot", "-Nshape=box", "-T" + output_type], input=f"{dot}".encode()
             )
         except (ImportError, FileNotFoundError):
-            raise ImportError("Graphviz dot binary should be on your PATH") from None
+            msg = "Graphviz dot binary should be on your PATH"
+            raise ImportError(msg) from None
 
         if output_path:
             Path(output_path).write_bytes(graph)
@@ -1140,9 +1310,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                 import matplotlib.image as mpimg
                 import matplotlib.pyplot as plt
             except ImportError:
-                raise ModuleNotFoundError(
-                    "matplotlib should be installed to show graph"
-                ) from None
+                msg = "matplotlib should be installed to show graph"
+                raise ModuleNotFoundError(msg) from None
             plt.figure(figsize=figsize)
             img = mpimg.imread(BytesIO(graph))
             plt.imshow(img)
@@ -1153,19 +1322,18 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         """
         Inspect a node in the computation graph.
 
-        Print the value that this node in the computation graph evaluates to and passes
-        on the value.
+        Print the value that this node in the computation graph evaluates to and pass on
+        the value.
 
         Examples
         --------
         >>> lf = pl.LazyFrame({"foo": [1, 1, -2, 3]})
         >>> (
-        ...     lf.select(pl.col("foo").cumsum().alias("bar"))
+        ...     lf.with_columns(pl.col("foo").cum_sum().alias("bar"))
         ...     .inspect()  # print the node before the filter
         ...     .filter(pl.col("bar") == pl.col("foo"))
         ... )  # doctest: +ELLIPSIS
-        <LazyFrame [1 col, {"bar": Int64}] at ...>
-
+        <LazyFrame [2 cols, {"foo": Int64, "bar": Int64}] at ...>
         """
 
         def inspect(s: DataFrame) -> DataFrame:
@@ -1185,7 +1353,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         maintain_order: bool = False,
     ) -> Self:
         """
-        Sort the DataFrame by the given columns.
+        Sort the LazyFrame by the given columns.
 
         Parameters
         ----------
@@ -1268,7 +1436,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ null ┆ 4.0 ┆ b   │
         │ 2    ┆ 5.0 ┆ c   │
         └──────┴─────┴─────┘
-
         """
         # Fast path for sorting by a single existing column
         if isinstance(by, str) and not more_by:
@@ -1281,9 +1448,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         if isinstance(descending, bool):
             descending = [descending]
         elif len(by) != len(descending):
-            raise ValueError(
-                f"the length of `descending` ({len(descending)}) does not match the length of `by` ({len(by)})"
-            )
+            msg = f"the length of `descending` ({len(descending)}) does not match the length of `by` ({len(by)})"
+            raise ValueError(msg)
         return self._from_pyldf(
             self._ldf.sort_by_exprs(by, descending, nulls_last, maintain_order)
         )
@@ -1300,7 +1466,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         """
         Return the `k` largest elements.
 
-        If 'descending=True` the smallest elements will be given.
+        If `descending=True` the smallest elements will be given.
 
         Parameters
         ----------
@@ -1310,7 +1476,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Column(s) included in sort order. Accepts expression input.
             Strings are parsed as column names.
         descending
-            Return the 'k' smallest. Top-k by multiple columns can be specified
+            Return the `k` smallest. Top-k by multiple columns can be specified
             per column by passing a sequence of booleans.
         nulls_last
             Place null values last.
@@ -1361,15 +1527,13 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ a   ┆ 2   │
         │ c   ┆ 1   │
         └─────┴─────┘
-
         """
         by = parse_as_list_of_expressions(by)
         if isinstance(descending, bool):
             descending = [descending]
         elif len(by) != len(descending):
-            raise ValueError(
-                f"the length of `descending` ({len(descending)}) does not match the length of `by` ({len(by)})"
-            )
+            msg = f"the length of `descending` ({len(descending)}) does not match the length of `by` ({len(by)})"
+            raise ValueError(msg)
         return self._from_pyldf(
             self._ldf.top_k(k, by, descending, nulls_last, maintain_order)
         )
@@ -1386,7 +1550,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         """
         Return the `k` smallest elements.
 
-        If 'descending=True` the largest elements will be given.
+        If `descending=True` the largest elements will be given.
 
         Parameters
         ----------
@@ -1396,7 +1560,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Column(s) included in sort order. Accepts expression input.
             Strings are parsed as column names.
         descending
-            Return the 'k' smallest. Top-k by multiple columns can be specified
+            Return the `k` largest. Bottom-k by multiple columns can be specified
             per column by passing a sequence of booleans.
         nulls_last
             Place null values last.
@@ -1447,7 +1611,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ b   ┆ 1   │
         │ b   ┆ 2   │
         └─────┴─────┘
-
         """
         by = parse_as_list_of_expressions(by)
         if isinstance(descending, bool):
@@ -1456,9 +1619,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             self._ldf.bottom_k(k, by, descending, nulls_last, maintain_order)
         )
 
-    @deprecate_renamed_parameter(
-        "common_subplan_elimination", "comm_subplan_elim", version="0.18.9"
-    )
     def profile(
         self,
         *,
@@ -1544,7 +1704,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
          │ group_by_partitioned(a) ┆ 5     ┆ 470  │
          │ sort(a)                 ┆ 475   ┆ 1964 │
          └─────────────────────────┴───────┴──────┘)
-
         """
         if no_optimization:
             predicate_pushdown = False
@@ -1561,7 +1720,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subplan_elim,
             comm_subexpr_elim,
             streaming,
-            eager=False,
+            _eager=False,
         )
         df, timings = ldf.profile()
         (df, timings) = wrap_df(df), wrap_df(timings)
@@ -1603,15 +1762,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                 plt.show()
 
             except ImportError:
-                raise ModuleNotFoundError(
-                    "matplotlib should be installed to show profiling plot"
-                ) from None
+                msg = "matplotlib should be installed to show profiling plot"
+                raise ModuleNotFoundError(msg) from None
 
         return df, timings
 
-    @deprecate_renamed_parameter(
-        "common_subplan_elimination", "comm_subplan_elim", version="0.18.9"
-    )
+    @overload
     def collect(
         self,
         *,
@@ -1619,18 +1775,54 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         predicate_pushdown: bool = True,
         projection_pushdown: bool = True,
         simplify_expression: bool = True,
-        no_optimization: bool = False,
         slice_pushdown: bool = True,
         comm_subplan_elim: bool = True,
         comm_subexpr_elim: bool = True,
+        no_optimization: bool = False,
         streaming: bool = False,
-        **kwargs: Any,
-    ) -> DataFrame:
-        """
-        Collect into a DataFrame.
+        background: Literal[True],
+        _eager: bool = False,
+    ) -> InProcessQuery:
+        ...
 
-        Note: use :func:`fetch` if you want to run your query on the first `n` rows
-        only. This can be a huge time saver in debugging queries.
+    @overload
+    def collect(
+        self,
+        *,
+        type_coercion: bool = True,
+        predicate_pushdown: bool = True,
+        projection_pushdown: bool = True,
+        simplify_expression: bool = True,
+        slice_pushdown: bool = True,
+        comm_subplan_elim: bool = True,
+        comm_subexpr_elim: bool = True,
+        no_optimization: bool = False,
+        streaming: bool = False,
+        background: Literal[False] = False,
+        _eager: bool = False,
+    ) -> DataFrame:
+        ...
+
+    def collect(
+        self,
+        *,
+        type_coercion: bool = True,
+        predicate_pushdown: bool = True,
+        projection_pushdown: bool = True,
+        simplify_expression: bool = True,
+        slice_pushdown: bool = True,
+        comm_subplan_elim: bool = True,
+        comm_subexpr_elim: bool = True,
+        no_optimization: bool = False,
+        streaming: bool = False,
+        background: bool = False,
+        _eager: bool = False,
+    ) -> DataFrame | InProcessQuery:
+        """
+        Materialize this LazyFrame into a DataFrame.
+
+        By default, all query optimizations are enabled. Individual optimizations may
+        be disabled by setting the corresponding parameter to `False`.
 
         Parameters
         ----------
@@ -1642,22 +1834,41 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Do projection pushdown optimization.
         simplify_expression
             Run simplify expressions optimization.
-        no_optimization
-            Turn off (certain) optimizations.
         slice_pushdown
             Slice pushdown optimization.
         comm_subplan_elim
             Will try to cache branching subplans that occur on self-joins or unions.
         comm_subexpr_elim
             Common subexpressions will be cached and reused.
+        no_optimization
+            Turn off (certain) optimizations.
         streaming
-            Run parts of the query in a streaming fashion (this is in an alpha state)
-        **kwargs
-            For internal use.
+            Process the query in batches to handle larger-than-memory data.
+            If set to `False` (default), the entire query is processed in a single
+            batch.
+
+            .. warning::
+                Streaming mode is considered **unstable**. It may be changed
+                at any point without it being considered a breaking change.
+
+            .. note::
+                Use :func:`explain` to see if Polars can process the query in streaming
+                mode.
+        background
+            Run the query in the background and get a handle to the query.
+            This handle can be used to fetch the result or cancel the query.
 
         Returns
         -------
         DataFrame
+
+        See Also
+        --------
+        fetch: Run the query on the first `n` rows only for debugging purposes.
+        explain : Print the query plan that is evaluated with collect.
+        profile : Collect the LazyFrame and time each node in the computation graph.
+        polars.collect_all : Collect multiple LazyFrames at the same time.
+        polars.Config.set_streaming_chunk_size : Set the size of streaming batches.
 
         Examples
         --------
@@ -1668,7 +1879,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ...         "c": [6, 5, 4, 3, 2, 1],
         ...     }
         ... )
-        >>> lf.group_by("a", maintain_order=True).agg(pl.all().sum()).collect()
+        >>> lf.group_by("a").agg(pl.all().sum()).collect()  # doctest: +SKIP
         shape: (3, 3)
         ┌─────┬─────┬─────┐
         │ a   ┆ b   ┆ c   │
@@ -1680,9 +1891,23 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ c   ┆ 6   ┆ 1   │
         └─────┴─────┴─────┘
 
+        Collect in streaming mode
+
+        >>> lf.group_by("a").agg(pl.all().sum()).collect(
+        ...     streaming=True
+        ... )  # doctest: +SKIP
+        shape: (3, 3)
+        ┌─────┬─────┬─────┐
+        │ a   ┆ b   ┆ c   │
+        │ --- ┆ --- ┆ --- │
+        │ str ┆ i64 ┆ i64 │
+        ╞═════╪═════╪═════╡
+        │ a   ┆ 4   ┆ 10  │
+        │ b   ┆ 11  ┆ 10  │
+        │ c   ┆ 6   ┆ 1   │
+        └─────┴─────┴─────┘
         """
-        eager = kwargs.get("eager", False)
-        if no_optimization or eager:
+        if no_optimization or _eager:
             predicate_pushdown = False
             projection_pushdown = False
             slice_pushdown = False
@@ -1690,6 +1915,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subexpr_elim = False
 
         if streaming:
+            issue_unstable_warning("Streaming mode is considered unstable.")
             comm_subplan_elim = False
 
         ldf = self._ldf.optimization_toggle(
@@ -1701,8 +1927,11 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subplan_elim,
             comm_subexpr_elim,
             streaming,
-            eager,
+            _eager,
         )
+        if background:
+            return InProcessQuery(ldf.collect_concurrently())
+
         return wrap_df(ldf.collect())
 
     @overload
@@ -1756,8 +1985,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         """
         Collect DataFrame asynchronously in thread pool.
 
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
+
         Collects into a DataFrame (like :func:`collect`), but instead of returning
-        dataframe directly, they are scheduled to be collected inside thread pool,
+        DataFrame directly, they are scheduled to be collected inside thread pool,
         while this method returns almost instantly.
 
         May be useful if you use gevent or asyncio and want to release control to other
@@ -1784,22 +2017,17 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         comm_subexpr_elim
             Common subexpressions will be cached and reused.
         streaming
-            Run parts of the query in a streaming fashion (this is in an alpha state)
+            Process the query in batches to handle larger-than-memory data.
+            If set to `False` (default), the entire query is processed in a single
+            batch.
 
-        Notes
-        -----
-        In case of error `set_exception` is used on
-        `asyncio.Future`/`gevent.event.AsyncResult` and will be reraised by them.
+            .. warning::
+                Streaming mode is considered **unstable**. It may be changed
+                at any point without it being considered a breaking change.
 
-        Warnings
-        --------
-        This functionality is experimental and may change without it being considered a
-        breaking change.
-
-        See Also
-        --------
-        polars.collect_all : Collect multiple LazyFrames at the same time.
-        polars.collect_all_async: Collect multiple LazyFrames at the same time lazily.
+            .. note::
+                Use :func:`explain` to see if Polars can process the query in streaming
+                mode.
 
         Returns
         -------
@@ -1807,6 +2035,16 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
         If `gevent=True` then returns wrapper that has
         `.get(block=True, timeout=None)` method.
+
+        See Also
+        --------
+        polars.collect_all : Collect multiple LazyFrames at the same time.
+        polars.collect_all_async: Collect multiple LazyFrames at the same time lazily.
+
+        Notes
+        -----
+        In case of error `set_exception` is used on
+        `asyncio.Future`/`gevent.event.AsyncResult` and will be reraised by them.
 
         Examples
         --------
@@ -1824,7 +2062,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ...         .agg(pl.all().sum())
         ...         .collect_async()
         ...     )
-        ...
         >>> asyncio.run(main())
         shape: (3, 3)
         ┌─────┬─────┬─────┐
@@ -1845,6 +2082,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subexpr_elim = False
 
         if streaming:
+            issue_unstable_warning("Streaming mode is considered unstable.")
             comm_subplan_elim = False
 
         ldf = self._ldf.optimization_toggle(
@@ -1856,13 +2094,14 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subplan_elim,
             comm_subexpr_elim,
             streaming,
-            eager=False,
+            _eager=False,
         )
 
         result = _GeventDataFrameResult() if gevent else _AioDataFrameResult()
         ldf.collect_with_callback(result._callback)  # type: ignore[attr-defined]
         return result  # type: ignore[return-value]
 
+    @unstable()
     def sink_parquet(
         self,
         path: str | Path,
@@ -1877,11 +2116,15 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         predicate_pushdown: bool = True,
         projection_pushdown: bool = True,
         simplify_expression: bool = True,
-        no_optimization: bool = False,
         slice_pushdown: bool = True,
+        no_optimization: bool = False,
     ) -> DataFrame:
         """
-        Persists a LazyFrame at the provided path.
+        Evaluate the query in streaming mode and write to a Parquet file.
+
+        .. warning::
+            Streaming mode is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
         This allows streaming results that are larger than RAM to be written to disk.
 
@@ -1922,10 +2165,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Do projection pushdown optimization.
         simplify_expression
             Run simplify expressions optimization.
-        no_optimization
-            Turn off (certain) optimizations.
         slice_pushdown
             Slice pushdown optimization.
+        no_optimization
+            Turn off (certain) optimizations.
 
         Returns
         -------
@@ -1935,19 +2178,18 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         --------
         >>> lf = pl.scan_csv("/path/to/my_larger_than_ram_file.csv")  # doctest: +SKIP
         >>> lf.sink_parquet("out.parquet")  # doctest: +SKIP
-
         """
         lf = self._set_sink_optimizations(
             type_coercion=type_coercion,
             predicate_pushdown=predicate_pushdown,
             projection_pushdown=projection_pushdown,
             simplify_expression=simplify_expression,
-            no_optimization=no_optimization,
             slice_pushdown=slice_pushdown,
+            no_optimization=no_optimization,
         )
 
         return lf.sink_parquet(
-            path=path,
+            path=normalize_filepath(path),
             compression=compression,
             compression_level=compression_level,
             statistics=statistics,
@@ -1956,6 +2198,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             maintain_order=maintain_order,
         )
 
+    @unstable()
     def sink_ipc(
         self,
         path: str | Path,
@@ -1966,11 +2209,15 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         predicate_pushdown: bool = True,
         projection_pushdown: bool = True,
         simplify_expression: bool = True,
-        no_optimization: bool = False,
         slice_pushdown: bool = True,
+        no_optimization: bool = False,
     ) -> DataFrame:
         """
-        Persists a LazyFrame at the provided path.
+        Evaluate the query in streaming mode and write to an IPC file.
+
+        .. warning::
+            Streaming mode is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
         This allows streaming results that are larger than RAM to be written to disk.
 
@@ -1992,10 +2239,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Do projection pushdown optimization.
         simplify_expression
             Run simplify expressions optimization.
-        no_optimization
-            Turn off (certain) optimizations.
         slice_pushdown
             Slice pushdown optimization.
+        no_optimization
+            Turn off (certain) optimizations.
 
         Returns
         -------
@@ -2005,15 +2252,14 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         --------
         >>> lf = pl.scan_csv("/path/to/my_larger_than_ram_file.csv")  # doctest: +SKIP
         >>> lf.sink_ipc("out.arrow")  # doctest: +SKIP
-
         """
         lf = self._set_sink_optimizations(
             type_coercion=type_coercion,
             predicate_pushdown=predicate_pushdown,
             projection_pushdown=projection_pushdown,
             simplify_expression=simplify_expression,
-            no_optimization=no_optimization,
             slice_pushdown=slice_pushdown,
+            no_optimization=no_optimization,
         )
 
         return lf.sink_ipc(
@@ -2022,14 +2268,18 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             maintain_order=maintain_order,
         )
 
+    @deprecate_renamed_parameter("quote", "quote_char", version="0.19.8")
+    @deprecate_renamed_parameter("has_header", "include_header", version="0.19.13")
+    @unstable()
     def sink_csv(
         self,
         path: str | Path,
         *,
-        has_header: bool = True,
+        include_bom: bool = False,
+        include_header: bool = True,
         separator: str = ",",
         line_terminator: str = "\n",
-        quote: str = '"',
+        quote_char: str = '"',
         batch_size: int = 1024,
         datetime_format: str | None = None,
         date_format: str | None = None,
@@ -2042,11 +2292,15 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         predicate_pushdown: bool = True,
         projection_pushdown: bool = True,
         simplify_expression: bool = True,
-        no_optimization: bool = False,
         slice_pushdown: bool = True,
+        no_optimization: bool = False,
     ) -> DataFrame:
         """
-        Persists a LazyFrame at the provided path.
+        Evaluate the query in streaming mode and write to a CSV file.
+
+        .. warning::
+            Streaming mode is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
         This allows streaming results that are larger than RAM to be written to disk.
 
@@ -2054,13 +2308,15 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ----------
         path
             File path to which the file should be written.
-        has_header
+        include_bom
+            Whether to include UTF-8 BOM in the CSV output.
+        include_header
             Whether to include header in the CSV output.
         separator
             Separate CSV fields with this symbol.
         line_terminator
             String used to end each row.
-        quote
+        quote_char
             Byte to use as quoting character.
         batch_size
             Number of rows that will be processed per thread.
@@ -2079,25 +2335,27 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             `chrono <https://docs.rs/chrono/latest/chrono/format/strftime/index.html>`_
             Rust crate.
         float_precision
-            Number of decimal places to write, applied to both ``Float32`` and
-            ``Float64`` datatypes.
+            Number of decimal places to write, applied to both `Float32` and
+            `Float64` datatypes.
         null_value
             A string representing null values (defaulting to the empty string).
         quote_style : {'necessary', 'always', 'non_numeric', 'never'}
             Determines the quoting strategy used.
+
             - necessary (default): This puts quotes around fields only when necessary.
-            They are necessary when fields contain a quote,
-            delimiter or record terminator.
-            Quotes are also necessary when writing an empty record
-            (which is indistinguishable from a record with one empty field).
-            This is the default.
+              They are necessary when fields contain a quote,
+              delimiter or record terminator.
+              Quotes are also necessary when writing an empty record
+              (which is indistinguishable from a record with one empty field).
+              This is the default.
             - always: This puts quotes around every field. Always.
             - never: This never puts quotes around fields, even if that results in
-            invalid CSV data (e.g.: by not quoting strings containing the separator).
+              invalid CSV data (e.g.: by not quoting strings containing the
+              separator).
             - non_numeric: This puts quotes around all fields that are non-numeric.
-            Namely, when writing a field that does not parse as a valid float
-            or integer, then quotes will be used even if they aren`t strictly
-            necessary.
+              Namely, when writing a field that does not parse as a valid float
+              or integer, then quotes will be used even if they aren`t strictly
+              necessary.
         maintain_order
             Maintain the order in which data is processed.
             Setting this to `False` will  be slightly faster.
@@ -2109,10 +2367,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Do projection pushdown optimization.
         simplify_expression
             Run simplify expressions optimization.
-        no_optimization
-            Turn off (certain) optimizations.
         slice_pushdown
             Slice pushdown optimization.
+        no_optimization
+            Turn off (certain) optimizations.
 
         Returns
         -------
@@ -2122,12 +2380,9 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         --------
         >>> lf = pl.scan_csv("/path/to/my_larger_than_ram_file.csv")  # doctest: +SKIP
         >>> lf.sink_csv("out.csv")  # doctest: +SKIP
-
         """
-        if len(separator) != 1:
-            raise ValueError("only single byte separator is allowed")
-        if len(quote) != 1:
-            raise ValueError("only single byte quote char is allowed")
+        _check_arg_is_1byte("separator", separator, can_be_empty=False)
+        _check_arg_is_1byte("quote_char", quote_char, can_be_empty=False)
         if not null_value:
             null_value = None
 
@@ -2136,16 +2391,17 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             predicate_pushdown=predicate_pushdown,
             projection_pushdown=projection_pushdown,
             simplify_expression=simplify_expression,
-            no_optimization=no_optimization,
             slice_pushdown=slice_pushdown,
+            no_optimization=no_optimization,
         )
 
         return lf.sink_csv(
             path=path,
-            has_header=has_header,
+            include_bom=include_bom,
+            include_header=include_header,
             separator=ord(separator),
             line_terminator=line_terminator,
-            quote=ord(quote),
+            quote_char=ord(quote_char),
             batch_size=batch_size,
             datetime_format=datetime_format,
             date_format=date_format,
@@ -2156,6 +2412,68 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             maintain_order=maintain_order,
         )
 
+    @unstable()
+    def sink_ndjson(
+        self,
+        path: str | Path,
+        *,
+        maintain_order: bool = True,
+        type_coercion: bool = True,
+        predicate_pushdown: bool = True,
+        projection_pushdown: bool = True,
+        simplify_expression: bool = True,
+        slice_pushdown: bool = True,
+        no_optimization: bool = False,
+    ) -> DataFrame:
+        """
+        Evaluate the query in streaming mode and write to an NDJSON file.
+
+        .. warning::
+            Streaming mode is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
+
+        This allows streaming results that are larger than RAM to be written to disk.
+
+        Parameters
+        ----------
+        path
+            File path to which the file should be written.
+        maintain_order
+            Maintain the order in which data is processed.
+            Setting this to `False` will be slightly faster.
+        type_coercion
+            Do type coercion optimization.
+        predicate_pushdown
+            Do predicate pushdown optimization.
+        projection_pushdown
+            Do projection pushdown optimization.
+        simplify_expression
+            Run simplify expressions optimization.
+        slice_pushdown
+            Slice pushdown optimization.
+        no_optimization
+            Turn off (certain) optimizations.
+
+        Returns
+        -------
+        DataFrame
+
+        Examples
+        --------
+        >>> lf = pl.scan_csv("/path/to/my_larger_than_ram_file.csv")  # doctest: +SKIP
+        >>> lf.sink_ndjson("out.ndjson")  # doctest: +SKIP
+        """
+        lf = self._set_sink_optimizations(
+            type_coercion=type_coercion,
+            predicate_pushdown=predicate_pushdown,
+            projection_pushdown=projection_pushdown,
+            simplify_expression=simplify_expression,
+            slice_pushdown=slice_pushdown,
+            no_optimization=no_optimization,
+        )
+
+        return lf.sink_json(path=path, maintain_order=maintain_order)
+
     def _set_sink_optimizations(
         self,
         *,
@@ -2163,8 +2481,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         predicate_pushdown: bool = True,
         projection_pushdown: bool = True,
         simplify_expression: bool = True,
-        no_optimization: bool = False,
         slice_pushdown: bool = True,
+        no_optimization: bool = False,
     ) -> PyLazyFrame:
         if no_optimization:
             predicate_pushdown = False
@@ -2180,12 +2498,9 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subplan_elim=False,
             comm_subexpr_elim=False,
             streaming=True,
-            eager=False,
+            _eager=False,
         )
 
-    @deprecate_renamed_parameter(
-        "common_subplan_elimination", "comm_subplan_elim", version="0.18.9"
-    )
     def fetch(
         self,
         n_rows: int = 500,
@@ -2229,11 +2544,11 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Notes
         -----
         This is similar to a :func:`collect` operation, but it overwrites the number of
-        rows read by *every* scan operation. Be aware that ``fetch`` does not guarantee
+        rows read by *every* scan operation. Be aware that `fetch` does not guarantee
         the final number of rows in the DataFrame. Filters, join operations and fewer
         rows being available in the scanned data will all influence the final number
         of rows (joins are especially susceptible to this, and may return no data
-        at all if ``n_rows`` is too small as the join keys may not be present).
+        at all if `n_rows` is too small as the join keys may not be present).
 
         Warnings
         --------
@@ -2263,7 +2578,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ a   ┆ 1   ┆ 6   │
         │ b   ┆ 2   ┆ 5   │
         └─────┴─────┴─────┘
-
         """
         if no_optimization:
             predicate_pushdown = False
@@ -2281,7 +2595,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             comm_subplan_elim,
             comm_subexpr_elim,
             streaming,
-            eager=False,
+            _eager=False,
         )
         return wrap_df(lf.fetch(n_rows))
 
@@ -2307,7 +2621,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ... )
         >>> lf.lazy()  # doctest: +ELLIPSIS
         <LazyFrame [3 cols, {"a": Int64 … "c": Boolean}] at ...>
-
         """
         return self
 
@@ -2317,7 +2630,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
     def cast(
         self,
-        dtypes: Mapping[ColumnNameOrSelector, PolarsDataType] | PolarsDataType,
+        dtypes: (
+            Mapping[ColumnNameOrSelector | PolarsDataType, PolarsDataType]
+            | PolarsDataType
+        ),
         *,
         strict: bool = True,
     ) -> Self:
@@ -2358,17 +2674,24 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 3.0 ┆ 8   ┆ 2022-05-06 │
         └─────┴─────┴────────────┘
 
-        Cast all frame columns to the specified dtype:
+        Cast all frame columns matching one dtype (or dtype group) to another dtype:
 
-        >>> lf.cast(pl.Utf8).collect().to_dict(False)
-        {'foo': ['1', '2', '3'],
-         'bar': ['6.0', '7.0', '8.0'],
-         'ham': ['2020-01-02', '2021-03-04', '2022-05-06']}
+        >>> lf.cast({pl.Date: pl.Datetime}).collect()
+        shape: (3, 3)
+        ┌─────┬─────┬─────────────────────┐
+        │ foo ┆ bar ┆ ham                 │
+        │ --- ┆ --- ┆ ---                 │
+        │ i64 ┆ f64 ┆ datetime[μs]        │
+        ╞═════╪═════╪═════════════════════╡
+        │ 1   ┆ 6.0 ┆ 2020-01-02 00:00:00 │
+        │ 2   ┆ 7.0 ┆ 2021-03-04 00:00:00 │
+        │ 3   ┆ 8.0 ┆ 2022-05-06 00:00:00 │
+        └─────┴─────┴─────────────────────┘
 
         Use selectors to define the columns being cast:
 
         >>> import polars.selectors as cs
-        >>> lf.cast({cs.numeric(): pl.UInt32, cs.temporal(): pl.Utf8}).collect()
+        >>> lf.cast({cs.numeric(): pl.UInt32, cs.temporal(): pl.String}).collect()
         shape: (3, 3)
         ┌─────┬─────┬────────────┐
         │ foo ┆ bar ┆ ham        │
@@ -2380,17 +2703,28 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 3   ┆ 8   ┆ 2022-05-06 │
         └─────┴─────┴────────────┘
 
+        Cast all frame columns to the specified dtype:
+
+        >>> lf.cast(pl.String).collect().to_dict(as_series=False)
+        {'foo': ['1', '2', '3'],
+         'bar': ['6.0', '7.0', '8.0'],
+         'ham': ['2020-01-02', '2021-03-04', '2022-05-06']}
         """
         if not isinstance(dtypes, Mapping):
             return self._from_pyldf(self._ldf.cast_all(dtypes, strict))
 
         cast_map = {}
         for c, dtype in dtypes.items():
+            if (is_polars_dtype(c) or isinstance(c, DataTypeGroup)) or (
+                isinstance(c, Collection) and all(is_polars_dtype(x) for x in c)
+            ):
+                c = by_dtype(c)  # type: ignore[arg-type]
+
             dtype = py_type_to_dtype(dtype)
             cast_map.update(
                 {c: dtype}
                 if isinstance(c, str)
-                else {x: dtype for x in expand_selector(self, c)}
+                else {x: dtype for x in expand_selector(self, c)}  # type: ignore[arg-type]
             )
 
         return self._from_pyldf(self._ldf.cast(cast_map, strict))
@@ -2438,13 +2772,14 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ null ┆ null ┆ null │
         │ null ┆ null ┆ null │
         └──────┴──────┴──────┘
-
         """
         return pl.DataFrame(schema=self.schema).clear(n).lazy()
 
     def clone(self) -> Self:
         """
-        Very cheap deepcopy/clone.
+        Create a copy of this LazyFrame.
+
+        This is a cheap operation that does not copy data.
 
         See Also
         --------
@@ -2462,11 +2797,20 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ... )
         >>> lf.clone()  # doctest: +ELLIPSIS
         <LazyFrame [3 cols, {"a": Int64 … "c": Boolean}] at ...>
-
         """
         return self._from_pyldf(self._ldf.clone())
 
-    def filter(self, predicate: IntoExpr) -> Self:
+    def filter(
+        self,
+        *predicates: (
+            IntoExprColumn
+            | Iterable[IntoExprColumn]
+            | bool
+            | list[bool]
+            | np.ndarray[Any, Any]
+        ),
+        **constraints: Any,
+    ) -> Self:
         """
         Filter the rows in the LazyFrame based on a predicate expression.
 
@@ -2474,8 +2818,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
         Parameters
         ----------
-        predicate
+        predicates
             Expression that evaluates to a boolean Series.
+        constraints
+            Column filters; use `name = value` to filter columns by the supplied value.
+            Each constraint will behave the same as `pl.col(name).eq(value)`, and
+            will be implicitly joined with the other filter conditions using `&`.
 
         Examples
         --------
@@ -2489,20 +2837,47 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
         Filter on one condition:
 
-        >>> lf.filter(pl.col("foo") < 3).collect()
+        >>> lf.filter(pl.col("foo") > 1).collect()
         shape: (2, 3)
         ┌─────┬─────┬─────┐
         │ foo ┆ bar ┆ ham │
         │ --- ┆ --- ┆ --- │
         │ i64 ┆ i64 ┆ str │
         ╞═════╪═════╪═════╡
-        │ 1   ┆ 6   ┆ a   │
         │ 2   ┆ 7   ┆ b   │
+        │ 3   ┆ 8   ┆ c   │
         └─────┴─────┴─────┘
 
         Filter on multiple conditions:
 
         >>> lf.filter((pl.col("foo") < 3) & (pl.col("ham") == "a")).collect()
+        shape: (1, 3)
+        ┌─────┬─────┬─────┐
+        │ foo ┆ bar ┆ ham │
+        │ --- ┆ --- ┆ --- │
+        │ i64 ┆ i64 ┆ str │
+        ╞═════╪═════╪═════╡
+        │ 1   ┆ 6   ┆ a   │
+        └─────┴─────┴─────┘
+
+        Provide multiple filters using `*args` syntax:
+
+        >>> lf.filter(
+        ...     pl.col("foo") == 1,
+        ...     pl.col("ham") == "a",
+        ... ).collect()
+        shape: (1, 3)
+        ┌─────┬─────┬─────┐
+        │ foo ┆ bar ┆ ham │
+        │ --- ┆ --- ┆ --- │
+        │ i64 ┆ i64 ┆ str │
+        ╞═════╪═════╪═════╡
+        │ 1   ┆ 6   ┆ a   │
+        └─────┴─────┴─────┘
+
+        Provide multiple filters using `**kwargs` syntax:
+
+        >>> lf.filter(foo=1, ham="a").collect()
         shape: (1, 3)
         ┌─────┬─────┬─────┐
         │ foo ┆ bar ┆ ham │
@@ -2524,13 +2899,88 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 1   ┆ 6   ┆ a   │
         │ 3   ┆ 8   ┆ c   │
         └─────┴─────┴─────┘
-
         """
-        if isinstance(predicate, list):
-            predicate = pl.Series(predicate)
+        all_predicates: list[pl.Expr] = []
+        boolean_masks = []
 
-        predicate = parse_as_expression(predicate)
-        return self._from_pyldf(self._ldf.filter(predicate))
+        # no-op; immediately matches all rows
+        if len(predicates) == 1 and predicates[0] is True and not constraints:
+            return self.clone()
+
+        # note: identify masks separately from predicates
+        for p in predicates:
+            if p is False:  # immediately disallows all rows
+                return self.clear()  # type: ignore[return-value]
+            elif p is True:
+                continue  # no-op; matches all rows
+            elif is_bool_sequence(p, include_series=True):
+                boolean_masks.append(pl.Series(p, dtype=Boolean))
+            elif (
+                (is_seq := is_sequence(p))
+                and any(not isinstance(x, pl.Expr) for x in p)
+            ) or (
+                not is_seq
+                and not isinstance(p, pl.Expr)
+                and not (isinstance(p, str) and p in self.columns)
+            ):
+                err = (
+                    f"Series(…, dtype={p.dtype})"
+                    if isinstance(p, pl.Series)
+                    else repr(p)
+                )
+                msg = f"invalid predicate for `filter`: {err}"
+                raise TypeError(msg)
+            else:
+                all_predicates.extend(
+                    wrap_expr(x) for x in parse_as_list_of_expressions(p)
+                )
+
+        # identify deprecated usage of 'predicate' parameter
+        if "predicate" in constraints:
+            is_mask = False
+            if isinstance(p := constraints["predicate"], pl.Expr) or (
+                is_mask := is_bool_sequence(p)
+            ):
+                p = constraints.pop("predicate")
+                issue_deprecation_warning(
+                    "`filter` no longer takes a 'predicate' parameter.\n"
+                    "To silence this warning you should omit the keyword and pass "
+                    "as a positional argument instead.",
+                    version="0.19.9",
+                )
+                if is_mask:
+                    boolean_masks.append(pl.Series(p, dtype=Boolean))
+                else:
+                    all_predicates.append(p)  # type: ignore[arg-type]
+
+        # unpack equality constraints from kwargs
+        all_predicates.extend(
+            F.col(name).eq(value) for name, value in constraints.items()
+        )
+        if not (all_predicates or boolean_masks):
+            msg = "at least one predicate or constraint must be provided"
+            raise TypeError(msg)
+
+        # if multiple predicates, combine as 'horizontal' expression
+        combined_predicate = (
+            (
+                F.all_horizontal(*all_predicates)
+                if len(all_predicates) > 1
+                else all_predicates[0]
+            )._pyexpr
+            if all_predicates
+            else None
+        )
+
+        # apply reduced boolean mask first, if applicable, then predicates
+        ldf = (
+            self._ldf.filter(F.lit(reduce(and_, boolean_masks))._pyexpr)
+            if boolean_masks
+            else self._ldf
+        )
+        return self._from_pyldf(
+            ldf if combined_predicate is None else ldf.filter(combined_predicate)
+        )
 
     def select(
         self, *exprs: IntoExpr | Iterable[IntoExpr], **named_exprs: IntoExpr
@@ -2617,13 +3067,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         └───────────┘
 
         Expressions with multiple outputs can be automatically instantiated as Structs
-        by enabling the experimental setting ``Config.set_auto_structify(True)``:
+        by enabling the setting `Config.set_auto_structify(True)`:
 
         >>> with pl.Config(auto_structify=True):
         ...     lf.select(
-        ...         is_odd=(pl.col(pl.INTEGER_DTYPES) % 2).suffix("_is_odd"),
+        ...         is_odd=(pl.col(pl.INTEGER_DTYPES) % 2).name.suffix("_is_odd"),
         ...     ).collect()
-        ...
         shape: (3, 1)
         ┌───────────┐
         │ is_odd    │
@@ -2634,7 +3083,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ {0,1}     │
         │ {1,0}     │
         └───────────┘
-
         """
         structify = bool(int(os.environ.get("POLARS_AUTO_STRUCTIFY", 0)))
 
@@ -2665,7 +3113,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         See Also
         --------
         select
-
         """
         structify = bool(int(os.environ.get("POLARS_AUTO_STRUCTIFY", 0)))
 
@@ -2674,31 +3121,33 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         )
         return self._from_pyldf(self._ldf.select_seq(pyexprs))
 
+    @deprecate_parameter_as_positional("by", version="0.20.7")
     def group_by(
         self,
-        by: IntoExpr | Iterable[IntoExpr],
-        *more_by: IntoExpr,
+        *by: IntoExpr | Iterable[IntoExpr],
         maintain_order: bool = False,
+        **named_by: IntoExpr,
     ) -> LazyGroupBy:
         """
         Start a group by operation.
 
         Parameters
         ----------
-        by
+        *by
             Column(s) to group by. Accepts expression input. Strings are parsed as
             column names.
-        *more_by
-            Additional columns to group by, specified as positional arguments.
         maintain_order
             Ensure that the order of the groups is consistent with the input data.
             This is slower than a default group by.
-            Settings this to ``True`` blocks the possibility
+            Setting this to `True` blocks the possibility
             to run on the streaming engine.
+        **named_by
+            Additional columns to group by, specified as keyword arguments.
+            The columns will be renamed to the keyword used.
 
         Examples
         --------
-        Group by one column and call ``agg`` to compute the grouped sum of another
+        Group by one column and call `agg` to compute the grouped sum of another
         column.
 
         >>> lf = pl.LazyFrame(
@@ -2720,7 +3169,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ c   ┆ 3   │
         └─────┴─────┘
 
-        Set ``maintain_order=True`` to ensure the order of the groups is consistent with
+        Set `maintain_order=True` to ensure the order of the groups is consistent with
         the input.
 
         >>> lf.group_by("a", maintain_order=True).agg(pl.col("c")).collect()
@@ -2766,13 +3215,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ b   ┆ 1   ┆ 3.0 │
         │ c   ┆ 1   ┆ 1.0 │
         └─────┴─────┴─────┘
-
         """
-        exprs = parse_as_list_of_expressions(by, *more_by)
+        exprs = parse_as_list_of_expressions(*by, **named_by)
         lgb = self._ldf.group_by(exprs, maintain_order)
         return LazyGroupBy(lgb)
 
-    def group_by_rolling(
+    def rolling(
         self,
         index_column: IntoExpr,
         *,
@@ -2785,17 +3233,24 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         """
         Create rolling groups based on a time, Int32, or Int64 column.
 
-        Different from a ``dynamic_group_by`` the windows are now determined by the
+        Different from a `dynamic_group_by` the windows are now determined by the
         individual values and are not of constant intervals. For constant intervals
         use :func:`LazyFrame.group_by_dynamic`.
 
-        If you have a time series ``<t_0, t_1, ..., t_n>``, then by default the
+        If you have a time series `<t_0, t_1, ..., t_n>`, then by default the
         windows created will be
 
             * (t_0 - period, t_0]
             * (t_1 - period, t_1]
             * ...
             * (t_n - period, t_n]
+
+        whereas if you pass a non-default `offset`, then the windows will be
+
+            * (t_0 + offset, t_0 + offset + period]
+            * (t_1 + offset, t_1 + offset + period]
+            * ...
+            * (t_n + offset, t_n + offset + period]
 
         The `period` and `offset` arguments are created either from a timedelta, or
         by using the following string language:
@@ -2816,15 +3271,11 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Or combine them:
         "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-        Suffix with `"_saturating"` to indicate that dates too large for
-        their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
-        instead of erroring.
-
         By "calendar day", we mean the corresponding time on the next day (which may
         not be 24 hours, due to daylight savings). Similarly for "calendar week",
         "calendar month", "calendar quarter", and "calendar year".
 
-        In case of a group_by_rolling on an integer column, the windows are defined by:
+        In case of a rolling operation on an integer column, the windows are defined by:
 
         - "1i"      # length 1
         - "10i"     # length 10
@@ -2849,16 +3300,16 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         by
             Also group by this column/these columns
         check_sorted
-            When the ``by`` argument is given, polars can not check sortedness
+            When the `by` argument is given, polars can not check sortedness
             by the metadata and has to do a full scan on the index column to
             verify data is sorted. This is expensive. If you are sure the
-            data within the by groups is sorted, you can set this to ``False``.
+            data within the by groups is sorted, you can set this to `False`.
             Doing so incorrectly will lead to incorrect output
 
         Returns
         -------
         LazyGroupBy
-            Object you can call ``.agg`` on to aggregate by groups, the result
+            Object you can call `.agg` on to aggregate by groups, the result
             of which will be sorted by `index_column` (but note that if `by` columns are
             passed, it will only be sorted within each `by` group).
 
@@ -2880,19 +3331,14 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ...     pl.col("dt").str.strptime(pl.Datetime).set_sorted()
         ... )
         >>> out = (
-        ...     df.group_by_rolling(index_column="dt", period="2d")
+        ...     df.rolling(index_column="dt", period="2d")
         ...     .agg(
-        ...         [
-        ...             pl.sum("a").alias("sum_a"),
-        ...             pl.min("a").alias("min_a"),
-        ...             pl.max("a").alias("max_a"),
-        ...         ]
+        ...         pl.sum("a").alias("sum_a"),
+        ...         pl.min("a").alias("min_a"),
+        ...         pl.max("a").alias("max_a"),
         ...     )
         ...     .collect()
         ... )
-        >>> assert out["sum_a"].to_list() == [3, 10, 15, 24, 11, 1]
-        >>> assert out["max_a"].to_list() == [3, 7, 7, 9, 9, 1]
-        >>> assert out["min_a"].to_list() == [3, 3, 3, 3, 2, 1]
         >>> out
         shape: (6, 4)
         ┌─────────────────────┬───────┬───────┬───────┐
@@ -2907,8 +3353,9 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 2020-01-03 19:45:32 ┆ 11    ┆ 2     ┆ 9     │
         │ 2020-01-08 23:16:43 ┆ 1     ┆ 1     ┆ 1     │
         └─────────────────────┴───────┴───────┴───────┘
-
         """
+        period = deprecate_saturating(period)
+        offset = deprecate_saturating(offset)
         index_column = parse_as_expression(index_column)
         if offset is None:
             offset = _negate_duration(_timedelta_to_pl_duration(period))
@@ -2917,7 +3364,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         period = _timedelta_to_pl_duration(period)
         offset = _timedelta_to_pl_duration(offset)
 
-        lgb = self._ldf.group_by_rolling(
+        lgb = self._ldf.rolling(
             index_column, period, offset, closed, pyexprs_by, check_sorted
         )
         return LazyGroupBy(lgb)
@@ -2929,9 +3376,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         every: str | timedelta,
         period: str | timedelta | None = None,
         offset: str | timedelta | None = None,
-        truncate: bool = True,
+        truncate: bool | None = None,
         include_boundaries: bool = False,
         closed: ClosedInterval = "left",
+        label: Label = "left",
         by: IntoExpr | Iterable[IntoExpr] | None = None,
         start_by: StartBy = "window",
         check_sorted: bool = True,
@@ -2975,12 +3423,23 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Defaults to negative `every`.
         truncate
             truncate the time value to the window lower bound
+
+            .. deprecated:: 0.19.4
+                Use `label` instead.
         include_boundaries
-            Add the lower and upper bound of the window to the "_lower_bound" and
-            "_upper_bound" columns. This will impact performance because it's harder to
+            Add the lower and upper bound of the window to the "_lower_boundary" and
+            "_upper_boundary" columns. This will impact performance because it's harder to
             parallelize
-        closed : {'right', 'left', 'both', 'none'}
+        closed : {'left', 'right', 'both', 'none'}
             Define which sides of the temporal interval are closed (inclusive).
+        label : {'left', 'right', 'datapoint'}
+            Define which label to use for the window:
+
+            - 'left': lower boundary of the window
+            - 'right': upper boundary of the window
+            - 'datapoint': the first value of the index column in the given window.
+              If you don't need the label to be at one of the boundaries, choose this
+              option for maximum performance
         by
             Also group by this column/these columns
         start_by : {'window', 'datapoint', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'}
@@ -2990,29 +3449,29 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
               `every`, and then adding `offset`.
               Note that weekly windows start on Monday.
             * 'datapoint': Start from the first encountered data point.
-            * a day of the week (only takes effect if `every` contains ``'w'``):
+            * a day of the week (only takes effect if `every` contains `'w'`):
 
               * 'monday': Start the window on the Monday before the first data point.
               * 'tuesday': Start the window on the Tuesday before the first data point.
               * ...
               * 'sunday': Start the window on the Sunday before the first data point.
         check_sorted
-            When the ``by`` argument is given, polars can not check sortedness
+            When the `by` argument is given, polars can not check sortedness
             by the metadata and has to do a full scan on the index column to
             verify data is sorted. This is expensive. If you are sure the
-            data within the by groups is sorted, you can set this to ``False``.
+            data within the by groups is sorted, you can set this to `False`.
             Doing so incorrectly will lead to incorrect output
 
         Returns
         -------
         LazyGroupBy
-            Object you can call ``.agg`` on to aggregate by groups, the result
+            Object you can call `.agg` on to aggregate by groups, the result
             of which will be sorted by `index_column` (but note that if `by` columns are
             passed, it will only be sorted within each `by` group).
 
         See Also
         --------
-        group_by_rolling
+        rolling
 
         Notes
         -----
@@ -3053,10 +3512,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
            Or combine them:
            "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-           Suffix with `"_saturating"` to indicate that dates too large for
-           their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
-           instead of erroring.
-
            By "calendar day", we mean the corresponding time on the next day (which may
            not be 24 hours, due to daylight savings). Similarly for "calendar week",
            "calendar month", "calendar quarter", and "calendar year".
@@ -3069,7 +3524,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Examples
         --------
         >>> from datetime import datetime
-        >>> # create an example dataframe
         >>> lf = pl.LazyFrame(
         ...     {
         ...         "time": pl.datetime_range(
@@ -3100,130 +3554,112 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Group by windows of 1 hour starting at 2021-12-16 00:00:00.
 
         >>> lf.group_by_dynamic("time", every="1h", closed="right").agg(
-        ...     [
-        ...         pl.col("time").min().alias("time_min"),
-        ...         pl.col("time").max().alias("time_max"),
-        ...     ]
+        ...     pl.col("n")
         ... ).collect()
-        shape: (4, 3)
-        ┌─────────────────────┬─────────────────────┬─────────────────────┐
-        │ time                ┆ time_min            ┆ time_max            │
-        │ ---                 ┆ ---                 ┆ ---                 │
-        │ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        │
-        ╞═════════════════════╪═════════════════════╪═════════════════════╡
-        │ 2021-12-15 23:00:00 ┆ 2021-12-16 00:00:00 ┆ 2021-12-16 00:00:00 │
-        │ 2021-12-16 00:00:00 ┆ 2021-12-16 00:30:00 ┆ 2021-12-16 01:00:00 │
-        │ 2021-12-16 01:00:00 ┆ 2021-12-16 01:30:00 ┆ 2021-12-16 02:00:00 │
-        │ 2021-12-16 02:00:00 ┆ 2021-12-16 02:30:00 ┆ 2021-12-16 03:00:00 │
-        └─────────────────────┴─────────────────────┴─────────────────────┘
+        shape: (4, 2)
+        ┌─────────────────────┬───────────┐
+        │ time                ┆ n         │
+        │ ---                 ┆ ---       │
+        │ datetime[μs]        ┆ list[i64] │
+        ╞═════════════════════╪═══════════╡
+        │ 2021-12-15 23:00:00 ┆ [0]       │
+        │ 2021-12-16 00:00:00 ┆ [1, 2]    │
+        │ 2021-12-16 01:00:00 ┆ [3, 4]    │
+        │ 2021-12-16 02:00:00 ┆ [5, 6]    │
+        └─────────────────────┴───────────┘
 
         The window boundaries can also be added to the aggregation result
 
         >>> lf.group_by_dynamic(
         ...     "time", every="1h", include_boundaries=True, closed="right"
-        ... ).agg([pl.col("time").count().alias("time_count")]).collect()
+        ... ).agg(pl.col("n").mean()).collect()
         shape: (4, 4)
-        ┌─────────────────────┬─────────────────────┬─────────────────────┬────────────┐
-        │ _lower_boundary     ┆ _upper_boundary     ┆ time                ┆ time_count │
-        │ ---                 ┆ ---                 ┆ ---                 ┆ ---        │
-        │ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        ┆ u32        │
-        ╞═════════════════════╪═════════════════════╪═════════════════════╪════════════╡
-        │ 2021-12-15 23:00:00 ┆ 2021-12-16 00:00:00 ┆ 2021-12-15 23:00:00 ┆ 1          │
-        │ 2021-12-16 00:00:00 ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 00:00:00 ┆ 2          │
-        │ 2021-12-16 01:00:00 ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 01:00:00 ┆ 2          │
-        │ 2021-12-16 02:00:00 ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 02:00:00 ┆ 2          │
-        └─────────────────────┴─────────────────────┴─────────────────────┴────────────┘
+        ┌─────────────────────┬─────────────────────┬─────────────────────┬─────┐
+        │ _lower_boundary     ┆ _upper_boundary     ┆ time                ┆ n   │
+        │ ---                 ┆ ---                 ┆ ---                 ┆ --- │
+        │ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        ┆ f64 │
+        ╞═════════════════════╪═════════════════════╪═════════════════════╪═════╡
+        │ 2021-12-15 23:00:00 ┆ 2021-12-16 00:00:00 ┆ 2021-12-15 23:00:00 ┆ 0.0 │
+        │ 2021-12-16 00:00:00 ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 00:00:00 ┆ 1.5 │
+        │ 2021-12-16 01:00:00 ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 01:00:00 ┆ 3.5 │
+        │ 2021-12-16 02:00:00 ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 02:00:00 ┆ 5.5 │
+        └─────────────────────┴─────────────────────┴─────────────────────┴─────┘
 
-        When closed="left", should not include right end of interval
+        When closed="left", the window excludes the right end of interval:
         [lower_bound, upper_bound)
 
         >>> lf.group_by_dynamic("time", every="1h", closed="left").agg(
-        ...     [
-        ...         pl.col("time").count().alias("time_count"),
-        ...         pl.col("time").alias("time_agg_list"),
-        ...     ]
+        ...     pl.col("n")
         ... ).collect()
-        shape: (4, 3)
-        ┌─────────────────────┬────────────┬───────────────────────────────────┐
-        │ time                ┆ time_count ┆ time_agg_list                     │
-        │ ---                 ┆ ---        ┆ ---                               │
-        │ datetime[μs]        ┆ u32        ┆ list[datetime[μs]]                │
-        ╞═════════════════════╪════════════╪═══════════════════════════════════╡
-        │ 2021-12-16 00:00:00 ┆ 2          ┆ [2021-12-16 00:00:00, 2021-12-16… │
-        │ 2021-12-16 01:00:00 ┆ 2          ┆ [2021-12-16 01:00:00, 2021-12-16… │
-        │ 2021-12-16 02:00:00 ┆ 2          ┆ [2021-12-16 02:00:00, 2021-12-16… │
-        │ 2021-12-16 03:00:00 ┆ 1          ┆ [2021-12-16 03:00:00]             │
-        └─────────────────────┴────────────┴───────────────────────────────────┘
+        shape: (4, 2)
+        ┌─────────────────────┬───────────┐
+        │ time                ┆ n         │
+        │ ---                 ┆ ---       │
+        │ datetime[μs]        ┆ list[i64] │
+        ╞═════════════════════╪═══════════╡
+        │ 2021-12-16 00:00:00 ┆ [0, 1]    │
+        │ 2021-12-16 01:00:00 ┆ [2, 3]    │
+        │ 2021-12-16 02:00:00 ┆ [4, 5]    │
+        │ 2021-12-16 03:00:00 ┆ [6]       │
+        └─────────────────────┴───────────┘
 
         When closed="both" the time values at the window boundaries belong to 2 groups.
 
         >>> lf.group_by_dynamic("time", every="1h", closed="both").agg(
-        ...     pl.col("time").count().alias("time_count")
+        ...     pl.col("n")
         ... ).collect()
         shape: (5, 2)
-        ┌─────────────────────┬────────────┐
-        │ time                ┆ time_count │
-        │ ---                 ┆ ---        │
-        │ datetime[μs]        ┆ u32        │
-        ╞═════════════════════╪════════════╡
-        │ 2021-12-15 23:00:00 ┆ 1          │
-        │ 2021-12-16 00:00:00 ┆ 3          │
-        │ 2021-12-16 01:00:00 ┆ 3          │
-        │ 2021-12-16 02:00:00 ┆ 3          │
-        │ 2021-12-16 03:00:00 ┆ 1          │
-        └─────────────────────┴────────────┘
+        ┌─────────────────────┬───────────┐
+        │ time                ┆ n         │
+        │ ---                 ┆ ---       │
+        │ datetime[μs]        ┆ list[i64] │
+        ╞═════════════════════╪═══════════╡
+        │ 2021-12-15 23:00:00 ┆ [0]       │
+        │ 2021-12-16 00:00:00 ┆ [0, 1, 2] │
+        │ 2021-12-16 01:00:00 ┆ [2, 3, 4] │
+        │ 2021-12-16 02:00:00 ┆ [4, 5, 6] │
+        │ 2021-12-16 03:00:00 ┆ [6]       │
+        └─────────────────────┴───────────┘
 
         Dynamic group bys can also be combined with grouping on normal keys
 
-        >>> lf = pl.LazyFrame(
-        ...     {
-        ...         "time": pl.datetime_range(
-        ...             start=datetime(2021, 12, 16),
-        ...             end=datetime(2021, 12, 16, 3),
-        ...             interval="30m",
-        ...             eager=True,
-        ...         ),
-        ...         "groups": ["a", "a", "a", "b", "b", "a", "a"],
-        ...     }
-        ... )
+        >>> lf = lf.with_columns(groups=pl.Series(["a", "a", "a", "b", "b", "a", "a"]))
         >>> lf.collect()
-        shape: (7, 2)
-        ┌─────────────────────┬────────┐
-        │ time                ┆ groups │
-        │ ---                 ┆ ---    │
-        │ datetime[μs]        ┆ str    │
-        ╞═════════════════════╪════════╡
-        │ 2021-12-16 00:00:00 ┆ a      │
-        │ 2021-12-16 00:30:00 ┆ a      │
-        │ 2021-12-16 01:00:00 ┆ a      │
-        │ 2021-12-16 01:30:00 ┆ b      │
-        │ 2021-12-16 02:00:00 ┆ b      │
-        │ 2021-12-16 02:30:00 ┆ a      │
-        │ 2021-12-16 03:00:00 ┆ a      │
-        └─────────────────────┴────────┘
-        >>> (
-        ...     lf.group_by_dynamic(
-        ...         "time",
-        ...         every="1h",
-        ...         closed="both",
-        ...         by="groups",
-        ...         include_boundaries=True,
-        ...     )
-        ... ).agg([pl.col("time").count().alias("time_count")]).collect()
+        shape: (7, 3)
+        ┌─────────────────────┬─────┬────────┐
+        │ time                ┆ n   ┆ groups │
+        │ ---                 ┆ --- ┆ ---    │
+        │ datetime[μs]        ┆ i64 ┆ str    │
+        ╞═════════════════════╪═════╪════════╡
+        │ 2021-12-16 00:00:00 ┆ 0   ┆ a      │
+        │ 2021-12-16 00:30:00 ┆ 1   ┆ a      │
+        │ 2021-12-16 01:00:00 ┆ 2   ┆ a      │
+        │ 2021-12-16 01:30:00 ┆ 3   ┆ b      │
+        │ 2021-12-16 02:00:00 ┆ 4   ┆ b      │
+        │ 2021-12-16 02:30:00 ┆ 5   ┆ a      │
+        │ 2021-12-16 03:00:00 ┆ 6   ┆ a      │
+        └─────────────────────┴─────┴────────┘
+        >>> lf.group_by_dynamic(
+        ...     "time",
+        ...     every="1h",
+        ...     closed="both",
+        ...     by="groups",
+        ...     include_boundaries=True,
+        ... ).agg(pl.col("n")).collect()
         shape: (7, 5)
-        ┌────────┬─────────────────────┬─────────────────────┬─────────────────────┬────────────┐
-        │ groups ┆ _lower_boundary     ┆ _upper_boundary     ┆ time                ┆ time_count │
-        │ ---    ┆ ---                 ┆ ---                 ┆ ---                 ┆ ---        │
-        │ str    ┆ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        ┆ u32        │
-        ╞════════╪═════════════════════╪═════════════════════╪═════════════════════╪════════════╡
-        │ a      ┆ 2021-12-15 23:00:00 ┆ 2021-12-16 00:00:00 ┆ 2021-12-15 23:00:00 ┆ 1          │
-        │ a      ┆ 2021-12-16 00:00:00 ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 00:00:00 ┆ 3          │
-        │ a      ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 01:00:00 ┆ 1          │
-        │ a      ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 02:00:00 ┆ 2          │
-        │ a      ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 04:00:00 ┆ 2021-12-16 03:00:00 ┆ 1          │
-        │ b      ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 01:00:00 ┆ 2          │
-        │ b      ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 02:00:00 ┆ 1          │
-        └────────┴─────────────────────┴─────────────────────┴─────────────────────┴────────────┘
+        ┌────────┬─────────────────────┬─────────────────────┬─────────────────────┬───────────┐
+        │ groups ┆ _lower_boundary     ┆ _upper_boundary     ┆ time                ┆ n         │
+        │ ---    ┆ ---                 ┆ ---                 ┆ ---                 ┆ ---       │
+        │ str    ┆ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        ┆ list[i64] │
+        ╞════════╪═════════════════════╪═════════════════════╪═════════════════════╪═══════════╡
+        │ a      ┆ 2021-12-15 23:00:00 ┆ 2021-12-16 00:00:00 ┆ 2021-12-15 23:00:00 ┆ [0]       │
+        │ a      ┆ 2021-12-16 00:00:00 ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 00:00:00 ┆ [0, 1, 2] │
+        │ a      ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 01:00:00 ┆ [2]       │
+        │ a      ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 02:00:00 ┆ [5, 6]    │
+        │ a      ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 04:00:00 ┆ 2021-12-16 03:00:00 ┆ [6]       │
+        │ b      ┆ 2021-12-16 01:00:00 ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 01:00:00 ┆ [3, 4]    │
+        │ b      ┆ 2021-12-16 02:00:00 ┆ 2021-12-16 03:00:00 ┆ 2021-12-16 02:00:00 ┆ [4]       │
+        └────────┴─────────────────────┴─────────────────────┴─────────────────────┴───────────┘
 
         Dynamic group by on an index column
 
@@ -3251,8 +3687,21 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 2               ┆ 5               ┆ 2   ┆ ["B", "B", "C"] │
         │ 4               ┆ 7               ┆ 4   ┆ ["C"]           │
         └─────────────────┴─────────────────┴─────┴─────────────────┘
-
         """  # noqa: W505
+        every = deprecate_saturating(every)
+        period = deprecate_saturating(period)
+        offset = deprecate_saturating(offset)
+        if truncate is not None:
+            if truncate:
+                label = "left"
+            else:
+                label = "datapoint"
+            issue_deprecation_warning(
+                f"`truncate` is deprecated and will be removed in a future version."
+                f" Please replace `truncate={truncate}` with `label='{label}'` to silence this warning.",
+                version="0.19.4",
+            )
+
         index_column = parse_as_expression(index_column)
         if offset is None:
             offset = _negate_duration(_timedelta_to_pl_duration(every))
@@ -3270,7 +3719,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             every,
             period,
             offset,
-            truncate,
+            label,
             include_boundaries,
             closed,
             pyexprs_by,
@@ -3360,10 +3809,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                 Or combine them:
                 "3d12h4m25s" # 3 days, 12 hours, 4 minutes, and 25 seconds
 
-                Suffix with `"_saturating"` to indicate that dates too large for
-                their month should saturate at the largest date
-                (e.g. 2022-02-29 -> 2022-02-28) instead of erroring.
-
                 By "calendar day", we mean the corresponding time on the next day
                 (which may not be 24 hours, due to daylight savings). Similarly for
                 "calendar week", "calendar month", "calendar quarter", and
@@ -3413,19 +3858,19 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 2018-05-12 00:00:00 ┆ 83.12      ┆ 4566 │
         │ 2019-05-12 00:00:00 ┆ 83.52      ┆ 4696 │
         └─────────────────────┴────────────┴──────┘
-
         """
+        tolerance = deprecate_saturating(tolerance)
         if not isinstance(other, LazyFrame):
-            raise TypeError(
-                f"expected `other` join table to be a LazyFrame, not a {type(other).__name__!r}"
-            )
+            msg = f"expected `other` join table to be a LazyFrame, not a {type(other).__name__!r}"
+            raise TypeError(msg)
 
         if isinstance(on, (str, pl.Expr)):
             left_on = on
             right_on = on
 
         if left_on is None or right_on is None:
-            raise ValueError("you should pass the column to join on as an argument")
+            msg = "you should pass the column to join on as an argument"
+            raise ValueError(msg)
 
         if by is not None:
             by_left_ = [by] if isinstance(by, str) else by
@@ -3478,6 +3923,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         right_on: str | Expr | Sequence[str | Expr] | None = None,
         suffix: str = "_right",
         validate: JoinValidation = "m:m",
+        join_nulls: bool = False,
         allow_parallel: bool = True,
         force_parallel: bool = False,
     ) -> Self:
@@ -3491,8 +3937,24 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         on
             Join column of both DataFrames. If set, `left_on` and `right_on` should be
             None.
-        how : {'inner', 'left', 'outer', 'semi', 'anti', 'cross'}
+        how : {'inner', 'left', 'outer', 'semi', 'anti', 'cross', 'outer_coalesce'}
             Join strategy.
+
+            * *inner*
+                Returns rows that have matching values in both tables
+            * *left*
+                Returns all rows from the left table, and the matched rows from the
+                right table
+            * *outer*
+                 Returns all rows when there is a match in either left or right table
+            * *outer_coalesce*
+                 Same as 'outer', but coalesces the key columns
+            * *cross*
+                 Returns the cartisian product of rows from both tables
+            * *semi*
+                 Filter rows that have a match in the right table.
+            * *anti*
+                 Filter rows that not have a match in the right table.
 
             .. note::
                 A left join preserves the row order of the left DataFrame.
@@ -3518,6 +3980,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
                 - This is currently not supported the streaming engine.
                 - This is only supported when joined by single columns.
+        join_nulls
+            Join on null values. By default null values will never produce matches.
         allow_parallel
             Allow the physical plan to optionally evaluate the computation of both
             DataFrames up to the join in parallel.
@@ -3555,17 +4019,17 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 2   ┆ 7.0 ┆ b   ┆ y     │
         └─────┴─────┴─────┴───────┘
         >>> lf.join(other_lf, on="ham", how="outer").collect()
-        shape: (4, 4)
-        ┌──────┬──────┬─────┬───────┐
-        │ foo  ┆ bar  ┆ ham ┆ apple │
-        │ ---  ┆ ---  ┆ --- ┆ ---   │
-        │ i64  ┆ f64  ┆ str ┆ str   │
-        ╞══════╪══════╪═════╪═══════╡
-        │ 1    ┆ 6.0  ┆ a   ┆ x     │
-        │ 2    ┆ 7.0  ┆ b   ┆ y     │
-        │ null ┆ null ┆ d   ┆ z     │
-        │ 3    ┆ 8.0  ┆ c   ┆ null  │
-        └──────┴──────┴─────┴───────┘
+        shape: (4, 5)
+        ┌──────┬──────┬──────┬───────┬───────────┐
+        │ foo  ┆ bar  ┆ ham  ┆ apple ┆ ham_right │
+        │ ---  ┆ ---  ┆ ---  ┆ ---   ┆ ---       │
+        │ i64  ┆ f64  ┆ str  ┆ str   ┆ str       │
+        ╞══════╪══════╪══════╪═══════╪═══════════╡
+        │ 1    ┆ 6.0  ┆ a    ┆ x     ┆ a         │
+        │ 2    ┆ 7.0  ┆ b    ┆ y     ┆ b         │
+        │ null ┆ null ┆ null ┆ z     ┆ d         │
+        │ 3    ┆ 8.0  ┆ c    ┆ null  ┆ null      │
+        └──────┴──────┴──────┴───────┴───────────┘
         >>> lf.join(other_lf, on="ham", how="left").collect()
         shape: (3, 4)
         ┌─────┬─────┬─────┬───────┐
@@ -3596,12 +4060,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╪═════╡
         │ 3   ┆ 8.0 ┆ c   │
         └─────┴─────┴─────┘
-
         """
         if not isinstance(other, LazyFrame):
-            raise TypeError(
-                f"expected `other` join table to be a LazyFrame, not a {type(other).__name__!r}"
-            )
+            msg = f"expected `other` join table to be a LazyFrame, not a {type(other).__name__!r}"
+            raise TypeError(msg)
 
         if how == "cross":
             return self._from_pyldf(
@@ -3611,6 +4073,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                     [],
                     allow_parallel,
                     force_parallel,
+                    join_nulls,
                     how,
                     suffix,
                     validate,
@@ -3625,7 +4088,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             pyexprs_left = parse_as_list_of_expressions(left_on)
             pyexprs_right = parse_as_list_of_expressions(right_on)
         else:
-            raise ValueError("must specify `on` OR `left_on` and `right_on`")
+            msg = "must specify `on` OR `left_on` and `right_on`"
+            raise ValueError(msg)
 
         return self._from_pyldf(
             self._ldf.join(
@@ -3634,6 +4098,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
                 pyexprs_right,
                 allow_parallel,
                 force_parallel,
+                join_nulls,
                 how,
                 suffix,
                 validate,
@@ -3646,7 +4111,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         **named_exprs: IntoExpr,
     ) -> Self:
         """
-        Add columns to this DataFrame.
+        Add columns to this LazyFrame.
 
         Added columns will replace existing columns with the same name.
 
@@ -3768,13 +4233,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         └─────┴──────┴───────┴──────┴───────┘
 
         Expressions with multiple outputs can be automatically instantiated as Structs
-        by enabling the experimental setting ``Config.set_auto_structify(True)``:
+        by enabling the setting `Config.set_auto_structify(True)`:
 
         >>> with pl.Config(auto_structify=True):
         ...     lf.drop("c").with_columns(
-        ...         diffs=pl.col(["a", "b"]).diff().suffix("_diff"),
+        ...         diffs=pl.col(["a", "b"]).diff().name.suffix("_diff"),
         ...     ).collect()
-        ...
         shape: (4, 3)
         ┌─────┬──────┬─────────────┐
         │ a   ┆ b    ┆ diffs       │
@@ -3786,7 +4250,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 3   ┆ 10.0 ┆ {1,6.0}     │
         │ 4   ┆ 13.0 ┆ {1,3.0}     │
         └─────┴──────┴─────────────┘
-
         """
         structify = bool(int(os.environ.get("POLARS_AUTO_STRUCTIFY", 0)))
 
@@ -3801,7 +4264,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         **named_exprs: IntoExpr,
     ) -> Self:
         """
-        Add columns to this DataFrame.
+        Add columns to this LazyFrame.
 
         Added columns will replace existing columns with the same name.
 
@@ -3826,7 +4289,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         See Also
         --------
         with_columns
-
         """
         structify = bool(int(os.environ.get("POLARS_AUTO_STRUCTIFY", 0)))
 
@@ -3865,7 +4327,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ null │
         └──────┘
 
-        Fill nulls with the median from another dataframe:
+        Fill nulls with the median from another DataFrame:
 
         >>> train_lf = pl.LazyFrame(
         ...     {"feature_0": [-1.0, 0, 1], "feature_1": [-1.0, 0, 1]}
@@ -3873,7 +4335,9 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         >>> test_lf = pl.LazyFrame(
         ...     {"feature_0": [-1.0, None, 1], "feature_1": [-1.0, 0, 1]}
         ... )
-        >>> test_lf.with_context(train_lf.select(pl.all().suffix("_train"))).select(
+        >>> test_lf.with_context(
+        ...     train_lf.select(pl.all().name.suffix("_train"))
+        ... ).select(
         ...     pl.col("feature_0").fill_null(pl.col("feature_0_train").median())
         ... ).collect()
         shape: (3, 1)
@@ -3886,27 +4350,24 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 0.0       │
         │ 1.0       │
         └───────────┘
-
         """
         if not isinstance(other, list):
             other = [other]
 
         return self._from_pyldf(self._ldf.with_context([lf._ldf for lf in other]))
 
+    @deprecate_parameter_as_positional("columns", version="0.20.4")
     def drop(
-        self,
-        columns: ColumnNameOrSelector | Collection[ColumnNameOrSelector],
-        *more_columns: ColumnNameOrSelector,
+        self, *columns: ColumnNameOrSelector | Iterable[ColumnNameOrSelector]
     ) -> Self:
         """
-        Remove columns from the dataframe.
+        Remove columns from the DataFrame.
 
         Parameters
         ----------
-        columns
-            Name of the column(s) that should be removed from the dataframe.
-        *more_columns
-            Additional columns to drop, specified as positional arguments.
+        *columns
+            Names of the columns that should be removed from the dataframe.
+            Accepts column selector input.
 
         Examples
         --------
@@ -3959,24 +4420,24 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 7.0 │
         │ 8.0 │
         └─────┘
-
         """
-        drop_cols = _expand_selectors(self, columns, *more_columns)
+        drop_cols = _expand_selectors(self, *columns)
         return self._from_pyldf(self._ldf.drop(drop_cols))
 
-    def rename(self, mapping: dict[str, str]) -> Self:
+    def rename(self, mapping: dict[str, str] | Callable[[str], str]) -> Self:
         """
         Rename column names.
 
         Parameters
         ----------
         mapping
-            Key value pairs that map from old name to new name.
+            Key value pairs that map from old name to new name, or a function
+            that takes the old name as input and returns the new name.
 
         Notes
         -----
-        If names are swapped. E.g. 'A' points to 'B' and 'B' points to 'A', polars
-        will block projection and predicate pushdowns at this node.
+        If existing names are swapped (e.g. 'A' points to 'B' and 'B' points to 'A'),
+        polars will block projection and predicate pushdowns at this node.
 
         Examples
         --------
@@ -3998,11 +4459,24 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 2     ┆ 7   ┆ b   │
         │ 3     ┆ 8   ┆ c   │
         └───────┴─────┴─────┘
-
+        >>> lf.rename(lambda column_name: "c" + column_name[1:]).collect()
+        shape: (3, 3)
+        ┌─────┬─────┬─────┐
+        │ coo ┆ car ┆ cam │
+        │ --- ┆ --- ┆ --- │
+        │ i64 ┆ i64 ┆ str │
+        ╞═════╪═════╪═════╡
+        │ 1   ┆ 6   ┆ a   │
+        │ 2   ┆ 7   ┆ b   │
+        │ 3   ┆ 8   ┆ c   │
+        └─────┴─────┴─────┘
         """
-        existing = list(mapping.keys())
-        new = list(mapping.values())
-        return self._from_pyldf(self._ldf.rename(existing, new))
+        if callable(mapping):
+            return self.select(F.all().name.map(mapping))
+        else:
+            existing = list(mapping.keys())
+            new = list(mapping.values())
+            return self._from_pyldf(self._ldf.rename(existing, new))
 
     def reverse(self) -> Self:
         """
@@ -4027,104 +4501,87 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ b   ┆ 2   │
         │ a   ┆ 1   │
         └─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.reverse())
 
-    def shift(self, periods: int) -> Self:
-        """
-        Shift the values by a given period.
-
-        Parameters
-        ----------
-        periods
-            Number of places to shift (may be negative).
-
-        Examples
-        --------
-        >>> lf = pl.LazyFrame(
-        ...     {
-        ...         "a": [1, 3, 5],
-        ...         "b": [2, 4, 6],
-        ...     }
-        ... )
-        >>> lf.shift(periods=1).collect()
-        shape: (3, 2)
-        ┌──────┬──────┐
-        │ a    ┆ b    │
-        │ ---  ┆ ---  │
-        │ i64  ┆ i64  │
-        ╞══════╪══════╡
-        │ null ┆ null │
-        │ 1    ┆ 2    │
-        │ 3    ┆ 4    │
-        └──────┴──────┘
-        >>> lf.shift(periods=-1).collect()
-        shape: (3, 2)
-        ┌──────┬──────┐
-        │ a    ┆ b    │
-        │ ---  ┆ ---  │
-        │ i64  ┆ i64  │
-        ╞══════╪══════╡
-        │ 3    ┆ 4    │
-        │ 5    ┆ 6    │
-        │ null ┆ null │
-        └──────┴──────┘
-
-        """
-        return self._from_pyldf(self._ldf.shift(periods))
-
-    def shift_and_fill(
-        self,
-        fill_value: Expr | int | str | float,
-        *,
-        periods: int = 1,
+    @deprecate_renamed_parameter("periods", "n", version="0.19.11")
+    def shift(
+        self, n: int | IntoExprColumn = 1, *, fill_value: IntoExpr | None = None
     ) -> Self:
         """
-        Shift the values by a given period and fill the resulting null values.
+        Shift values by the given number of indices.
 
         Parameters
         ----------
+        n
+            Number of indices to shift forward. If a negative value is passed, values
+            are shifted in the opposite direction instead.
         fill_value
-            fill None values with the result of this expression.
-        periods
-            Number of places to shift (may be negative).
+            Fill the resulting null values with this value. Accepts expression input.
+            Non-expression inputs are parsed as literals.
+
+        Notes
+        -----
+        This method is similar to the `LAG` operation in SQL when the value for `n`
+        is positive. With a negative value for `n`, it is similar to `LEAD`.
 
         Examples
         --------
+        By default, values are shifted forward by one index.
+
         >>> lf = pl.LazyFrame(
         ...     {
-        ...         "a": [1, 3, 5],
-        ...         "b": [2, 4, 6],
+        ...         "a": [1, 2, 3, 4],
+        ...         "b": [5, 6, 7, 8],
         ...     }
         ... )
-        >>> lf.shift_and_fill(fill_value=0, periods=1).collect()
-        shape: (3, 2)
-        ┌─────┬─────┐
-        │ a   ┆ b   │
-        │ --- ┆ --- │
-        │ i64 ┆ i64 │
-        ╞═════╪═════╡
-        │ 0   ┆ 0   │
-        │ 1   ┆ 2   │
-        │ 3   ┆ 4   │
-        └─────┴─────┘
-        >>> lf.shift_and_fill(periods=-1, fill_value=0).collect()
-        shape: (3, 2)
-        ┌─────┬─────┐
-        │ a   ┆ b   │
-        │ --- ┆ --- │
-        │ i64 ┆ i64 │
-        ╞═════╪═════╡
-        │ 3   ┆ 4   │
-        │ 5   ┆ 6   │
-        │ 0   ┆ 0   │
-        └─────┴─────┘
+        >>> lf.shift().collect()
+        shape: (4, 2)
+        ┌──────┬──────┐
+        │ a    ┆ b    │
+        │ ---  ┆ ---  │
+        │ i64  ┆ i64  │
+        ╞══════╪══════╡
+        │ null ┆ null │
+        │ 1    ┆ 5    │
+        │ 2    ┆ 6    │
+        │ 3    ┆ 7    │
+        └──────┴──────┘
 
+        Pass a negative value to shift in the opposite direction instead.
+
+        >>> lf.shift(-2).collect()
+        shape: (4, 2)
+        ┌──────┬──────┐
+        │ a    ┆ b    │
+        │ ---  ┆ ---  │
+        │ i64  ┆ i64  │
+        ╞══════╪══════╡
+        │ 3    ┆ 7    │
+        │ 4    ┆ 8    │
+        │ null ┆ null │
+        │ null ┆ null │
+        └──────┴──────┘
+
+        Specify `fill_value` to fill the resulting null values.
+
+        >>> lf.shift(-2, fill_value=100).collect()
+        shape: (4, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 3   ┆ 7   │
+        │ 4   ┆ 8   │
+        │ 100 ┆ 100 │
+        │ 100 ┆ 100 │
+        └─────┴─────┘
         """
-        if not isinstance(fill_value, pl.Expr):
-            fill_value = F.lit(fill_value)
-        return self._from_pyldf(self._ldf.shift_and_fill(periods, fill_value._pyexpr))
+        if fill_value is not None:
+            fill_value = parse_as_expression(fill_value, str_as_lit=True)
+        n = parse_as_expression(n)
+        return self._from_pyldf(self._ldf.shift(n, fill_value))
 
     def slice(self, offset: int, length: int | None = None) -> Self:
         """
@@ -4135,7 +4592,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         offset
             Start index. Negative indexing is supported.
         length
-            Length of the slice. If set to ``None``, all rows starting at the offset
+            Length of the slice. If set to `None`, all rows starting at the offset
             will be selected.
 
         Examples
@@ -4157,12 +4614,10 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ y   ┆ 3   ┆ 4   │
         │ z   ┆ 5   ┆ 6   │
         └─────┴─────┴─────┘
-
         """
         if length and length < 0:
-            raise ValueError(
-                f"negative slice lengths ({length!r}) are invalid for LazyFrame"
-            )
+            msg = f"negative slice lengths ({length!r}) are invalid for LazyFrame"
+            raise ValueError(msg)
         return self._from_pyldf(self._ldf.slice(offset, length))
 
     def limit(self, n: int = 5) -> Self:
@@ -4213,7 +4668,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 1   ┆ 7   │
         │ 2   ┆ 8   │
         └─────┴─────┘
-
         """
         return self.head(n)
 
@@ -4263,7 +4717,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 1   ┆ 7   │
         │ 2   ┆ 8   │
         └─────┴─────┘
-
         """
         return self.slice(0, n)
 
@@ -4307,7 +4760,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 5   ┆ 11  │
         │ 6   ┆ 12  │
         └─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.tail(n))
 
@@ -4332,7 +4784,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 5   ┆ 6   │
         └─────┴─────┘
-
         """
         return self.tail(1)
 
@@ -4357,7 +4808,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 1   ┆ 2   │
         └─────┴─────┘
-
         """
         return self.slice(0, 1)
 
@@ -4384,24 +4834,98 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 4   ┆ 2   │
         └─────┴─────┘
-
         """
         return self.select(F.all().approx_n_unique())
 
-    @deprecate_renamed_function("approx_n_unique", version="0.18.12")
-    def approx_unique(self) -> Self:
+    def with_row_index(self, name: str = "index", offset: int = 0) -> Self:
         """
-        Approximate count of unique values.
+        Add a row index as the first column in the LazyFrame.
 
-        .. deprecated:: 0.18.12
-            This method has been renamed to :func:`LazyFrame.approx_n_unique`.
+        Parameters
+        ----------
+        name
+            Name of the index column.
+        offset
+            Start the index at this offset. Cannot be negative.
 
+        Warnings
+        --------
+        Using this function can have a negative effect on query performance.
+        This may, for instance, block predicate pushdown optimization.
+
+        Notes
+        -----
+        The resulting column does not have any special properties. It is a regular
+        column of type `UInt32` (or `UInt64` in `polars-u64-idx`).
+
+        Examples
+        --------
+        >>> lf = pl.LazyFrame(
+        ...     {
+        ...         "a": [1, 3, 5],
+        ...         "b": [2, 4, 6],
+        ...     }
+        ... )
+        >>> lf.with_row_index().collect()
+        shape: (3, 3)
+        ┌───────┬─────┬─────┐
+        │ index ┆ a   ┆ b   │
+        │ ---   ┆ --- ┆ --- │
+        │ u32   ┆ i64 ┆ i64 │
+        ╞═══════╪═════╪═════╡
+        │ 0     ┆ 1   ┆ 2   │
+        │ 1     ┆ 3   ┆ 4   │
+        │ 2     ┆ 5   ┆ 6   │
+        └───────┴─────┴─────┘
+        >>> lf.with_row_index("id", offset=1000).collect()
+        shape: (3, 3)
+        ┌──────┬─────┬─────┐
+        │ id   ┆ a   ┆ b   │
+        │ ---  ┆ --- ┆ --- │
+        │ u32  ┆ i64 ┆ i64 │
+        ╞══════╪═════╪═════╡
+        │ 1000 ┆ 1   ┆ 2   │
+        │ 1001 ┆ 3   ┆ 4   │
+        │ 1002 ┆ 5   ┆ 6   │
+        └──────┴─────┴─────┘
+
+        An index column can also be created using the expressions :func:`int_range`
+        and :func:`len`.
+
+        >>> lf.select(
+        ...     pl.int_range(pl.len(), dtype=pl.UInt32).alias("index"),
+        ...     pl.all(),
+        ... ).collect()
+        shape: (3, 3)
+        ┌───────┬─────┬─────┐
+        │ index ┆ a   ┆ b   │
+        │ ---   ┆ --- ┆ --- │
+        │ u32   ┆ i64 ┆ i64 │
+        ╞═══════╪═════╪═════╡
+        │ 0     ┆ 1   ┆ 2   │
+        │ 1     ┆ 3   ┆ 4   │
+        │ 2     ┆ 5   ┆ 6   │
+        └───────┴─────┴─────┘
         """
-        return self.approx_n_unique()
+        try:
+            return self._from_pyldf(self._ldf.with_row_index(name, offset))
+        except OverflowError:
+            issue = "negative" if offset < 0 else "greater than the maximum index value"
+            msg = f"`offset` input for `with_row_index` cannot be {issue}, got {offset}"
+            raise ValueError(msg) from None
 
+    @deprecate_function(
+        "Use `with_row_index` instead."
+        " Note that the default column name has changed from 'row_nr' to 'index'.",
+        version="0.20.4",
+    )
     def with_row_count(self, name: str = "row_nr", offset: int = 0) -> Self:
         """
         Add a column at index 0 that counts the rows.
+
+        .. deprecated::
+            Use :meth:`with_row_index` instead.
+            Note that the default column name has changed from 'row_nr' to 'index'.
 
         Parameters
         ----------
@@ -4423,7 +4947,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ...         "b": [2, 4, 6],
         ...     }
         ... )
-        >>> lf.with_row_count().collect()
+        >>> lf.with_row_count().collect()  # doctest: +SKIP
         shape: (3, 3)
         ┌────────┬─────┬─────┐
         │ row_nr ┆ a   ┆ b   │
@@ -4434,13 +4958,19 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 1      ┆ 3   ┆ 4   │
         │ 2      ┆ 5   ┆ 6   │
         └────────┴─────┴─────┘
-
         """
-        return self._from_pyldf(self._ldf.with_row_count(name, offset))
+        return self.with_row_index(name, offset)
 
-    def take_every(self, n: int) -> Self:
+    def gather_every(self, n: int, offset: int = 0) -> Self:
         """
         Take every nth row in the LazyFrame and return as a new LazyFrame.
+
+        Parameters
+        ----------
+        n
+            Gather every *n*-th row.
+        offset
+            Starting index.
 
         Examples
         --------
@@ -4450,7 +4980,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ...         "b": [5, 6, 7, 8],
         ...     }
         ... )
-        >>> lf.take_every(2).collect()
+        >>> lf.gather_every(2).collect()
         shape: (2, 2)
         ┌─────┬─────┐
         │ a   ┆ b   │
@@ -4460,9 +4990,18 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 1   ┆ 5   │
         │ 3   ┆ 7   │
         └─────┴─────┘
-
+        >>> lf.gather_every(2, offset=1).collect()
+        shape: (2, 2)
+        ┌─────┬─────┐
+        │ a   ┆ b   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 2   ┆ 6   │
+        │ 4   ┆ 8   │
+        └─────┴─────┘
         """
-        return self.select(F.col("*").take_every(n))
+        return self.select(F.col("*").gather_every(n, offset))
 
     def fill_null(
         self,
@@ -4485,7 +5024,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             Number of consecutive null values to fill when using the 'forward' or
             'backward' strategy.
         matches_supertype
-            Fill all matching supertypes of the fill ``value`` literal.
+            Fill all matching supertypes of the fill `value` literal.
 
         Examples
         --------
@@ -4545,7 +5084,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 0   ┆ 0.0  │
         │ 4   ┆ 13.0 │
         └─────┴──────┘
-
         """
         dtypes: Sequence[PolarsDataType]
 
@@ -4584,7 +5122,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             elif isinstance(value, time):
                 dtypes = [Time]
             elif isinstance(value, str):
-                dtypes = [Utf8, Categorical]
+                dtypes = [String, Categorical]
             else:
                 # fallback; anything not explicitly handled above
                 dtypes = [infer_dtype(F.lit(value))]
@@ -4611,8 +5149,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         --------
         >>> lf = pl.LazyFrame(
         ...     {
-        ...         "a": [1.5, 2, float("NaN"), 4],
-        ...         "b": [0.5, 4, float("NaN"), 13],
+        ...         "a": [1.5, 2, float("nan"), 4],
+        ...         "b": [0.5, 4, float("nan"), 13],
         ...     }
         ... )
         >>> lf.fill_nan(99).collect()
@@ -4627,7 +5165,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 99.0 ┆ 99.0 │
         │ 4.0  ┆ 13.0 │
         └──────┴──────┘
-
         """
         if not isinstance(value, pl.Expr):
             value = F.lit(value)
@@ -4670,7 +5207,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞══════════╪══════════╡
         │ 1.118034 ┆ 0.433013 │
         └──────────┴──────────┘
-
         """
         return self._from_pyldf(self._ldf.std(ddof))
 
@@ -4711,7 +5247,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞══════╪════════╡
         │ 1.25 ┆ 0.1875 │
         └──────┴────────┘
-
         """
         return self._from_pyldf(self._ldf.var(ddof))
 
@@ -4736,7 +5271,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 4   ┆ 2   │
         └─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.max())
 
@@ -4761,7 +5295,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 1   ┆ 1   │
         └─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.min())
 
@@ -4786,7 +5319,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 10  ┆ 5   │
         └─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.sum())
 
@@ -4811,7 +5343,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪══════╡
         │ 2.5 ┆ 1.25 │
         └─────┴──────┘
-
         """
         return self._from_pyldf(self._ldf.mean())
 
@@ -4836,7 +5367,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 2.5 ┆ 1.0 │
         └─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.median())
 
@@ -4862,7 +5392,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╪═════╡
         │ 1   ┆ 1   ┆ 0   │
         └─────┴─────┴─────┘
-
         """
         return self._from_pyldf(self._ldf.null_count())
 
@@ -4898,7 +5427,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ╞═════╪═════╡
         │ 3.0 ┆ 1.0 │
         └─────┴─────┘
-
         """
         quantile = parse_as_expression(quantile)
         return self._from_pyldf(self._ldf.quantile(quantile, interpolation))
@@ -4909,13 +5437,13 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         *more_columns: str | Expr,
     ) -> Self:
         """
-        Explode the dataframe to long format by exploding the given columns.
+        Explode the DataFrame to long format by exploding the given columns.
 
         Parameters
         ----------
         columns
             Column names, expressions, or a selector defining them. The underlying
-            columns being exploded must be of List or Utf8 datatype.
+            columns being exploded must be of the `List` or `Array` data type.
         *more_columns
             Additional names of columns to explode, specified as positional arguments.
 
@@ -4943,7 +5471,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ c       ┆ 7       │
         │ c       ┆ 8       │
         └─────────┴─────────┘
-
         """
         columns = parse_as_list_of_expressions(
             *_expand_selectors(self, columns, *more_columns)
@@ -4958,13 +5485,13 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         maintain_order: bool = False,
     ) -> Self:
         """
-        Drop duplicate rows from this dataframe.
+        Drop duplicate rows from this DataFrame.
 
         Parameters
         ----------
         subset
             Column name(s) or selector(s), to consider when identifying
-            duplicate rows. If set to ``None`` (default), use all columns.
+            duplicate rows. If set to `None` (default), use all columns.
         keep : {'first', 'last', 'any', 'none'}
             Which of the duplicate rows to keep.
 
@@ -4976,7 +5503,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         maintain_order
             Keep the same order as the original DataFrame. This is more expensive to
             compute.
-            Settings this to ``True`` blocks the possibility
+            Settings this to `True` blocks the possibility
             to run on the streaming engine.
 
         Returns
@@ -5029,7 +5556,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 3   ┆ a   ┆ b   │
         │ 1   ┆ a   ┆ b   │
         └─────┴─────┴─────┘
-
         """
         if subset is not None:
             subset = _expand_selectors(self, subset)
@@ -5048,7 +5574,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ----------
         subset
             Column name(s) for which null values are considered.
-            If set to ``None`` (default), use all columns.
+            If set to `None` (default), use all columns.
 
         Examples
         --------
@@ -5106,7 +5632,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ┌──────┬──────┬──────┐
         │ a    ┆ b    ┆ c    │
         │ ---  ┆ ---  ┆ ---  │
-        │ f32  ┆ i64  ┆ i64  │
+        │ null ┆ i64  ┆ i64  │
         ╞══════╪══════╪══════╡
         │ null ┆ 1    ┆ 1    │
         │ null ┆ 2    ┆ null │
@@ -5121,13 +5647,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ┌──────┬─────┬──────┐
         │ a    ┆ b   ┆ c    │
         │ ---  ┆ --- ┆ ---  │
-        │ f32  ┆ i64 ┆ i64  │
+        │ null ┆ i64 ┆ i64  │
         ╞══════╪═════╪══════╡
         │ null ┆ 1   ┆ 1    │
         │ null ┆ 2   ┆ null │
         │ null ┆ 1   ┆ 1    │
         └──────┴─────┴──────┘
-
         """
         if subset is not None:
             subset = _expand_selectors(self, subset)
@@ -5192,7 +5717,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ y   ┆ c        ┆ 4     │
         │ z   ┆ c        ┆ 6     │
         └─────┴──────────┴───────┘
-
         """
         value_vars = [] if value_vars is None else _expand_selectors(self, value_vars)
         id_vars = [] if id_vars is None else _expand_selectors(self, id_vars)
@@ -5231,12 +5755,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         no_optimizations
             Turn off all optimizations past this point.
         schema
-            Output schema of the function, if set to ``None`` we assume that the schema
+            Output schema of the function, if set to `None` we assume that the schema
             will remain unchanged by the applied function.
         validate_output_schema
             It is paramount that polars' schema is correct. This flag will ensure that
             the output schema of this function will be checked with the expected schema.
-            Setting this to ``False`` will not do this check, but may lead to hard to
+            Setting this to `False` will not do this check, but may lead to hard to
             debug bugs.
         streamable
             Whether the function that is given is eligible to be running with the
@@ -5246,11 +5770,11 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
 
         Warnings
         --------
-        The ``schema`` of a `LazyFrame` must always be correct. It is up to the caller
+        The `schema` of a `LazyFrame` must always be correct. It is up to the caller
         of this function to ensure that this invariant is upheld.
 
         It is important that the optimization flags are correct. If the custom function
-        for instance does an aggregation of a column, ``predicate_pushdown`` should not
+        for instance does an aggregation of a column, `predicate_pushdown` should not
         be allowed, as this prunes rows and will influence your aggregation results.
 
         Examples
@@ -5281,7 +5805,6 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ -4      ┆ 199996 │
         │ -2      ┆ 199998 │
         └─────────┴────────┘
-
         """
         if no_optimizations:
             predicate_pushdown = False
@@ -5315,25 +5838,28 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         ... )
         >>> lf.interpolate().collect()
         shape: (4, 3)
-        ┌─────┬──────┬─────┐
-        │ foo ┆ bar  ┆ baz │
-        │ --- ┆ ---  ┆ --- │
-        │ i64 ┆ i64  ┆ i64 │
-        ╞═════╪══════╪═════╡
-        │ 1   ┆ 6    ┆ 1   │
-        │ 5   ┆ 7    ┆ 3   │
-        │ 9   ┆ 9    ┆ 6   │
-        │ 10  ┆ null ┆ 9   │
-        └─────┴──────┴─────┘
-
+        ┌──────┬──────┬──────────┐
+        │ foo  ┆ bar  ┆ baz      │
+        │ ---  ┆ ---  ┆ ---      │
+        │ f64  ┆ f64  ┆ f64      │
+        ╞══════╪══════╪══════════╡
+        │ 1.0  ┆ 6.0  ┆ 1.0      │
+        │ 5.0  ┆ 7.0  ┆ 3.666667 │
+        │ 9.0  ┆ 9.0  ┆ 6.333333 │
+        │ 10.0 ┆ null ┆ 9.0      │
+        └──────┴──────┴──────────┘
         """
         return self.select(F.col("*").interpolate())
 
-    def unnest(self, columns: str | Sequence[str], *more_columns: str) -> Self:
+    def unnest(
+        self,
+        columns: ColumnNameOrSelector | Collection[ColumnNameOrSelector],
+        *more_columns: ColumnNameOrSelector,
+    ) -> Self:
         """
         Decompose struct columns into separate columns for each of their fields.
 
-        The new columns will be inserted into the dataframe at the location of the
+        The new columns will be inserted into the DataFrame at the location of the
         struct column.
 
         Parameters
@@ -5375,13 +5901,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ foo    ┆ 1   ┆ a   ┆ true ┆ [1, 2]    ┆ baz   │
         │ bar    ┆ 2   ┆ b   ┆ null ┆ [3]       ┆ womp  │
         └────────┴─────┴─────┴──────┴───────────┴───────┘
-
         """
-        if isinstance(columns, str):
-            columns = [columns]
-        if more_columns:
-            columns = list(columns)
-            columns.extend(more_columns)
+        columns = _expand_selectors(self, columns, *more_columns)
         return self._from_pyldf(self._ldf.unnest(columns))
 
     def merge_sorted(self, other: LazyFrame, key: str) -> Self:
@@ -5474,44 +5995,59 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             [wrap_expr(e).set_sorted(descending=descending) for e in columns]
         )
 
+    @unstable()
     def update(
         self,
         other: LazyFrame,
         on: str | Sequence[str] | None = None,
-        how: Literal["left", "inner"] = "left",
+        how: Literal["left", "inner", "outer"] = "left",
+        *,
+        left_on: str | Sequence[str] | None = None,
+        right_on: str | Sequence[str] | None = None,
+        include_nulls: bool = False,
     ) -> Self:
         """
         Update the values in this `LazyFrame` with the non-null values in `other`.
 
-        Notes
-        -----
-        This is syntactic sugar for a left/inner join + coalesce
-
-        Warnings
-        --------
-        This functionality is experimental and may change without it being considered a
-        breaking change.
+        .. warning::
+            This functionality is considered **unstable**. It may be changed
+            at any point without it being considered a breaking change.
 
         Parameters
         ----------
         other
             LazyFrame that will be used to update the values
         on
-            Column names that will be joined on.
-            If none given the row count is used.
-        how : {'left', 'inner'}
-            'left' will keep the left table rows as is.
-            'inner' will remove rows that are not found in other
+            Column names that will be joined on. If set to `None` (default),
+            the implicit row index of each frame is used as a join key.
+        how : {'left', 'inner', 'outer'}
+            * 'left' will keep all rows from the left table; rows may be duplicated
+              if multiple rows in the right frame match the left row's key.
+            * 'inner' keeps only those rows where the key exists in both frames.
+            * 'outer' will update existing rows where the key matches while also
+              adding any new rows contained in the given frame.
+        left_on
+           Join column(s) of the left DataFrame.
+        right_on
+           Join column(s) of the right DataFrame.
+        include_nulls
+            If True, null values from the right DataFrame will be used to update the
+            left DataFrame.
+
+        Notes
+        -----
+        This is syntactic sugar for a left/inner join, with an optional coalesce when
+        `include_nulls = False`.
 
         Examples
         --------
-        >>> df = pl.DataFrame(
+        >>> lf = pl.LazyFrame(
         ...     {
         ...         "A": [1, 2, 3, 4],
         ...         "B": [400, 500, 600, 700],
         ...     }
         ... )
-        >>> df
+        >>> lf.collect()
         shape: (4, 2)
         ┌─────┬─────┐
         │ A   ┆ B   │
@@ -5523,79 +6059,189 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         │ 3   ┆ 600 │
         │ 4   ┆ 700 │
         └─────┴─────┘
-        >>> new_df = pl.DataFrame(
+        >>> new_lf = pl.LazyFrame(
         ...     {
-        ...         "B": [4, None, 6],
-        ...         "C": [7, 8, 9],
+        ...         "B": [-66, None, -99],
+        ...         "C": [5, 3, 1],
         ...     }
         ... )
-        >>> new_df
-        shape: (3, 2)
-        ┌──────┬─────┐
-        │ B    ┆ C   │
-        │ ---  ┆ --- │
-        │ i64  ┆ i64 │
-        ╞══════╪═════╡
-        │ 4    ┆ 7   │
-        │ null ┆ 8   │
-        │ 6    ┆ 9   │
-        └──────┴─────┘
-        >>> df.update(new_df)
+
+        Update `df` values with the non-null values in `new_df`, by row index:
+
+        >>> lf.update(new_lf).collect()
         shape: (4, 2)
         ┌─────┬─────┐
         │ A   ┆ B   │
         │ --- ┆ --- │
         │ i64 ┆ i64 │
         ╞═════╪═════╡
-        │ 1   ┆ 4   │
+        │ 1   ┆ -66 │
         │ 2   ┆ 500 │
-        │ 3   ┆ 6   │
+        │ 3   ┆ -99 │
         │ 4   ┆ 700 │
         └─────┴─────┘
 
+        Update `df` values with the non-null values in `new_df`, by row index,
+        but only keeping those rows that are common to both frames:
+
+        >>> lf.update(new_lf, how="inner").collect()
+        shape: (3, 2)
+        ┌─────┬─────┐
+        │ A   ┆ B   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 1   ┆ -66 │
+        │ 2   ┆ 500 │
+        │ 3   ┆ -99 │
+        └─────┴─────┘
+
+        Update `df` values with the non-null values in `new_df`, using an outer join
+        strategy that defines explicit join columns in each frame:
+
+        >>> lf.update(new_lf, left_on=["A"], right_on=["C"], how="outer").collect()
+        shape: (5, 2)
+        ┌─────┬─────┐
+        │ A   ┆ B   │
+        │ --- ┆ --- │
+        │ i64 ┆ i64 │
+        ╞═════╪═════╡
+        │ 1   ┆ -99 │
+        │ 2   ┆ 500 │
+        │ 3   ┆ 600 │
+        │ 4   ┆ 700 │
+        │ 5   ┆ -66 │
+        └─────┴─────┘
+
+        Update `df` values including null values in `new_df`, using an outer join
+        strategy that defines explicit join columns in each frame:
+
+        >>> lf.update(
+        ...     new_lf, left_on="A", right_on="C", how="outer", include_nulls=True
+        ... ).collect()
+        shape: (5, 2)
+        ┌─────┬──────┐
+        │ A   ┆ B    │
+        │ --- ┆ ---  │
+        │ i64 ┆ i64  │
+        ╞═════╪══════╡
+        │ 1   ┆ -99  │
+        │ 2   ┆ 500  │
+        │ 3   ┆ null │
+        │ 4   ┆ 700  │
+        │ 5   ┆ -66  │
+        └─────┴──────┘
         """
-        row_count_used = False
+        if how not in ("left", "inner", "outer"):
+            msg = f"`how` must be one of {{'left', 'inner', 'outer'}}; found {how!r}"
+            raise ValueError(msg)
+        if how == "outer":
+            how = "outer_coalesce"  # type: ignore[assignment]
+
+        row_index_used = False
         if on is None:
-            row_count_used = True
-            row_count_name = "__POLARS_ROW_COUNT"
-            self = self.with_row_count(row_count_name)
-            other = other.with_row_count(row_count_name)
-            on = row_count_name
+            if left_on is None and right_on is None:
+                # no keys provided--use row index
+                row_index_used = True
+                row_index_name = "__POLARS_ROW_INDEX"
+                self = self.with_row_index(row_index_name)
+                other = other.with_row_index(row_index_name)
+                left_on = right_on = [row_index_name]
+            else:
+                # one of left or right is missing, raise error
+                if left_on is None:
+                    msg = "missing join columns for left frame"
+                    raise ValueError(msg)
+                if right_on is None:
+                    msg = "missing join columns for right frame"
+                    raise ValueError(msg)
+        else:
+            # move on into left/right_on to simplify logic
+            left_on = right_on = on
 
-        if isinstance(on, str):
-            on = [on]
+        if isinstance(left_on, str):
+            left_on = [left_on]
+        if isinstance(right_on, str):
+            right_on = [right_on]
 
-        union_names = set(self.columns) & set(other.columns)
+        left_names = self.columns
+        for name in left_on:
+            if name not in left_names:
+                msg = f"left join column {name!r} not found"
+                raise ValueError(msg)
+        right_names = other.columns
+        for name in right_on:
+            if name not in right_names:
+                msg = f"right join column {name!r} not found"
+                raise ValueError(msg)
 
-        for name in on:
-            if name not in union_names:
-                raise ValueError(f"join column {name!r} not found")
-
-        right_added_names = union_names - set(on)
-
-        # no need to join if only join columns are in other
-        if len(right_added_names) == 0:
-            if row_count_used:
-                return self.drop(row_count_name)
+        # no need to join if *only* join columns are in other (inner/left update only)
+        if how != "outer_coalesce" and len(other.columns) == len(right_on):  # type: ignore[comparison-overlap, redundant-expr]
+            if row_index_used:
+                return self.drop(row_index_name)
             return self
 
+        # only use non-idx right columns present in left frame
+        right_other = set(other.columns).intersection(self.columns) - set(right_on)
+
+        # When include_nulls is True, we need to distinguish records after the join that
+        # were originally null in the right frame, as opposed to records that were null
+        # because the key was missing from the right frame.
+        # Add a validity column to track whether row was matched or not.
+        if include_nulls:
+            validity = ("__POLARS_VALIDITY",)
+            other = other.with_columns(F.lit(True).alias(validity[0]))
+        else:
+            validity = ()  # type: ignore[assignment]
+
         tmp_name = "__POLARS_RIGHT"
+        drop_columns = [*(f"{name}{tmp_name}" for name in right_other), *validity]
         result = (
-            self.join(other.select(list(union_names)), on=on, how=how, suffix=tmp_name)
-            .with_columns(
-                [
-                    F.coalesce([column_name + tmp_name, F.col(column_name)]).alias(
-                        column_name
-                    )
-                    for column_name in right_added_names
-                ]
+            self.join(
+                other.select(*right_on, *right_other, *validity),
+                left_on=left_on,
+                right_on=right_on,
+                how=how,
+                suffix=tmp_name,
             )
-            .drop([name + tmp_name for name in right_added_names])
+            .with_columns(
+                (
+                    # use left value only when right value failed to join
+                    F.when(F.col(validity).is_null())
+                    .then(F.col(name))
+                    .otherwise(F.col(f"{name}{tmp_name}"))
+                    if include_nulls
+                    else F.coalesce([f"{name}{tmp_name}", F.col(name)])
+                ).alias(name)
+                for name in right_other
+            )
+            .drop(drop_columns)
         )
-        if row_count_used:
-            result = result.drop(row_count_name)
+        if row_index_used:
+            result = result.drop(row_index_name)
 
         return self._from_pyldf(result._ldf)
+
+    def count(self) -> Self:
+        """
+        Return the number of non-null elements for each column.
+
+        Examples
+        --------
+        >>> lf = pl.LazyFrame(
+        ...     {"a": [1, 2, 3, 4], "b": [1, 2, 1, None], "c": [None, None, None, None]}
+        ... )
+        >>> lf.count().collect()
+        shape: (1, 3)
+        ┌─────┬─────┬─────┐
+        │ a   ┆ b   ┆ c   │
+        │ --- ┆ --- ┆ --- │
+        │ u32 ┆ u32 ┆ u32 │
+        ╞═════╪═════╪═════╡
+        │ 4   ┆ 3   ┆ 0   │
+        └─────┴─────┴─────┘
+        """
+        return self._from_pyldf(self._ldf.count())
 
     @deprecate_renamed_function("group_by", version="0.19.0")
     def groupby(
@@ -5620,13 +6266,12 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         maintain_order
             Ensure that the order of the groups is consistent with the input data.
             This is slower than a default group by.
-            Settings this to ``True`` blocks the possibility
+            Settings this to `True` blocks the possibility
             to run on the streaming engine.
-
         """
         return self.group_by(by, *more_by, maintain_order=maintain_order)
 
-    @deprecate_renamed_function("group_by_rolling", version="0.19.0")
+    @deprecate_renamed_function("rolling", version="0.19.0")
     def groupby_rolling(
         self,
         index_column: IntoExpr,
@@ -5641,7 +6286,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         Create rolling groups based on a time, Int32, or Int64 column.
 
         .. deprecated:: 0.19.0
-            This method has been renamed to :func:`LazyFrame.group_by_rolling`.
+            This method has been renamed to :func:`LazyFrame.rolling`.
 
         Parameters
         ----------
@@ -5663,21 +6308,79 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         by
             Also group by this column/these columns
         check_sorted
-            When the ``by`` argument is given, polars can not check sortedness
+            When the `by` argument is given, polars can not check sortedness
             by the metadata and has to do a full scan on the index column to
             verify data is sorted. This is expensive. If you are sure the
-            data within the by groups is sorted, you can set this to ``False``.
+            data within the by groups is sorted, you can set this to `False`.
             Doing so incorrectly will lead to incorrect output
 
         Returns
         -------
         LazyGroupBy
-            Object you can call ``.agg`` on to aggregate by groups, the result
+            Object you can call `.agg` on to aggregate by groups, the result
             of which will be sorted by `index_column` (but note that if `by` columns are
             passed, it will only be sorted within each `by` group).
-
         """
-        return self.group_by_rolling(
+        return self.rolling(
+            index_column,
+            period=period,
+            offset=offset,
+            closed=closed,
+            by=by,
+            check_sorted=check_sorted,
+        )
+
+    @deprecate_renamed_function("rolling", version="0.19.9")
+    def group_by_rolling(
+        self,
+        index_column: IntoExpr,
+        *,
+        period: str | timedelta,
+        offset: str | timedelta | None = None,
+        closed: ClosedInterval = "right",
+        by: IntoExpr | Iterable[IntoExpr] | None = None,
+        check_sorted: bool = True,
+    ) -> LazyGroupBy:
+        """
+        Create rolling groups based on a time, Int32, or Int64 column.
+
+        .. deprecated:: 0.19.9
+            This method has been renamed to :func:`LazyFrame.rolling`.
+
+        Parameters
+        ----------
+        index_column
+            Column used to group based on the time window.
+            Often of type Date/Datetime.
+            This column must be sorted in ascending order (or, if `by` is specified,
+            then it must be sorted in ascending order within each group).
+
+            In case of a rolling group by on indices, dtype needs to be one of
+            {Int32, Int64}. Note that Int32 gets temporarily cast to Int64, so if
+            performance matters use an Int64 column.
+        period
+            length of the window - must be non-negative
+        offset
+            offset of the window. Default is -period
+        closed : {'right', 'left', 'both', 'none'}
+            Define which sides of the temporal interval are closed (inclusive).
+        by
+            Also group by this column/these columns
+        check_sorted
+            When the `by` argument is given, polars can not check sortedness
+            by the metadata and has to do a full scan on the index column to
+            verify data is sorted. This is expensive. If you are sure the
+            data within the by groups is sorted, you can set this to `False`.
+            Doing so incorrectly will lead to incorrect output
+
+        Returns
+        -------
+        LazyGroupBy
+            Object you can call `.agg` on to aggregate by groups, the result
+            of which will be sorted by `index_column` (but note that if `by` columns are
+            passed, it will only be sorted within each `by` group).
+        """
+        return self.rolling(
             index_column,
             period=period,
             offset=offset,
@@ -5723,7 +6426,7 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         period
             length of the window, if None it will equal 'every'
         offset
-            offset of the window, only takes effect if `start_by` is ``'window'``.
+            offset of the window, only takes effect if `start_by` is `'window'`.
             Defaults to negative `every`.
         truncate
             truncate the time value to the window lower bound
@@ -5742,26 +6445,25 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
               `every`, and then adding `offset`.
               Note that weekly windows start on Monday.
             * 'datapoint': Start from the first encountered data point.
-            * a day of the week (only takes effect if `every` contains ``'w'``):
+            * a day of the week (only takes effect if `every` contains `'w'`):
 
               * 'monday': Start the window on the Monday before the first data point.
               * 'tuesday': Start the window on the Tuesday before the first data point.
               * ...
               * 'sunday': Start the window on the Sunday before the first data point.
         check_sorted
-            When the ``by`` argument is given, polars can not check sortedness
+            When the `by` argument is given, polars can not check sortedness
             by the metadata and has to do a full scan on the index column to
             verify data is sorted. This is expensive. If you are sure the
-            data within the by groups is sorted, you can set this to ``False``.
+            data within the by groups is sorted, you can set this to `False`.
             Doing so incorrectly will lead to incorrect output
 
         Returns
         -------
         LazyGroupBy
-            Object you can call ``.agg`` on to aggregate by groups, the result
+            Object you can call `.agg` on to aggregate by groups, the result
             of which will be sorted by `index_column` (but note that if `by` columns are
             passed, it will only be sorted within each `by` group).
-
         """  # noqa: W505
         return self.group_by_dynamic(
             index_column,
@@ -5808,19 +6510,18 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         no_optimizations
             Turn off all optimizations past this point.
         schema
-            Output schema of the function, if set to ``None`` we assume that the schema
+            Output schema of the function, if set to `None` we assume that the schema
             will remain unchanged by the applied function.
         validate_output_schema
             It is paramount that polars' schema is correct. This flag will ensure that
             the output schema of this function will be checked with the expected schema.
-            Setting this to ``False`` will not do this check, but may lead to hard to
+            Setting this to `False` will not do this check, but may lead to hard to
             debug bugs.
         streamable
             Whether the function that is given is eligible to be running with the
             streaming engine. That means that the function must produce the same result
             when it is executed in batches or when it is be executed on the full
             dataset.
-
         """
         return self.map_batches(
             function,
@@ -5832,3 +6533,43 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             validate_output_schema=validate_output_schema,
             streamable=streamable,
         )
+
+    @deprecate_function("Use `shift` instead.", version="0.19.12")
+    @deprecate_renamed_parameter("periods", "n", version="0.19.11")
+    def shift_and_fill(
+        self,
+        fill_value: Expr | int | str | float,
+        *,
+        n: int = 1,
+    ) -> Self:
+        """
+        Shift values by the given number of places and fill the resulting null values.
+
+        .. deprecated:: 0.19.12
+            Use :func:`shift` instead.
+
+        Parameters
+        ----------
+        fill_value
+            fill None values with the result of this expression.
+        n
+            Number of places to shift (may be negative).
+        """
+        return self.shift(n, fill_value=fill_value)
+
+    @deprecate_renamed_function("gather_every", version="0.19.14")
+    def take_every(self, n: int, offset: int = 0) -> Self:
+        """
+        Take every nth row in the LazyFrame and return as a new LazyFrame.
+
+        .. deprecated:: 0.19.0
+            This method has been renamed to :meth:`gather_every`.
+
+        Parameters
+        ----------
+        n
+            Gather every *n*-th row.
+        offset
+            Starting index.
+        """
+        return self.gather_every(n, offset)

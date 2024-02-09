@@ -70,3 +70,123 @@ def test_sorted_flag_after_streaming_join() -> None:
         .collect(streaming=True)["x"]
         .flags["SORTED_ASC"]
     )
+
+
+def test_streaming_cross_join_empty() -> None:
+    df1 = pl.LazyFrame(
+        data={
+            "col1": ["a"],
+        }
+    )
+
+    df2 = pl.LazyFrame(
+        data={
+            "col1": [],
+        },
+        schema={
+            "col1": str,
+        },
+    )
+
+    out = df1.join(
+        df2,
+        how="cross",
+        on="col1",
+    ).collect(streaming=True)
+    assert out.shape == (0, 2)
+    assert out.columns == ["col1", "col1_right"]
+
+
+def test_streaming_join_rechunk_12498() -> None:
+    rows = pl.int_range(0, 2)
+
+    a = pl.select(A=rows).lazy()
+    b = pl.select(B=rows).lazy()
+
+    q = a.join(b, how="cross")
+    assert q.collect(streaming=True).to_dict(as_series=False) == {
+        "A": [0, 1, 0, 1],
+        "B": [0, 0, 1, 1],
+    }
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_join_null_matches(streaming: bool) -> None:
+    # null values in joins should never find a match.
+    df_a = pl.LazyFrame(
+        {
+            "idx_a": [0, 1, 2],
+            "a": [None, 1, 2],
+        }
+    )
+
+    df_b = pl.LazyFrame(
+        {
+            "idx_b": [0, 1, 2, 3],
+            "a": [None, 2, 1, None],
+        }
+    )
+
+    expected = pl.DataFrame({"idx_a": [2, 1], "a": [2, 1], "idx_b": [1, 2]})
+    assert_frame_equal(
+        df_a.join(df_b, on="a", how="inner").collect(streaming=streaming), expected
+    )
+    expected = pl.DataFrame(
+        {"idx_a": [0, 1, 2], "a": [None, 1, 2], "idx_b": [None, 2, 1]}
+    )
+    assert_frame_equal(
+        df_a.join(df_b, on="a", how="left").collect(streaming=streaming), expected
+    )
+    expected = pl.DataFrame(
+        {
+            "idx_a": [None, 2, 1, None, 0],
+            "a": [None, 2, 1, None, None],
+            "idx_b": [0, 1, 2, 3, None],
+            "a_right": [None, 2, 1, None, None],
+        }
+    )
+    assert_frame_equal(df_a.join(df_b, on="a", how="outer").collect(), expected)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_join_null_matches_multiple_keys(streaming: bool) -> None:
+    df_a = pl.LazyFrame(
+        {
+            "a": [None, 1, 2],
+            "idx": [0, 1, 2],
+        }
+    )
+
+    df_b = pl.LazyFrame(
+        {
+            "a": [None, 2, 1, None, 1],
+            "idx": [0, 1, 2, 3, 1],
+            "c": [10, 20, 30, 40, 50],
+        }
+    )
+
+    expected = pl.DataFrame({"a": [1], "idx": [1], "c": [50]})
+    assert_frame_equal(
+        df_a.join(df_b, on=["a", "idx"], how="inner").collect(streaming=streaming),
+        expected,
+    )
+    expected = pl.DataFrame(
+        {"a": [None, 1, 2], "idx": [0, 1, 2], "c": [None, 50, None]}
+    )
+    assert_frame_equal(
+        df_a.join(df_b, on=["a", "idx"], how="left").collect(streaming=streaming),
+        expected,
+    )
+
+    expected = pl.DataFrame(
+        {
+            "a": [None, None, None, None, None, 1, 2],
+            "idx": [None, None, None, None, 0, 1, 2],
+            "a_right": [None, 2, 1, None, None, 1, None],
+            "idx_right": [0, 1, 2, 3, None, 1, None],
+            "c": [10, 20, 30, 40, None, 50, None],
+        }
+    )
+    assert_frame_equal(
+        df_a.join(df_b, on=["a", "idx"], how="outer").sort("a").collect(), expected
+    )

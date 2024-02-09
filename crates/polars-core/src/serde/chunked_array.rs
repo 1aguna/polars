@@ -59,7 +59,7 @@ where
     state.serialize_entry("name", name)?;
     state.serialize_entry("datatype", dtype)?;
     state.serialize_entry("bit_settings", &bit_settings)?;
-    state.serialize_entry("values", &IterSer::new(ca.into_iter()))?;
+    state.serialize_entry("values", &IterSer::new(ca.iter()))?;
     state.end()
 }
 
@@ -129,10 +129,12 @@ macro_rules! impl_serialize {
     };
 }
 
-impl_serialize!(Utf8Chunked);
+impl_serialize!(StringChunked);
 impl_serialize!(BooleanChunked);
 impl_serialize!(ListChunked);
 impl_serialize!(BinaryChunked);
+#[cfg(feature = "dtype-array")]
+impl_serialize!(ArrayChunked);
 
 #[cfg(feature = "dtype-categorical")]
 impl Serialize for CategoricalChunked {

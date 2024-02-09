@@ -1,5 +1,5 @@
-use polars_arrow::export::arrow::temporal_conversions::{MILLISECONDS, SECONDS_IN_DAY};
-use polars_arrow::time_zone::Tz;
+use arrow::legacy::time_zone::Tz;
+use arrow::temporal_conversions::{MILLISECONDS, SECONDS_IN_DAY};
 use polars_core::prelude::*;
 
 use crate::prelude::*;
@@ -10,7 +10,6 @@ pub trait PolarsRound {
         Self: Sized;
 }
 
-#[cfg(feature = "dtype-datetime")]
 impl PolarsRound for DatetimeChunked {
     fn round(&self, every: Duration, offset: Duration, tz: Option<&Tz>) -> PolarsResult<Self> {
         let w = Window::new(every, every, offset);
@@ -20,13 +19,12 @@ impl PolarsRound for DatetimeChunked {
             TimeUnit::Microseconds => Window::round_us,
             TimeUnit::Milliseconds => Window::round_ms,
         };
-        Ok(self
-            .try_apply(|t| func(&w, t, tz))?
-            .into_datetime(self.time_unit(), self.time_zone().clone()))
+
+        let out = { self.try_apply(|t| func(&w, t, tz)) };
+        out.map(|ok| ok.into_datetime(self.time_unit(), self.time_zone().clone()))
     }
 }
 
-#[cfg(feature = "dtype-date")]
 impl PolarsRound for DateChunked {
     fn round(&self, every: Duration, offset: Duration, _tz: Option<&Tz>) -> PolarsResult<Self> {
         let w = Window::new(every, every, offset);

@@ -1,9 +1,10 @@
 //! this contains code used for rewriting projections, expanding wildcards, regex selection etc.
-use polars_arrow::index::IndexToUsize;
+use arrow::legacy::index::IndexToUsize;
 use polars_core::utils::get_supertype;
 
 use super::*;
 use crate::prelude::function_expr::FunctionExpr;
+use crate::utils::expr_output_name;
 
 /// This replace the wildcard Expr with a Column Expr. It also removes the Exclude Expr from the
 /// expression chain.
@@ -24,7 +25,8 @@ pub(super) fn replace_wildcard_with_column(mut expr: Expr, column_name: Arc<str>
     expr
 }
 
-pub fn remove_exclude(mut expr: Expr) -> Expr {
+#[cfg(feature = "regex")]
+fn remove_exclude(mut expr: Expr) -> Expr {
     expr.mutate().apply(|e| {
         if let Expr::Exclude(input, _) = e {
             *e = remove_exclude(std::mem::take(input));
@@ -37,7 +39,6 @@ pub fn remove_exclude(mut expr: Expr) -> Expr {
 
 fn rewrite_special_aliases(expr: Expr) -> PolarsResult<Expr> {
     // the blocks are added by cargo fmt
-    #[allow(clippy::blocks_in_if_conditions)]
     if has_expr(&expr, |e| {
         matches!(e, Expr::KeepName(_) | Expr::RenameAlias { .. })
     }) {
@@ -45,7 +46,7 @@ fn rewrite_special_aliases(expr: Expr) -> PolarsResult<Expr> {
             Expr::KeepName(expr) => {
                 let roots = expr_to_leaf_column_names(&expr);
                 let name = roots
-                    .get(0)
+                    .first()
                     .expect("expected root column to keep expression name");
                 Ok(Expr::Alias(expr, name.clone()))
             },
@@ -54,7 +55,7 @@ fn rewrite_special_aliases(expr: Expr) -> PolarsResult<Expr> {
                 let name = function.call(&name)?;
                 Ok(Expr::Alias(expr, Arc::from(name)))
             },
-            _ => panic!("`keep_name`, `suffix`, `prefix` should be last expression"),
+            _ => panic!("`keep`, `suffix`, `prefix` should be last expression"),
         }
     } else {
         Ok(expr)
@@ -170,6 +171,7 @@ fn replace_regex(
 }
 
 /// replace `columns(["A", "B"])..` with `col("A")..`, `col("B")..`
+#[allow(unused_variables)]
 fn expand_columns(
     expr: &Expr,
     result: &mut Vec<Expr>,
@@ -354,27 +356,15 @@ fn prepare_excluded(
     }
 
     // exclude group_by keys
-    for mut expr in keys.iter() {
-        // Allow a number of aliases of a column expression, still exclude column from aggregation
-        loop {
-            match expr {
-                Expr::Column(name) => {
-                    exclude.insert(name.clone());
-                    break;
-                },
-                Expr::Alias(e, _) => {
-                    expr = e;
-                },
-                _ => {
-                    break;
-                },
-            }
+    for expr in keys.iter() {
+        if let Ok(name) = expr_output_name(expr) {
+            exclude.insert(name.clone());
         }
     }
     Ok(exclude)
 }
 
-// functions can have col(["a", "b"]) or col(Utf8) as inputs
+// functions can have col(["a", "b"]) or col(String) as inputs
 fn expand_function_inputs(mut expr: Expr, schema: &Schema) -> Expr {
     expr.mutate().apply(|e| match e {
         Expr::AnonymousFunction { input, options, .. } | Expr::Function { input, options, .. }
@@ -467,7 +457,7 @@ pub(crate) fn rewrite_projections(
     for mut expr in exprs {
         let result_offset = result.len();
 
-        // functions can have col(["a", "b"]) or col(Utf8) as inputs
+        // functions can have col(["a", "b"]) or col(String) as inputs
         expr = expand_function_inputs(expr, schema);
 
         let mut flags = find_flags(&expr);

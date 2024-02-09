@@ -19,7 +19,7 @@ COMPRESSIONS = ["uncompressed", "snappy", "deflate"]
 
 @pytest.fixture()
 def example_df() -> pl.DataFrame:
-    return pl.DataFrame({"i64": [1, 2], "f64": [0.1, 0.2], "utf8": ["a", "b"]})
+    return pl.DataFrame({"i64": [1, 2], "f64": [0.1, 0.2], "str": ["a", "b"]})
 
 
 @pytest.mark.parametrize("compression", COMPRESSIONS)
@@ -67,4 +67,25 @@ def test_select_projection() -> None:
     f.seek(0)
 
     read_df = pl.read_avro(f, columns=[1, 2])
+    assert_frame_equal(expected, read_df)
+
+
+def test_with_name() -> None:
+    df = pl.DataFrame({"a": [1]})
+    expected = pl.DataFrame(
+        {
+            "type": ["record"],
+            "name": ["my_schema_name"],
+            "fields": [[{"name": "a", "type": ["null", "long"]}]],
+        }
+    )
+
+    f = io.BytesIO()
+    df.write_avro(f, name="my_schema_name")
+
+    f.seek(0)
+    raw = f.read()
+
+    read_df = pl.read_json(raw[raw.find(b"{") : raw.rfind(b"}") + 1])
+
     assert_frame_equal(expected, read_df)

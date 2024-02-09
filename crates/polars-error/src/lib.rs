@@ -2,6 +2,7 @@ pub mod constants;
 mod warning;
 
 use std::borrow::Cow;
+use std::collections::TryReserveError;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::ops::Deref;
@@ -17,11 +18,17 @@ where
     T: Into<Cow<'static, str>>,
 {
     fn from(msg: T) -> Self {
-        if env::var("POLARS_PANIC_ON_ERR").is_ok() {
+        if env::var("POLARS_PANIC_ON_ERR").as_deref().unwrap_or("") == "1" {
             panic!("{}", msg.into())
         } else {
             ErrString(msg.into())
         }
+    }
+}
+
+impl AsRef<str> for ErrString {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
@@ -41,8 +48,6 @@ impl Display for ErrString {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolarsError {
-    #[error(transparent)]
-    ArrowError(Box<ArrowError>),
     #[error("not found: {0}")]
     ColumnNotFound(ErrString),
     #[error("{0}")]
@@ -69,12 +74,6 @@ pub enum PolarsError {
     StructFieldNotFound(ErrString),
 }
 
-impl From<ArrowError> for PolarsError {
-    fn from(err: ArrowError) -> Self {
-        Self::ArrowError(Box::new(err))
-    }
-}
-
 #[cfg(feature = "regex")]
 impl From<regex::Error> for PolarsError {
     fn from(err: regex::Error) -> Self {
@@ -87,20 +86,50 @@ impl From<object_store::Error> for PolarsError {
     fn from(err: object_store::Error) -> Self {
         PolarsError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
-            format!("object store error {err:?}"),
+            format!("object-store error: {err:?}"),
         ))
+    }
+}
+
+#[cfg(feature = "avro-schema")]
+impl From<avro_schema::error::Error> for PolarsError {
+    fn from(value: avro_schema::error::Error) -> Self {
+        polars_err!(ComputeError: "avro-error: {}", value)
+    }
+}
+
+#[cfg(feature = "parquet2")]
+impl From<PolarsError> for parquet2::error::Error {
+    fn from(value: PolarsError) -> Self {
+        // catch all needed :(.
+        parquet2::error::Error::OutOfSpec(format!("error: {value}"))
+    }
+}
+
+impl From<simdutf8::basic::Utf8Error> for PolarsError {
+    fn from(value: simdutf8::basic::Utf8Error) -> Self {
+        polars_err!(ComputeError: "invalid utf8: {}", value)
+    }
+}
+#[cfg(feature = "arrow-format")]
+impl From<arrow_format::ipc::planus::Error> for PolarsError {
+    fn from(err: arrow_format::ipc::planus::Error) -> Self {
+        polars_err!(ComputeError: "parquet error: {err:?}")
+    }
+}
+
+impl From<TryReserveError> for PolarsError {
+    fn from(value: TryReserveError) -> Self {
+        polars_err!(ComputeError: "OOM: {}", value)
     }
 }
 
 pub type PolarsResult<T> = Result<T, PolarsError>;
 
-pub use arrow::error::Error as ArrowError;
-
 impl PolarsError {
     pub fn wrap_msg(&self, func: &dyn Fn(&str) -> String) -> Self {
         use PolarsError::*;
         match self {
-            ArrowError(err) => ComputeError(func(&format!("ArrowError: {err}")).into()),
             ColumnNotFound(msg) => ColumnNotFound(func(msg).into()),
             ComputeError(msg) => ComputeError(func(msg).into()),
             Duplicate(msg) => Duplicate(func(msg).into()),
@@ -169,6 +198,12 @@ macro_rules! polars_err {
             InvalidOperation: "{} operation not supported for dtypes `{}` and `{}`", $op, $lhs, $rhs
         )
     };
+    (oos = $($tt:tt)+) => {
+        $crate::polars_err!(ComputeError: "out-of-spec: {}", $($tt)+)
+    };
+    (nyi = $($tt:tt)+) => {
+        $crate::polars_err!(ComputeError: "not yet implemented: {}", format!($($tt)+) )
+    };
     (opq = $op:ident, $arg:expr) => {
         $crate::polars_err!(op = concat!("`", stringify!($op), "`"), $arg)
     };
@@ -184,6 +219,9 @@ macro_rules! polars_err {
     (unpack) => {
         polars_err!(SchemaMismatch: "cannot unpack series, data types don't match")
     };
+    (not_in_enum,value=$value:expr,categories=$categories:expr) =>{
+        polars_err!(ComputeError: "value '{}' is not present in Enum: {:?}",$value,$categories)
+    };
     (string_cache_mismatch) => {
         polars_err!(StringCacheMismatch: r#"
 cannot compare categoricals coming from different sources, consider setting a global StringCache.
@@ -194,13 +232,13 @@ Help: if you're using Python, this may look something like:
         # Initialize Categoricals.
         df1 = pl.DataFrame({'a': ['1', '2']}, schema={'a': pl.Categorical})
         df2 = pl.DataFrame({'a': ['1', '3']}, schema={'a': pl.Categorical})
-        # Your operations go here.
-        pl.concat([df1, df2])
+    # Your operations go here.
+    pl.concat([df1, df2])
 
 Alternatively, if the performance cost is acceptable, you could just set:
 
     import polars as pl
-    pl.enable_string_cache(True)
+    pl.enable_string_cache()
 
 on startup."#.trim_start())
     };

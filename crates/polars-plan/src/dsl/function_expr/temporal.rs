@@ -1,11 +1,77 @@
 #[cfg(feature = "date_offset")]
-use polars_arrow::time_zone::Tz;
+use arrow::legacy::time_zone::Tz;
 #[cfg(feature = "date_offset")]
-use polars_core::chunked_array::ops::arity::try_binary_elementwise_values;
+use polars_core::chunked_array::ops::arity::try_binary_elementwise;
 #[cfg(feature = "date_offset")]
 use polars_time::prelude::*;
 
 use super::*;
+use crate::{map, map_as_slice};
+
+impl From<TemporalFunction> for SpecialEq<Arc<dyn SeriesUdf>> {
+    fn from(func: TemporalFunction) -> Self {
+        use TemporalFunction::*;
+        match func {
+            Millennium => map!(datetime::millennium),
+            Century => map!(datetime::century),
+            Year => map!(datetime::year),
+            IsLeapYear => map!(datetime::is_leap_year),
+            IsoYear => map!(datetime::iso_year),
+            Month => map!(datetime::month),
+            Quarter => map!(datetime::quarter),
+            Week => map!(datetime::week),
+            WeekDay => map!(datetime::weekday),
+            Duration(tu) => map_as_slice!(datetime::duration, tu),
+            Day => map!(datetime::day),
+            OrdinalDay => map!(datetime::ordinal_day),
+            Time => map!(datetime::time),
+            Date => map!(datetime::date),
+            Datetime => map!(datetime::datetime),
+            Hour => map!(datetime::hour),
+            Minute => map!(datetime::minute),
+            Second => map!(datetime::second),
+            Millisecond => map!(datetime::millisecond),
+            Microsecond => map!(datetime::microsecond),
+            Nanosecond => map!(datetime::nanosecond),
+            TotalDays => map!(datetime::total_days),
+            TotalHours => map!(datetime::total_hours),
+            TotalMinutes => map!(datetime::total_minutes),
+            TotalSeconds => map!(datetime::total_seconds),
+            TotalMilliseconds => map!(datetime::total_milliseconds),
+            TotalMicroseconds => map!(datetime::total_microseconds),
+            TotalNanoseconds => map!(datetime::total_nanoseconds),
+            ToString(format) => map!(datetime::to_string, &format),
+            TimeStamp(tu) => map!(datetime::timestamp, tu),
+            #[cfg(feature = "timezones")]
+            ConvertTimeZone(tz) => map!(datetime::convert_time_zone, &tz),
+            WithTimeUnit(tu) => map!(datetime::with_time_unit, tu),
+            CastTimeUnit(tu) => map!(datetime::cast_time_unit, tu),
+            Truncate(offset) => {
+                map_as_slice!(datetime::truncate, &offset)
+            },
+            #[cfg(feature = "date_offset")]
+            MonthStart => map!(datetime::month_start),
+            #[cfg(feature = "date_offset")]
+            MonthEnd => map!(datetime::month_end),
+            #[cfg(feature = "timezones")]
+            BaseUtcOffset => map!(datetime::base_utc_offset),
+            #[cfg(feature = "timezones")]
+            DSTOffset => map!(datetime::dst_offset),
+            Round(every, offset) => map_as_slice!(datetime::round, &every, &offset),
+            #[cfg(feature = "timezones")]
+            ReplaceTimeZone(tz) => {
+                map_as_slice!(dispatch::replace_time_zone, tz.as_deref())
+            },
+            Combine(tu) => map_as_slice!(temporal::combine, tu),
+            DatetimeFunction {
+                time_unit,
+                time_zone,
+            } => {
+                map_as_slice!(temporal::datetime, &time_unit, time_zone.as_deref())
+            },
+        }
+    }
+}
 
 pub(super) fn datetime(
     s: &[Series],
@@ -67,11 +133,11 @@ pub(super) fn datetime(
         microsecond = microsecond.new_from_index(0, max_len);
     }
     let microsecond = microsecond.u32()?;
-    let mut _ambiguous = ambiguous.cast(&DataType::Utf8)?;
+    let mut _ambiguous = ambiguous.cast(&DataType::String)?;
     if _ambiguous.len() < max_len {
         _ambiguous = _ambiguous.new_from_index(0, max_len);
     }
-    let _ambiguous = _ambiguous.utf8()?;
+    let _ambiguous = _ambiguous.str()?;
 
     let ca: Int64Chunked = year
         .into_iter()
@@ -122,7 +188,7 @@ pub(super) fn datetime(
 #[cfg(feature = "date_offset")]
 fn apply_offsets_to_datetime(
     datetime: &Logical<DatetimeType, Int64Type>,
-    offsets: &Utf8Chunked,
+    offsets: &StringChunked,
     offset_fn: fn(&Duration, i64, Option<&Tz>) -> PolarsResult<i64>,
     time_zone: Option<&Tz>,
 ) -> PolarsResult<Int64Chunked> {
@@ -139,9 +205,13 @@ fn apply_offsets_to_datetime(
                 .try_apply(|v| offset_fn(&Duration::parse(offset), v, time_zone)),
             _ => Ok(datetime.0.apply(|_| None)),
         },
-        _ => try_binary_elementwise_values(datetime, offsets, |timestamp: i64, offset: &str| {
-            let offset = Duration::parse(offset);
-            offset_fn(&offset, timestamp, time_zone)
+        _ => try_binary_elementwise(datetime, offsets, |timestamp_opt, offset_opt| {
+            match (timestamp_opt, offset_opt) {
+                (Some(timestamp), Some(offset)) => {
+                    offset_fn(&Duration::parse(offset), timestamp, time_zone).map(Some)
+                },
+                _ => Ok(None),
+            }
         }),
     }
 }
@@ -149,7 +219,7 @@ fn apply_offsets_to_datetime(
 #[cfg(feature = "date_offset")]
 pub(super) fn date_offset(s: &[Series]) -> PolarsResult<Series> {
     let ts = &s[0];
-    let offsets = &s[1].utf8().unwrap();
+    let offsets = &s[1].str()?;
 
     let preserve_sortedness: bool;
     let out = match ts.dtype() {
@@ -243,7 +313,7 @@ pub(super) fn combine(s: &[Series], tu: TimeUnit) -> PolarsResult<Series> {
         Some(tz) => Ok(polars_ops::prelude::replace_time_zone(
             result_naive.datetime().unwrap(),
             Some(tz),
-            &Utf8Chunked::from_iter(std::iter::once("raise")),
+            &StringChunked::from_iter(std::iter::once("raise")),
         )?
         .into()),
         _ => Ok(result_naive),

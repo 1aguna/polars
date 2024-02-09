@@ -12,17 +12,17 @@ pub struct IpcExec {
 
 impl IpcExec {
     fn read(&mut self, verbose: bool) -> PolarsResult<DataFrame> {
-        let (file, projection, n_rows, predicate) = prepare_scan_args(
-            &self.path,
-            &self.predicate,
+        let file = std::fs::File::open(&self.path)?;
+        let (projection, predicate) = prepare_scan_args(
+            self.predicate.clone(),
             &mut self.file_options.with_columns,
             &mut self.schema,
-            self.file_options.n_rows,
-            self.file_options.row_count.is_some(),
+            self.file_options.row_index.is_some(),
+            None,
         );
-        IpcReader::new(file.unwrap())
-            .with_n_rows(n_rows)
-            .with_row_count(std::mem::take(&mut self.file_options.row_count))
+        IpcReader::new(file)
+            .with_n_rows(self.file_options.n_rows)
+            .with_row_index(std::mem::take(&mut self.file_options.row_index))
             .set_rechunk(self.file_options.rechunk)
             .with_projection(projection)
             .memory_mapped(self.options.memmap)
@@ -33,7 +33,8 @@ impl IpcExec {
 impl Executor for IpcExec {
     fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
         let finger_print = FileFingerPrint {
-            path: self.path.clone(),
+            paths: Arc::new([self.path.clone()]),
+            #[allow(clippy::useless_asref)]
             predicate: self
                 .predicate
                 .as_ref()

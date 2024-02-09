@@ -1,25 +1,23 @@
-use std::hash::Hash;
-
 use arrow::array::BooleanArray;
 use arrow::bitmap::MutableBitmap;
 use polars_core::prelude::*;
 use polars_core::with_match_physical_integer_polars_type;
+use polars_utils::total_ord::{TotalEq, TotalHash, TotalOrdWrap};
 
 // If invert is true then this is an `is_duplicated`.
 fn is_unique_ca<'a, T>(ca: &'a ChunkedArray<T>, invert: bool) -> BooleanChunked
 where
     T: PolarsDataType,
-    &'a ChunkedArray<T>: IntoIterator,
-    <<&'a ChunkedArray<T> as IntoIterator>::IntoIter as IntoIterator>::Item: Hash + Eq,
+    T::Physical<'a>: TotalHash + TotalEq,
 {
     let len = ca.len();
     let mut idx_key = PlHashMap::new();
 
     // Instead of group_tuples, which allocates a full Vec per group, we now
     // just toggle a boolean that's false if a group has multiple entries.
-    ca.into_iter().enumerate().for_each(|(idx, key)| {
+    ca.iter().enumerate().for_each(|(idx, key)| {
         idx_key
-            .entry(key)
+            .entry(TotalOrdWrap(key))
             .and_modify(|v: &mut (IdxSize, bool)| v.1 = false)
             .or_insert((idx as IdxSize, true));
     });
@@ -50,18 +48,18 @@ fn dispatcher(s: &Series, invert: bool) -> PolarsResult<BooleanChunked> {
             let ca = s.binary().unwrap();
             is_unique_ca(ca, invert)
         },
-        Utf8 => {
+        String => {
             let s = s.cast(&Binary).unwrap();
             let ca = s.binary().unwrap();
             is_unique_ca(ca, invert)
         },
         Float32 => {
-            let ca = s.bit_repr_small();
-            is_unique_ca(&ca, invert)
+            let ca = s.f32().unwrap();
+            is_unique_ca(ca, invert)
         },
         Float64 => {
-            let ca = s.bit_repr_large();
-            is_unique_ca(&ca, invert)
+            let ca = s.f64().unwrap();
+            is_unique_ca(ca, invert)
         },
         #[cfg(feature = "dtype-struct")]
         Struct(_) => {
@@ -72,6 +70,11 @@ fn dispatcher(s: &Series, invert: bool) -> PolarsResult<BooleanChunked> {
             } else {
                 df.is_unique()
             };
+        },
+        Null => match s.len() {
+            0 => BooleanChunked::new(s.name(), [] as [bool; 0]),
+            1 => BooleanChunked::new(s.name(), [!invert]),
+            len => BooleanChunked::full(s.name(), invert, len),
         },
         dt if dt.is_numeric() => {
             with_match_physical_integer_polars_type!(s.dtype(), |$T| {

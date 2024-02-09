@@ -153,14 +153,13 @@ class NotebookFormatter(HTMLFormatter):
     Class for formatting output data in HTML for display in Jupyter Notebooks.
 
     This class is intended for functionality specific to DataFrame._repr_html_().
-
     """
 
     def write_style(self) -> None:
         style = """\
             <style>
-            .dataframe > thead > tr > th,
-            .dataframe > tbody > tr > td {
+            .dataframe > thead > tr,
+            .dataframe > tbody > tr {
               text-align: right;
               white-space: pre-wrap;
             }

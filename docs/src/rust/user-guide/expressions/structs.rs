@@ -1,5 +1,6 @@
 // --8<-- [start:setup]
-use polars::{lazy::dsl::count, prelude::*};
+use polars::lazy::dsl::len;
+use polars::prelude::*;
 // --8<-- [end:setup]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --8<-- [start:ratings_df]
@@ -68,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .filter(as_struct(&[col("Movie"), col("Theatre")]).is_duplicated())
         // Error: .is_duplicated() not available if you try that
         // https://github.com/pola-rs/polars/issues/3803
-        .filter(count().over([col("Movie"), col("Theatre")]).gt(lit(1)))
+        .filter(len().over([col("Movie"), col("Theatre")]).gt(lit(1)))
         .collect()?;
     println!("{}", &out);
     // --8<-- [end:struct_duplicates]
@@ -77,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = ratings
         .clone()
         .lazy()
-        .with_columns([as_struct(&[col("Count"), col("Avg_Rating")])
+        .with_columns([as_struct(vec![col("Count"), col("Avg_Rating")])
             .rank(
                 RankOptions {
                     method: RankMethod::Dense,
@@ -90,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .filter(as_struct(&[col("Movie"), col("Theatre")]).is_duplicated())
         // Error: .is_duplicated() not available if you try that
         // https://github.com/pola-rs/polars/issues/3803
-        .filter(count().over([col("Movie"), col("Theatre")]).gt(lit(1)))
+        .filter(len().over([col("Movie"), col("Theatre")]).gt(lit(1)))
         .collect()?;
     println!("{}", &out);
     // --8<-- [end:struct_ranking]

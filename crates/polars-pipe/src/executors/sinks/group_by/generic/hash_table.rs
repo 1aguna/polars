@@ -1,5 +1,5 @@
-use polars_arrow::trusted_len::TrustedLenPush;
-use polars_core::hashing::partition::this_partition;
+use arrow::legacy::trusted_len::TrustedLenPush;
+use polars_utils::hashing::hash_to_partition;
 
 use super::*;
 use crate::pipeline::PARTITION_SIZE;
@@ -161,9 +161,8 @@ impl<const FIXED: bool> AggHashTable<FIXED> {
         partition: usize,
         other: &AggHashTable<FIXED_OTHER>,
     ) {
-        let partition = partition as u64;
         self.combine_impl(other, |hash| {
-            this_partition(hash, partition, PARTITION_SIZE as u64)
+            partition == hash_to_partition(hash, PARTITION_SIZE)
         })
     }
 
@@ -252,7 +251,7 @@ impl<const FIXED: bool> AggHashTable<FIXED> {
                     unsafe {
                         let running_agg = running_aggregations.get_unchecked_release_mut(i);
                         let av = running_agg.finalize();
-                        // safety: finalize creates owned anyvalues
+                        // safety: finalize creates owned AnyValues
                         buffer.add_unchecked_owned_physical(&av);
                     }
                 }
@@ -262,7 +261,7 @@ impl<const FIXED: bool> AggHashTable<FIXED> {
             .output_schema
             .iter_dtypes()
             .take(self.num_keys)
-            .map(|dtype| dtype.to_physical().to_arrow())
+            .map(|dtype| dtype.to_physical().to_arrow(true))
             .collect::<Vec<_>>();
         let fields = vec![Default::default(); self.num_keys];
         let key_columns =

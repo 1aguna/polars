@@ -16,7 +16,7 @@ pub mod json;
 #[cfg(feature = "json")]
 pub mod ndjson;
 #[cfg(feature = "cloud")]
-pub use crate::cloud::glob as async_glob;
+pub use cloud::glob as async_glob;
 
 pub mod mmap;
 mod options;
@@ -27,26 +27,24 @@ pub mod prelude;
 #[cfg(all(test, feature = "csv"))]
 mod tests;
 pub mod utils;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 #[cfg(feature = "partition")]
 pub mod partition;
+#[cfg(feature = "async")]
+pub mod pl_async;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[allow(unused)] // remove when updating to rust nightly >= 1.61
 use arrow::array::new_empty_array;
-use arrow::error::Result as ArrowResult;
 pub use options::*;
 use polars_core::frame::ArrowChunk;
 use polars_core::prelude::*;
 
-#[cfg(any(
-    feature = "ipc",
-    feature = "json",
-    feature = "avro",
-    feature = "ipc_streaming",
-))]
+#[cfg(any(feature = "ipc", feature = "avro", feature = "ipc_streaming",))]
 use crate::predicates::PhysicalIoExpr;
 
 pub trait SerReader<R>
@@ -86,22 +84,17 @@ pub trait WriterFactory {
 }
 
 pub trait ArrowReader {
-    fn next_record_batch(&mut self) -> ArrowResult<Option<ArrowChunk>>;
+    fn next_record_batch(&mut self) -> PolarsResult<Option<ArrowChunk>>;
 }
 
-#[cfg(any(
-    feature = "ipc",
-    feature = "json",
-    feature = "avro",
-    feature = "ipc_streaming",
-))]
+#[cfg(any(feature = "ipc", feature = "avro", feature = "ipc_streaming",))]
 pub(crate) fn finish_reader<R: ArrowReader>(
     mut reader: R,
     rechunk: bool,
     n_rows: Option<usize>,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     arrow_schema: &ArrowSchema,
-    row_count: Option<RowCount>,
+    row_index: Option<RowIndex>,
 ) -> PolarsResult<DataFrame> {
     use polars_core::utils::accumulate_dataframes_vertical;
 
@@ -113,12 +106,12 @@ pub(crate) fn finish_reader<R: ArrowReader>(
         num_rows += batch.len();
         let mut df = DataFrame::try_from((batch, arrow_schema.fields.as_slice()))?;
 
-        if let Some(rc) = &row_count {
-            df.with_row_count_mut(&rc.name, Some(current_num_rows + rc.offset));
+        if let Some(rc) = &row_index {
+            df.with_row_index_mut(&rc.name, Some(current_num_rows + rc.offset));
         }
 
         if let Some(predicate) = &predicate {
-            let s = predicate.evaluate(&df)?;
+            let s = predicate.evaluate_io(&df)?;
             let mask = s.bool().expect("filter predicates was not of type boolean");
             df = df.filter(mask)?;
         }
@@ -130,7 +123,7 @@ pub(crate) fn finish_reader<R: ArrowReader>(
                     .map(|df: &DataFrame| df.height())
                     .sum::<usize>();
                 if polars_core::config::verbose() {
-                    eprintln!("sliced off {} rows of the 'DataFrame'. These lines were read because they were in a single chunk.", df.height() - n)
+                    eprintln!("sliced off {} rows of the 'DataFrame'. These lines were read because they were in a single chunk.", df.height().saturating_sub(n))
                 }
                 parsed_dfs.push(df.slice(0, len));
                 break;
@@ -162,9 +155,13 @@ pub(crate) fn finish_reader<R: ArrowReader>(
     }
 }
 
+static CLOUD_URL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(s3a?|gs|gcs|file|abfss?|azure|az|adl|https?)://").unwrap());
+
 /// Check if the path is a cloud url.
 pub fn is_cloud_url<P: AsRef<Path>>(p: P) -> bool {
-    p.as_ref().starts_with("s3://")
-        || p.as_ref().starts_with("file://")
-        || p.as_ref().starts_with("gcs://")
+    match p.as_ref().as_os_str().to_str() {
+        Some(s) => CLOUD_URL.is_match(s),
+        _ => false,
+    }
 }

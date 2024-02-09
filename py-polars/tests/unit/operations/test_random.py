@@ -14,7 +14,7 @@ def test_shuffle_group_by_reseed() -> None:
         shuffled = df.group_by("group", maintain_order=True).agg(
             pl.col("l").shuffle(seed)
         )
-        num_unique = shuffled.group_by("l").agg(pl.lit(0)).select(pl.count())
+        num_unique = shuffled.group_by("l").agg(pl.lit(0)).select(pl.len())
         return int(num_unique[0, 0])
 
     assert unique_shuffle_groups(50, None) > 1  # Astronomically unlikely.
@@ -50,8 +50,41 @@ def test_sample_expr() -> None:
 def test_sample_df() -> None:
     df = pl.DataFrame({"foo": [1, 2, 3], "bar": [6, 7, 8], "ham": ["a", "b", "c"]})
 
+    assert df.sample().shape == (1, 3)
     assert df.sample(n=2, seed=0).shape == (2, 3)
     assert df.sample(fraction=0.4, seed=0).shape == (1, 3)
+    assert df.sample(n=pl.Series([2]), seed=0).shape == (2, 3)
+    assert df.sample(fraction=pl.Series([0.4]), seed=0).shape == (1, 3)
+    assert df.select(pl.col("foo").sample(n=pl.Series([2]), seed=0)).shape == (2, 1)
+    assert df.select(pl.col("foo").sample(fraction=pl.Series([0.4]), seed=0)).shape == (
+        1,
+        1,
+    )
+    with pytest.raises(ValueError, match="cannot specify both `n` and `fraction`"):
+        df.sample(n=2, fraction=0.4)
+
+
+def test_sample_n_expr() -> None:
+    df = pl.DataFrame(
+        {
+            "group": [1, 1, 1, 2, 2, 2],
+            "val": [1, 2, 3, 2, 1, 1],
+        }
+    )
+
+    out_df = df.sample(pl.Series([3]), seed=0)
+    expected_df = pl.DataFrame({"group": [2, 2, 1], "val": [1, 1, 3]})
+    assert_frame_equal(out_df, expected_df)
+
+    agg_df = df.group_by("group", maintain_order=True).agg(
+        pl.col("val").sample(pl.col("val").max(), seed=0)
+    )
+    expected_df = pl.DataFrame({"group": [1, 2], "val": [[1, 2, 3], [1, 1]]})
+    assert_frame_equal(agg_df, expected_df)
+
+    select_df = df.select(pl.col("val").sample(pl.col("val").max(), seed=0))
+    expected_df = pl.DataFrame({"val": [1, 1, 3]})
+    assert_frame_equal(select_df, expected_df)
 
 
 def test_sample_empty_df() -> None:

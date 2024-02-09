@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use polars_arrow::error::PolarsResult;
 use polars_core::prelude::{DataType, Field, *};
 use polars_core::series::Series;
+use polars_error::PolarsResult;
 use polars_lazy::prelude::IntoLazy;
 use polars_plan::prelude::{GetOutput, UserDefinedFunction};
 use polars_sql::function_registry::FunctionRegistry;
@@ -97,7 +97,7 @@ fn test_udfs() -> PolarsResult<()> {
         "b" => &[1, 2, 3],
         "my_div" => &[1, 1, 1]
     }?;
-    assert!(expected.frame_equal_missing(&res));
+    assert!(expected.equals_missing(&res));
 
     Ok(())
 }

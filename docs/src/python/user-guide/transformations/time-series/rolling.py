@@ -1,6 +1,7 @@
 # --8<-- [start:setup]
-import polars as pl
 from datetime import date, datetime
+
+import polars as pl
 
 # --8<-- [end:setup]
 
@@ -29,17 +30,11 @@ df = (
     .to_frame()
 )
 
-out = (
-    df.group_by_dynamic("time", every="1mo", period="1mo", closed="left")
-    .agg(
-        [
-            pl.col("time").cumcount().reverse().head(3).alias("day/eom"),
-            ((pl.col("time") - pl.col("time").first()).last().dt.days() + 1).alias(
-                "days_in_month"
-            ),
-        ]
-    )
-    .explode("day/eom")
+out = df.group_by_dynamic("time", every="1mo", period="1mo", closed="left").agg(
+    pl.col("time").cum_count().reverse().head(3).alias("day/eom"),
+    ((pl.col("time") - pl.col("time").first()).last().dt.total_days() + 1).alias(
+        "days_in_month"
+    ),
 )
 print(out)
 # --8<-- [end:group_by_dyn]
@@ -66,10 +61,6 @@ out = df.group_by_dynamic(
     closed="both",
     by="groups",
     include_boundaries=True,
-).agg(
-    [
-        pl.count(),
-    ]
-)
+).agg(pl.len())
 print(out)
 # --8<-- [end:group_by_dyn2]

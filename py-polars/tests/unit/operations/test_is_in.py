@@ -5,7 +5,8 @@ from datetime import date
 import pytest
 
 import polars as pl
-from polars.testing import assert_series_equal
+from polars import StringCache
+from polars.testing import assert_frame_equal, assert_series_equal
 
 
 def test_struct_logical_is_in() -> None:
@@ -31,7 +32,7 @@ def test_struct_logical_is_in() -> None:
 def test_is_in_bool() -> None:
     vals = [True, None]
     df = pl.DataFrame({"A": [True, False, None]})
-    assert df.select(pl.col("A").is_in(vals)).to_dict(False) == {
+    assert df.select(pl.col("A").is_in(vals)).to_dict(as_series=False) == {
         "A": [True, False, None]
     }
 
@@ -50,9 +51,9 @@ def test_is_in_empty_list_4639() -> None:
     df = pl.DataFrame({"a": [1, None]})
     empty_list: list[int] = []
 
-    assert df.with_columns([pl.col("a").is_in(empty_list).alias("a_in_list")]).to_dict(
-        False
-    ) == {"a": [1, None], "a_in_list": [False, None]}
+    result = df.with_columns([pl.col("a").is_in(empty_list).alias("a_in_list")])
+    expected = pl.DataFrame({"a": [1, None], "a_in_list": [False, None]})
+    assert_frame_equal(result, expected)
 
 
 def test_is_in_struct() -> None:
@@ -66,7 +67,9 @@ def test_is_in_struct() -> None:
         }
     )
 
-    assert df.filter(pl.col("struct_elem").is_in("struct_list")).to_dict(False) == {
+    assert df.filter(pl.col("struct_elem").is_in("struct_list")).to_dict(
+        as_series=False
+    ) == {
         "struct_elem": [{"a": 1, "b": 11}],
         "struct_list": [[{"a": 1, "b": 11}, {"a": 2, "b": 12}, {"a": 3, "b": 13}]],
     }
@@ -80,7 +83,12 @@ def test_is_in_null_prop() -> None:
         .item()
         is None
     )
-    assert pl.Series([None], dtype=pl.Boolean).is_in(pl.Series([42])).item() is None
+    with pytest.raises(
+        pl.InvalidOperationError,
+        match="`is_in` cannot check for Int64 values in Boolean data",
+    ):
+        _res = pl.Series([None], dtype=pl.Boolean).is_in(pl.Series([42])).item()
+
     assert (
         pl.Series([{"a": None}], dtype=pl.Struct({"a": pl.Boolean}))
         .is_in(pl.Series([{"a": 42}]))
@@ -100,19 +108,14 @@ def test_is_in_float_list_10764() -> None:
             "n": [3.0, 2.0],
         }
     )
-
-    assert df.select(pl.col("n").is_in("lst").alias("is_in")).to_dict(False) == {
-        "is_in": [True, False]
-    }
+    assert df.select(pl.col("n").is_in("lst").alias("is_in")).to_dict(
+        as_series=False
+    ) == {"is_in": [True, False]}
 
 
 def test_is_in_df() -> None:
     df = pl.DataFrame({"a": [1, 2, 3]})
-    assert df.select(pl.col("a").is_in([1, 2]))["a"].to_list() == [
-        True,
-        True,
-        False,
-    ]
+    assert df.select(pl.col("a").is_in([1, 2]))["a"].to_list() == [True, True, False]
 
 
 def test_is_in_series() -> None:
@@ -121,7 +124,7 @@ def test_is_in_series() -> None:
     out = s.is_in(["a", "b"])
     assert out.to_list() == [True, True, False]
 
-    # Check if empty list is converted to pl.Utf8.
+    # Check if empty list is converted to pl.String
     out = s.is_in([])
     assert out.to_list() == [False] * out.len()
 
@@ -136,7 +139,10 @@ def test_is_in_series() -> None:
     ]
     assert df.select(pl.col("b").is_in([])).to_series().to_list() == [False] * df.height
 
-    with pytest.raises(pl.ComputeError, match=r"cannot compare"):
+    with pytest.raises(
+        pl.InvalidOperationError,
+        match=r"`is_in` cannot check for String values in Int64 data",
+    ):
         df.select(pl.col("b").is_in(["x", "x"]))
 
     # check we don't shallow-copy and accidentally modify 'a' (see: #10072)
@@ -147,6 +153,162 @@ def test_is_in_series() -> None:
     assert_series_equal(b, pl.Series("b", [True, False]))
 
 
+def test_is_in_null() -> None:
+    s = pl.Series([None, None], dtype=pl.Null)
+    result = s.is_in([1, 2, None])
+    expected = pl.Series([None, None], dtype=pl.Boolean)
+    assert_series_equal(result, expected)
+
+
 def test_is_in_invalid_shape() -> None:
     with pytest.raises(pl.ComputeError):
         pl.Series("a", [1, 2, 3]).is_in([[]])
+
+
+@pytest.mark.parametrize("dtype", [pl.Float32, pl.Float64])
+def test_is_in_float(dtype: pl.PolarsDataType) -> None:
+    s = pl.Series([float("nan"), 0.0], dtype=dtype)
+    result = s.is_in([-0.0, -float("nan")])
+    expected = pl.Series([True, True], dtype=pl.Boolean)
+    assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("df", "matches", "expected_error"),
+    [
+        (
+            pl.DataFrame({"a": [1, 2], "b": [[1.0, 2.5], [3.0, 4.0]]}),
+            [True, False],
+            None,
+        ),
+        (
+            pl.DataFrame({"a": [2.5, 3.0], "b": [[1, 2], [3, 4]]}),
+            [False, True],
+            None,
+        ),
+        (
+            pl.DataFrame(
+                {"a": [None, None], "b": [[1, 2], [3, 4]]},
+                schema_overrides={"a": pl.Null},
+            ),
+            [None, None],
+            None,
+        ),
+        (
+            pl.DataFrame({"a": ["1", "2"], "b": [[1, 2], [3, 4]]}),
+            None,
+            r"`is_in` cannot check for String values in List\(Int64\) data",
+        ),
+        (
+            pl.DataFrame({"a": [date.today(), None], "b": [[1, 2], [3, 4]]}),
+            None,
+            r"`is_in` cannot check for Date values in List\(Int64\) data",
+        ),
+    ],
+)
+def test_is_in_expr_list_series(
+    df: pl.DataFrame, matches: list[bool] | None, expected_error: str | None
+) -> None:
+    expr_is_in = pl.col("a").is_in(pl.col("b"))
+    if matches:
+        assert df.select(expr_is_in).to_series().to_list() == matches
+    else:
+        with pytest.raises(pl.InvalidOperationError, match=expected_error):
+            df.select(expr_is_in)
+
+
+def test_is_in_null_series() -> None:
+    df = pl.DataFrame({"a": ["a", "b", None]})
+    result = df.select(pl.col("a").is_in([None]))
+    expected = pl.DataFrame({"a": [False, False, None]})
+    assert_frame_equal(result, expected)
+
+
+def test_is_in_int_range() -> None:
+    r = pl.int_range(0, 3, eager=False)
+    out = pl.select(r.is_in([1, 2])).to_series()
+    assert out.to_list() == [False, True, True]
+
+    r = pl.int_range(0, 3, eager=True)  # type: ignore[assignment]
+    out = r.is_in([1, 2])  # type: ignore[assignment]
+    assert out.to_list() == [False, True, True]
+
+
+def test_is_in_date_range() -> None:
+    r = pl.date_range(date(2023, 1, 1), date(2023, 1, 3), eager=False)
+    out = pl.select(r.is_in([date(2023, 1, 2), date(2023, 1, 3)])).to_series()
+    assert out.to_list() == [False, True, True]
+
+    r = pl.date_range(date(2023, 1, 1), date(2023, 1, 3), eager=True)  # type: ignore[assignment]
+    out = r.is_in([date(2023, 1, 2), date(2023, 1, 3)])  # type: ignore[assignment]
+    assert out.to_list() == [False, True, True]
+
+
+@StringCache()
+@pytest.mark.parametrize("dtype", [pl.Categorical, pl.Enum(["a", "b", "c"])])
+def test_cat_is_in_series(dtype: pl.DataType) -> None:
+    s = pl.Series(["a", "b", "c", None], dtype=dtype)
+    s2 = pl.Series(["b", "c"], dtype=dtype)
+    expected = pl.Series([False, True, True, None])
+    assert_series_equal(s.is_in(s2), expected)
+
+    s2_str = s2.cast(pl.String)
+    assert_series_equal(s.is_in(s2_str), expected)
+
+
+@StringCache()
+def test_cat_is_in_series_non_existent() -> None:
+    dtype = pl.Categorical
+    s = pl.Series(["a", "b", "c", None], dtype=dtype)
+    s2 = pl.Series(["a", "d", "e"], dtype=dtype)
+    expected = pl.Series([True, False, False, None])
+    assert_series_equal(s.is_in(s2), expected)
+
+    s2_str = s2.cast(pl.String)
+    assert_series_equal(s.is_in(s2_str), expected)
+
+
+@StringCache()
+def test_enum_is_in_series_non_existent() -> None:
+    dtype = pl.Enum(["a", "b", "c"])
+    s = pl.Series(["a", "b", "c", None], dtype=dtype)
+    s2_str = pl.Series(["a", "d", "e"])
+    expected = pl.Series([True, False, False, None])
+    assert_series_equal(s.is_in(s2_str), expected)
+
+
+@StringCache()
+@pytest.mark.parametrize("dtype", [pl.Categorical, pl.Enum(["a", "b", "c"])])
+def test_cat_is_in_with_lit_str(dtype: pl.DataType) -> None:
+    s = pl.Series(["a", "b", "c", None], dtype=dtype)
+    lit = ["b"]
+    expected = pl.Series([False, True, False, None])
+
+    assert_series_equal(s.is_in(lit), expected)
+
+
+@StringCache()
+@pytest.mark.parametrize("dtype", [pl.Categorical, pl.Enum(["a", "b", "c"])])
+def test_cat_is_in_with_lit_str_non_existent(dtype: pl.DataType) -> None:
+    s = pl.Series(["a", "b", "c", None], dtype=dtype)
+    lit = ["d"]
+    expected = pl.Series([False, False, False, None])
+
+    assert_series_equal(s.is_in(lit), expected)
+
+
+@StringCache()
+@pytest.mark.parametrize("dtype", [pl.Categorical, pl.Enum(["a", "b", "c"])])
+def test_cat_is_in_with_lit_str_cache_setup(dtype: pl.DataType) -> None:
+    # init the global cache
+    _ = pl.Series(["c", "b", "a"], dtype=dtype)
+
+    assert_series_equal(pl.Series(["a"], dtype=dtype).is_in(["a"]), pl.Series([True]))
+    assert_series_equal(pl.Series(["b"], dtype=dtype).is_in(["b"]), pl.Series([True]))
+    assert_series_equal(pl.Series(["c"], dtype=dtype).is_in(["c"]), pl.Series([True]))
+
+
+def test_is_in_with_wildcard_13809() -> None:
+    out = pl.DataFrame({"A": ["B"]}).select(pl.all().is_in(["C"]))
+    expected = pl.DataFrame({"A": [False]})
+    assert_frame_equal(out, expected)

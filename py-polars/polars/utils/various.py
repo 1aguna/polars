@@ -13,22 +13,25 @@ from typing import TYPE_CHECKING, Any, Generator, Iterable, Literal, Sequence, T
 import polars as pl
 from polars import functions as F
 from polars.datatypes import (
+    FLOAT_DTYPES,
+    INTEGER_DTYPES,
     Boolean,
     Date,
     Datetime,
+    Decimal,
     Duration,
     Int64,
+    String,
     Time,
-    Utf8,
-    unpack_dtypes,
 )
-from polars.dependencies import _PYARROW_AVAILABLE
+from polars.dependencies import _check_for_numpy
+from polars.dependencies import numpy as np
 
 if TYPE_CHECKING:
     from collections.abc import Reversible
 
-    from polars import DataFrame, Series
-    from polars.type_aliases import PolarsDataType, PolarsIntegerType, SizeUnit
+    from polars import DataFrame
+    from polars.type_aliases import PolarsDataType, SizeUnit
 
     if sys.version_info >= (3, 10):
         from typing import ParamSpec, TypeGuard
@@ -66,18 +69,41 @@ def _is_iterable_of(val: Iterable[object], eltype: type | tuple[type, ...]) -> b
     return all(isinstance(x, eltype) for x in val)
 
 
-def is_bool_sequence(val: object) -> TypeGuard[Sequence[bool]]:
+def is_bool_sequence(
+    val: object, *, include_series: bool = False
+) -> TypeGuard[Sequence[bool]]:
     """Check whether the given sequence is a sequence of booleans."""
+    if _check_for_numpy(val) and isinstance(val, np.ndarray):
+        return val.dtype == np.bool_
+    elif include_series and isinstance(val, pl.Series):
+        return val.dtype == pl.Boolean
     return isinstance(val, Sequence) and _is_iterable_of(val, bool)
 
 
-def is_int_sequence(val: object) -> TypeGuard[Sequence[int]]:
+def is_int_sequence(
+    val: object, *, include_series: bool = False
+) -> TypeGuard[Sequence[int]]:
     """Check whether the given sequence is a sequence of integers."""
+    if _check_for_numpy(val) and isinstance(val, np.ndarray):
+        return np.issubdtype(val.dtype, np.integer)
+    elif include_series and isinstance(val, pl.Series):
+        return val.dtype.is_integer()
     return isinstance(val, Sequence) and _is_iterable_of(val, int)
 
 
+def is_sequence(
+    val: object, *, include_series: bool = False
+) -> TypeGuard[Sequence[Any]]:
+    """Check whether the given input is a numpy array or python sequence."""
+    return (
+        (_check_for_numpy(val) and isinstance(val, np.ndarray))
+        or isinstance(val, (pl.Series, Sequence) if include_series else Sequence)
+        and not isinstance(val, str)
+    )
+
+
 def is_str_sequence(
-    val: object, *, allow_str: bool = False
+    val: object, *, allow_str: bool = False, include_series: bool = False
 ) -> TypeGuard[Sequence[str]]:
     """
     Check that `val` is a sequence of strings.
@@ -87,21 +113,44 @@ def is_str_sequence(
     """
     if allow_str is False and isinstance(val, str):
         return False
+    elif _check_for_numpy(val) and isinstance(val, np.ndarray):
+        return np.issubdtype(val.dtype, np.str_)
+    elif include_series and isinstance(val, pl.Series):
+        return val.dtype == pl.String
     return isinstance(val, Sequence) and _is_iterable_of(val, str)
 
 
+def is_column(obj: Any) -> bool:
+    """Indicate if the given object is a basic/unaliased column."""
+    from polars.expr import Expr
+
+    return isinstance(obj, Expr) and obj.meta.is_column()
+
+
+def warn_null_comparison(obj: Any) -> None:
+    """Warn for possibly unintentional comparisons with None."""
+    if obj is None:
+        warnings.warn(
+            "Comparisons with None always result in null. Consider using `.is_null()` or `.is_not_null()`.",
+            UserWarning,
+            stacklevel=find_stacklevel(),
+        )
+
+
 def range_to_series(
-    name: str, rng: range, dtype: PolarsIntegerType | None = None
-) -> Series:
+    name: str, rng: range, dtype: PolarsDataType | None = None
+) -> pl.Series:
     """Fast conversion of the given range to a Series."""
     dtype = dtype or Int64
-    return F.int_range(
-        start=rng.start,
-        end=rng.stop,
-        step=rng.step,
-        dtype=dtype,
-        eager=True,
-    ).alias(name)
+    if dtype.is_integer():
+        range = F.int_range(  # type: ignore[call-overload]
+            start=rng.start, end=rng.stop, step=rng.step, dtype=dtype, eager=True
+        )
+    else:
+        range = F.int_range(
+            start=rng.start, end=rng.stop, step=rng.step, eager=True
+        ).cast(dtype)
+    return range.alias(name)
 
 
 def range_to_slice(rng: range) -> slice:
@@ -121,28 +170,25 @@ def handle_projection_columns(
         elif is_int_sequence(columns):
             projection = list(columns)
         elif not is_str_sequence(columns):
-            raise TypeError(
-                "'columns' arg should contain a list of all integers or all strings values"
-            )
+            msg = "`columns` arg should contain a list of all integers or all strings values"
+            raise TypeError(msg)
         else:
             new_columns = columns
         if columns and len(set(columns)) != len(columns):
-            raise ValueError(
-                f"`columns` arg should only have unique values. Got {columns!r}"
-            )
+            msg = f"`columns` arg should only have unique values, got {columns!r}"
+            raise ValueError(msg)
         if projection and len(set(projection)) != len(projection):
-            raise ValueError(
-                f"`columns` arg should only have unique values. Got {projection!r}"
-            )
+            msg = f"`columns` arg should only have unique values, got {projection!r}"
+            raise ValueError(msg)
     return projection, new_columns
 
 
-def _prepare_row_count_args(
-    row_count_name: str | None = None,
-    row_count_offset: int = 0,
+def _prepare_row_index_args(
+    row_index_name: str | None = None,
+    row_index_offset: int = 0,
 ) -> tuple[str, int] | None:
-    if row_count_name is not None:
-        return (row_count_name, row_count_offset)
+    if row_index_name is not None:
+        return (row_index_name, row_index_offset)
     else:
         return None
 
@@ -168,18 +214,6 @@ def arrlen(obj: Any) -> int | None:
         return None
 
 
-def can_create_dicts_with_pyarrow(dtypes: Sequence[PolarsDataType]) -> bool:
-    """Check if the given dtypes can be used to create dicts with pyarrow fast path."""
-    # TODO: have our own fast-path for dict iteration in Rust
-    return (
-        _PYARROW_AVAILABLE
-        # note: 'ns' precision instantiates values as pandas types - avoid
-        and not any(
-            (getattr(tp, "time_unit", None) == "ns") for tp in unpack_dtypes(*dtypes)
-        )
-    )
-
-
 def normalize_filepath(path: str | Path, *, check_not_directory: bool = True) -> str:
     """Create a string path, expanding the home directory if present."""
     # don't use pathlib here as it modifies slashes (s3:// -> s3:/)
@@ -189,7 +223,8 @@ def normalize_filepath(path: str | Path, *, check_not_directory: bool = True) ->
         and os.path.exists(path)  # noqa: PTH110
         and os.path.isdir(path)  # noqa: PTH112
     ):
-        raise IsADirectoryError(f"expected a file path; {path!r} is a directory")
+        msg = f"expected a file path; {path!r} is a directory"
+        raise IsADirectoryError(msg)
     return path
 
 
@@ -220,9 +255,8 @@ def scale_bytes(sz: int, unit: SizeUnit) -> int | float:
     elif unit in {"tb", "terabytes"}:
         return sz / 1024**4
     else:
-        raise ValueError(
-            f"unit must be one of {{'b', 'kb', 'mb', 'gb', 'tb'}}, got {unit!r}"
-        )
+        msg = f"`unit` must be one of {{'b', 'kb', 'mb', 'gb', 'tb'}}, got {unit!r}"
+        raise ValueError(msg)
 
 
 def _cast_repr_strings_with_schema(
@@ -242,15 +276,13 @@ def _cast_repr_strings_with_schema(
     -----
     Table repr strings are less strict (or different) than equivalent CSV data, so need
     special handling; as this function is only used for reprs, parsing is flexible.
-
     """
     tp: PolarsDataType | None
     if not df.is_empty():
         for tp in df.schema.values():
-            if tp != Utf8:
-                raise TypeError(
-                    f"DataFrame should contain only Utf8 string repr data; found {tp!r}"
-                )
+            if tp != String:
+                msg = f"DataFrame should contain only String repr data; found {tp!r}"
+                raise TypeError(msg)
 
     # duration string scaling
     ns_sec = 1_000_000_000
@@ -284,7 +316,7 @@ def _cast_repr_strings_with_schema(
                 tp_base = Datetime(tp.time_unit)  # type: ignore[union-attr]
                 d = F.col(c).str.replace(r"[A-Z ]+$", "")
                 cast_cols[c] = (
-                    F.when(d.str.lengths() == 19)
+                    F.when(d.str.len_bytes() == 19)
                     .then(d + ".000000000")
                     .otherwise(d + "000000000")
                     .str.slice(0, 29)
@@ -296,7 +328,7 @@ def _cast_repr_strings_with_schema(
                 cast_cols[c] = F.col(c).str.strptime(tp, "%Y-%m-%d")  # type: ignore[arg-type]
             elif tp == Time:
                 cast_cols[c] = (
-                    F.when(F.col(c).str.lengths() == 8)
+                    F.when(F.col(c).str.len_bytes() == 8)
                     .then(F.col(c) + ".000000000")
                     .otherwise(F.col(c) + "000000000")
                     .str.slice(0, 18)
@@ -310,8 +342,36 @@ def _cast_repr_strings_with_schema(
                     .cast(tp)
                 )
             elif tp == Boolean:
-                cast_cols[c] = F.col(c).map_dict(
-                    {"true": True, "false": False}, return_dtype=Boolean
+                cast_cols[c] = F.col(c).replace(
+                    {"true": True, "false": False},
+                    default=None,
+                )
+            elif tp in INTEGER_DTYPES:
+                int_string = F.col(c).str.replace_all(r"[^\d+-]", "")
+                cast_cols[c] = (
+                    pl.when(int_string.str.len_bytes() > 0).then(int_string).cast(tp)
+                )
+            elif tp in FLOAT_DTYPES or tp.base_type() == Decimal:
+                # identify integer/fractional parts
+                integer_part = F.col(c).str.replace(r"^(.*)\D(\d*)$", "$1")
+                fractional_part = F.col(c).str.replace(r"^(.*)\D(\d*)$", "$2")
+                cast_cols[c] = (
+                    # check for empty string and/or integer format
+                    pl.when(F.col(c).str.contains(r"^[+-]?\d*$"))
+                    .then(pl.when(F.col(c).str.len_bytes() > 0).then(F.col(c)))
+                    # check for scientific notation
+                    .when(F.col(c).str.contains("[eE]"))
+                    .then(F.col(c).str.replace(r"[^eE\d]", "."))
+                    .otherwise(
+                        # recombine sanitised integer/fractional components
+                        pl.concat_str(
+                            integer_part.str.replace_all(r"[^\d+-]", ""),
+                            fractional_part,
+                            separator=".",
+                        )
+                    )
+                    .cast(String)
+                    .cast(tp)
                 )
             elif tp != df.schema[c]:
                 cast_cols[c] = F.col(c).cast(tp)
@@ -335,8 +395,8 @@ class sphinx_accessor(property):  # noqa: D101
             return self.fget(  # type: ignore[misc]
                 instance if isinstance(instance, cls) else cls
             )
-        except AttributeError:
-            return None  # type: ignore[return-value]
+        except (AttributeError, ImportError):
+            return self  # type: ignore[return-value]
 
 
 class _NoDefault(Enum):
@@ -362,7 +422,7 @@ def find_stacklevel() -> int:
     Taken from:
     https://github.com/pandas-dev/pandas/blob/ab89c53f48df67709a533b6a95ce3d911871a0a8/pandas/util/_exceptions.py#L30-L51
     """
-    pkg_dir = Path(pl.__file__).parent
+    pkg_dir = str(Path(pl.__file__).parent)
 
     # https://stackoverflow.com/questions/17407119/python-inspect-stack-is-slow
     frame = inspect.currentframe()
@@ -370,7 +430,11 @@ def find_stacklevel() -> int:
     try:
         while frame:
             fname = inspect.getfile(frame)
-            if fname.startswith(str(pkg_dir)):
+            if fname.startswith(pkg_dir) or (
+                (qualname := getattr(frame.f_code, "co_qualname", None))
+                # ignore @singledispatch wrappers
+                and qualname.startswith("singledispatch.")
+            ):
                 frame = frame.f_back
                 n += 1
             else:
@@ -398,12 +462,11 @@ def _get_stack_locals(
     of_type
         Only return objects of this type.
     n_objects
-        If specified, return only the most recent ``n`` matching objects.
+        If specified, return only the most recent `n` matching objects.
     n_frames
-        If specified, look at objects in the last ``n`` stack frames only.
+        If specified, look at objects in the last `n` stack frames only.
     named
         If specified, only return objects matching the given name(s).
-
     """
     if isinstance(named, str):
         named = (named,)
@@ -441,9 +504,10 @@ def _get_stack_locals(
 
 
 # this is called from rust
-def _polars_warn(msg: str) -> None:
+def _polars_warn(msg: str, category: type[Warning] = UserWarning) -> None:
     warnings.warn(
         msg,
+        category=category,
         stacklevel=find_stacklevel(),
     )
 
@@ -469,7 +533,9 @@ def in_terminal_that_supports_colour() -> bool:
     return False
 
 
-def parse_percentiles(percentiles: Sequence[float] | float | None) -> Sequence[float]:
+def parse_percentiles(
+    percentiles: Sequence[float] | float | None, *, inject_median: bool = False
+) -> Sequence[float]:
     """
     Transforms raw percentiles into our preferred format, adding the 50th percentile.
 
@@ -481,12 +547,15 @@ def parse_percentiles(percentiles: Sequence[float] | float | None) -> Sequence[f
     elif percentiles is None:
         percentiles = []
     if not all((0 <= p <= 1) for p in percentiles):
-        raise ValueError("percentiles must all be in the range [0, 1]")
+        msg = "`percentiles` must all be in the range [0, 1]"
+        raise ValueError(msg)
 
     sub_50_percentiles = sorted(p for p in percentiles if p < 0.5)
     at_or_above_50_percentiles = sorted(p for p in percentiles if p >= 0.5)
 
-    if not at_or_above_50_percentiles or at_or_above_50_percentiles[0] != 0.5:
+    if inject_median and (
+        not at_or_above_50_percentiles or at_or_above_50_percentiles[0] != 0.5
+    ):
         at_or_above_50_percentiles = [0.5, *at_or_above_50_percentiles]
 
     return [*sub_50_percentiles, *at_or_above_50_percentiles]

@@ -15,7 +15,7 @@ pub enum LiteralValue {
     /// A binary true or false.
     Boolean(bool),
     /// A UTF8 encoded string type.
-    Utf8(String),
+    String(String),
     /// A raw binary array
     Binary(Vec<u8>),
     /// An unsigned 8-bit integer number.
@@ -63,7 +63,15 @@ impl LiteralValue {
         matches!(self, LiteralValue::Float32(_) | LiteralValue::Float64(_))
     }
 
-    pub fn to_anyvalue(&self) -> Option<AnyValue> {
+    pub(crate) fn projects_as_scalar(&self) -> bool {
+        match self {
+            LiteralValue::Range { low, high, .. } => high.saturating_sub(*low) == 1,
+            LiteralValue::Series(s) => s.len() == 1,
+            _ => true,
+        }
+    }
+
+    pub fn to_any_value(&self) -> Option<AnyValue> {
         use LiteralValue::*;
         let av = match self {
             Null => AnyValue::Null,
@@ -82,7 +90,7 @@ impl LiteralValue {
             Int64(v) => AnyValue::Int64(*v),
             Float32(v) => AnyValue::Float32(*v),
             Float64(v) => AnyValue::Float64(*v),
-            Utf8(v) => AnyValue::Utf8(v),
+            String(v) => AnyValue::String(v),
             #[cfg(feature = "dtype-duration")]
             Duration(v, tu) => AnyValue::Duration(*v, *tu),
             #[cfg(feature = "dtype-date")]
@@ -114,14 +122,14 @@ impl LiteralValue {
             LiteralValue::Int64(_) => DataType::Int64,
             LiteralValue::Float32(_) => DataType::Float32,
             LiteralValue::Float64(_) => DataType::Float64,
-            LiteralValue::Utf8(_) => DataType::Utf8,
+            LiteralValue::String(_) => DataType::String,
             LiteralValue::Binary(_) => DataType::Binary,
             LiteralValue::Range { data_type, .. } => data_type.clone(),
-            #[cfg(all(feature = "temporal", feature = "dtype-date"))]
+            #[cfg(feature = "dtype-date")]
             LiteralValue::Date(_) => DataType::Date,
-            #[cfg(all(feature = "temporal", feature = "dtype-datetime"))]
+            #[cfg(feature = "dtype-datetime")]
             LiteralValue::DateTime(_, tu, tz) => DataType::Datetime(*tu, tz.clone()),
-            #[cfg(all(feature = "temporal", feature = "dtype-duration"))]
+            #[cfg(feature = "dtype-duration")]
             LiteralValue::Duration(_, tu) => DataType::Duration(*tu),
             LiteralValue::Series(s) => s.dtype().clone(),
             LiteralValue::Null => DataType::Null,
@@ -138,13 +146,13 @@ pub trait Literal {
 
 impl Literal for String {
     fn lit(self) -> Expr {
-        Expr::Literal(LiteralValue::Utf8(self))
+        Expr::Literal(LiteralValue::String(self))
     }
 }
 
 impl<'a> Literal for &'a str {
     fn lit(self) -> Expr {
-        Expr::Literal(LiteralValue::Utf8(self.to_owned()))
+        Expr::Literal(LiteralValue::String(self.to_owned()))
     }
 }
 
@@ -166,7 +174,7 @@ impl TryFrom<AnyValue<'_>> for LiteralValue {
         match value {
             AnyValue::Null => Ok(Self::Null),
             AnyValue::Boolean(b) => Ok(Self::Boolean(b)),
-            AnyValue::Utf8(s) => Ok(Self::Utf8(s.to_string())),
+            AnyValue::String(s) => Ok(Self::String(s.to_string())),
             AnyValue::Binary(b) => Ok(Self::Binary(b.to_vec())),
             #[cfg(feature = "dtype-u8")]
             AnyValue::UInt8(u) => Ok(Self::UInt8(u)),
@@ -182,23 +190,23 @@ impl TryFrom<AnyValue<'_>> for LiteralValue {
             AnyValue::Int64(i) => Ok(Self::Int64(i)),
             AnyValue::Float32(f) => Ok(Self::Float32(f)),
             AnyValue::Float64(f) => Ok(Self::Float64(f)),
-            #[cfg(all(feature = "temporal", feature = "dtype-datetime"))]
+            #[cfg(feature = "dtype-date")]
             AnyValue::Date(v) => Ok(LiteralValue::Date(v)),
-            #[cfg(all(feature = "temporal", feature = "dtype-datetime"))]
+            #[cfg(feature = "dtype-datetime")]
             AnyValue::Datetime(value, tu, tz) => Ok(LiteralValue::DateTime(value, tu, tz.clone())),
-            #[cfg(all(feature = "temporal", feature = "dtype-duration"))]
+            #[cfg(feature = "dtype-duration")]
             AnyValue::Duration(value, tu) => Ok(LiteralValue::Duration(value, tu)),
-            #[cfg(all(feature = "temporal", feature = "dtype-datetime"))]
+            #[cfg(feature = "dtype-time")]
             AnyValue::Time(v) => Ok(LiteralValue::Time(v)),
             AnyValue::List(l) => Ok(Self::Series(SpecialEq::new(l))),
-            AnyValue::Utf8Owned(o) => Ok(Self::Utf8(o.into())),
+            AnyValue::StringOwned(o) => Ok(Self::String(o.into())),
             #[cfg(feature = "dtype-categorical")]
-            AnyValue::Categorical(c, rev_mapping, arr) => {
+            AnyValue::Categorical(c, rev_mapping, arr) | AnyValue::Enum(c, rev_mapping, arr) => {
                 if arr.is_null() {
-                    Ok(Self::Utf8(rev_mapping.get(c).to_string()))
+                    Ok(Self::String(rev_mapping.get(c).to_string()))
                 } else {
                     unsafe {
-                        Ok(Self::Utf8(
+                        Ok(Self::String(
                             arr.deref_unchecked().value(c as usize).to_string(),
                         ))
                     }
@@ -247,7 +255,7 @@ impl Literal for Null {
     }
 }
 
-#[cfg(all(feature = "temporal", feature = "dtype-datetime"))]
+#[cfg(feature = "dtype-datetime")]
 impl Literal for NaiveDateTime {
     fn lit(self) -> Expr {
         if in_nanoseconds_window(&self) {
@@ -266,7 +274,7 @@ impl Literal for NaiveDateTime {
     }
 }
 
-#[cfg(all(feature = "temporal", feature = "dtype-duration"))]
+#[cfg(feature = "dtype-duration")]
 impl Literal for ChronoDuration {
     fn lit(self) -> Expr {
         if let Some(value) = self.num_nanoseconds() {
@@ -280,7 +288,7 @@ impl Literal for ChronoDuration {
     }
 }
 
-#[cfg(all(feature = "temporal", feature = "dtype-datetime"))]
+#[cfg(feature = "dtype-datetime")]
 impl Literal for NaiveDate {
     fn lit(self) -> Expr {
         self.and_hms_opt(0, 0, 0).unwrap().lit()
@@ -312,10 +320,26 @@ pub fn lit<L: Literal>(t: L) -> Expr {
 
 impl Hash for LiteralValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        if let Some(v) = self.to_anyvalue() {
-            v.hash_impl(state, true)
-        } else {
-            0.hash(state)
+        std::mem::discriminant(self).hash(state);
+        match self {
+            LiteralValue::Series(s) => {
+                s.dtype().hash(state);
+                s.len().hash(state);
+            },
+            LiteralValue::Range {
+                low,
+                high,
+                data_type,
+            } => {
+                low.hash(state);
+                high.hash(state);
+                data_type.hash(state)
+            },
+            _ => {
+                if let Some(v) = self.to_any_value() {
+                    v.hash_impl(state, true)
+                }
+            },
         }
     }
 }

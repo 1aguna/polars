@@ -10,6 +10,7 @@ pub(crate) struct UnionExec {
 
 impl Executor for UnionExec {
     fn execute(&mut self, state: &mut ExecutionState) -> PolarsResult<DataFrame> {
+        state.should_stop()?;
         #[cfg(debug_assertions)]
         {
             if state.verbose() {
@@ -103,7 +104,13 @@ impl Executor for UnionExec {
                     .collect::<PolarsResult<Vec<_>>>()
             });
 
-            concat_df(out?.iter().flat_map(|dfs| dfs.iter()))
+            concat_df(out?.iter().flat_map(|dfs| dfs.iter())).map(|df| {
+                if let Some((offset, len)) = self.options.slice {
+                    df.slice(offset, len)
+                } else {
+                    df
+                }
+            })
         }
         .map(|mut df| {
             if self.options.rechunk {

@@ -65,10 +65,10 @@ pub(super) fn predicate_to_pa(
             }
         },
         AExpr::Literal(lv) => {
-            let av = lv.to_anyvalue()?;
+            let av = lv.to_any_value()?;
             let dtype = av.dtype();
             match av.as_borrowed() {
-                AnyValue::Utf8(s) => Some(format!("'{s}'")),
+                AnyValue::String(s) => Some(format!("'{s}'")),
                 AnyValue::Boolean(val) => {
                     // python bools are capitalized
                     if val {
@@ -148,7 +148,7 @@ pub(super) fn predicate_to_pa(
             input,
             ..
         } => {
-            let col = predicate_to_pa(*input.get(0)?, expr_arena, args)?;
+            let col = predicate_to_pa(*input.first()?, expr_arena, args)?;
             let mut args = args;
             args.allow_literal_series = true;
             let values = predicate_to_pa(*input.get(1)?, expr_arena, args)?;

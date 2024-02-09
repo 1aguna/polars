@@ -1,6 +1,7 @@
 use super::*;
 
-pub(crate) fn row_count_at_scan(q: LazyFrame) -> bool {
+#[cfg(feature = "parquet")]
+pub(crate) fn row_index_at_scan(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
 
@@ -10,7 +11,7 @@ pub(crate) fn row_count_at_scan(q: LazyFrame) -> bool {
             lp,
             Scan {
                 file_options: FileScanOptions {
-                    row_count: Some(_),
+                    row_index: Some(_),
                     ..
                 },
                 ..
@@ -57,6 +58,7 @@ pub(crate) fn predicate_at_all_scans(q: LazyFrame) -> bool {
     })
 }
 
+#[cfg(feature = "streaming")]
 pub(crate) fn is_pipeline(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
@@ -69,6 +71,7 @@ pub(crate) fn is_pipeline(q: LazyFrame) -> bool {
     )
 }
 
+#[cfg(feature = "streaming")]
 pub(crate) fn has_pipeline(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
@@ -83,6 +86,7 @@ pub(crate) fn has_pipeline(q: LazyFrame) -> bool {
     })
 }
 
+#[cfg(any(feature = "parquet", feature = "csv"))]
 fn slice_at_scan(q: LazyFrame) -> bool {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
@@ -161,11 +165,12 @@ fn test_no_left_join_pass() -> PolarsResult<()> {
         "bar" => [5, 5],
     ]?;
 
-    assert!(out.frame_equal(&expected));
+    assert!(out.equals(&expected));
     Ok(())
 }
 
 #[test]
+#[cfg(feature = "parquet")]
 pub fn test_simple_slice() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q = scan_foods_parquet(false).limit(3);
@@ -185,6 +190,7 @@ pub fn test_simple_slice() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "parquet")]
 #[cfg(feature = "cse")]
 pub fn test_slice_pushdown_join() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
@@ -221,6 +227,7 @@ pub fn test_slice_pushdown_join() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "parquet")]
 pub fn test_slice_pushdown_group_by() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q = scan_foods_parquet(false).limit(100);
@@ -250,6 +257,7 @@ pub fn test_slice_pushdown_group_by() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "parquet")]
 pub fn test_slice_pushdown_sort() -> PolarsResult<()> {
     let _guard = SINGLE_LOCK.lock().unwrap();
     let q = scan_foods_parquet(false).limit(100);
@@ -321,7 +329,7 @@ fn test_lazy_filter_and_rename() {
         "x" => &[4, 5]
     }
     .unwrap();
-    assert!(lf.collect().unwrap().frame_equal(&correct));
+    assert!(lf.collect().unwrap().equals(&correct));
 
     // now we check if the column is rename or added when we don't select
     let lf = df.lazy().rename(["a"], ["x"]).filter(col("x").map(
@@ -335,7 +343,7 @@ fn test_lazy_filter_and_rename() {
 }
 
 #[test]
-fn test_with_row_count_opts() -> PolarsResult<()> {
+fn test_with_row_index_opts() -> PolarsResult<()> {
     let df = df![
         "a" => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     ]?;
@@ -343,23 +351,23 @@ fn test_with_row_count_opts() -> PolarsResult<()> {
     let out = df
         .clone()
         .lazy()
-        .with_row_count("row_nr", None)
+        .with_row_index("index", None)
         .tail(5)
         .collect()?;
     let expected = df![
-        "row_nr" => [5 as IdxSize, 6, 7, 8, 9],
+        "index" => [5 as IdxSize, 6, 7, 8, 9],
         "a" => [5, 6, 7, 8, 9],
     ]?;
 
-    assert!(out.frame_equal(&expected));
+    assert!(out.equals(&expected));
     let out = df
         .clone()
         .lazy()
-        .with_row_count("row_nr", None)
+        .with_row_index("index", None)
         .slice(1, 2)
         .collect()?;
     assert_eq!(
-        out.column("row_nr")?
+        out.column("index")?
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>(),
@@ -369,11 +377,11 @@ fn test_with_row_count_opts() -> PolarsResult<()> {
     let out = df
         .clone()
         .lazy()
-        .with_row_count("row_nr", None)
+        .with_row_index("index", None)
         .filter(col("a").eq(lit(3i32)))
         .collect()?;
     assert_eq!(
-        out.column("row_nr")?
+        out.column("index")?
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>(),
@@ -384,10 +392,10 @@ fn test_with_row_count_opts() -> PolarsResult<()> {
         .clone()
         .lazy()
         .slice(1, 2)
-        .with_row_count("row_nr", None)
+        .with_row_index("index", None)
         .collect()?;
     assert_eq!(
-        out.column("row_nr")?
+        out.column("index")?
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>(),
@@ -397,62 +405,15 @@ fn test_with_row_count_opts() -> PolarsResult<()> {
     let out = df
         .lazy()
         .filter(col("a").eq(lit(3i32)))
-        .with_row_count("row_nr", None)
+        .with_row_index("index", None)
         .collect()?;
     assert_eq!(
-        out.column("row_nr")?
+        out.column("index")?
             .idx()?
             .into_no_null_iter()
             .collect::<Vec<_>>(),
         &[0]
     );
-
-    Ok(())
-}
-
-#[test]
-fn test_group_by_ternary_literal_predicate() -> PolarsResult<()> {
-    let df = df![
-        "a" => [1, 2, 3],
-        "b" => [1, 2, 3]
-    ]?;
-
-    for predicate in [true, false] {
-        let q = df
-            .clone()
-            .lazy()
-            .group_by(["a"])
-            .agg([when(lit(predicate))
-                .then(col("b").sum())
-                .otherwise(NULL.lit())])
-            .sort("a", Default::default());
-
-        let (mut expr_arena, mut lp_arena) = get_arenas();
-        let lp = q.clone().optimize(&mut lp_arena, &mut expr_arena).unwrap();
-
-        (&lp_arena).iter(lp).any(|(_, lp)| {
-            use ALogicalPlan::*;
-            match lp {
-                Aggregate { aggs, .. } => {
-                    for node in aggs {
-                        // we should not have a ternary expression anymore
-                        assert!(!matches!(expr_arena.get(*node), AExpr::Ternary { .. }));
-                    }
-                    false
-                },
-                _ => false,
-            }
-        });
-
-        let out = q.collect()?;
-        let b = out.column("b")?;
-        let b = b.i32()?;
-        if predicate {
-            assert_eq!(Vec::from(b), &[Some(1), Some(2), Some(3)]);
-        } else {
-            assert_eq!(b.null_count(), 3);
-        };
-    }
 
     Ok(())
 }
@@ -483,7 +444,7 @@ fn test_string_addition_to_concat_str() -> PolarsResult<()> {
 
     let out = q.collect()?;
     let s = out.column("literal")?;
-    assert_eq!(s.get(0)?, AnyValue::Utf8("fooabbar"));
+    assert_eq!(s.get(0)?, AnyValue::String("fooabbar"));
 
     Ok(())
 }
@@ -546,6 +507,7 @@ fn test_with_column_prune() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "csv")]
 fn test_slice_at_scan_group_by() -> PolarsResult<()> {
     let ldf = scan_foods_csv();
 

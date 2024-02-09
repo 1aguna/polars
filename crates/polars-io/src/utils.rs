@@ -1,8 +1,11 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use once_cell::sync::Lazy;
+#[cfg(any(feature = "csv", feature = "json"))]
 use polars_core::frame::DataFrame;
 use polars_core::prelude::*;
+use regex::{Regex, RegexBuilder};
 
 use crate::mmap::{MmapBytesReader, ReaderBytes};
 #[cfg(any(
@@ -34,11 +37,6 @@ pub fn get_reader_bytes<'a, R: Read + MmapBytesReader + ?Sized>(
             // we have to read to an owned buffer to get the bytes.
             let mut bytes = Vec::with_capacity(1024 * 128);
             reader.read_to_end(&mut bytes)?;
-            if !bytes.is_empty()
-                && (bytes[bytes.len() - 1] != b'\n' || bytes[bytes.len() - 1] != b'\r')
-            {
-                bytes.push(b'\n')
-            }
             Ok(ReaderBytes::Owned(bytes))
         }
     }
@@ -83,11 +81,9 @@ pub(crate) fn columns_to_projection(
     columns: &[String],
     schema: &ArrowSchema,
 ) -> PolarsResult<Vec<usize>> {
-    use ahash::AHashMap;
-
     let mut prj = Vec::with_capacity(columns.len());
     if columns.len() > 100 {
-        let mut column_names = AHashMap::with_capacity(schema.fields.len());
+        let mut column_names = PlHashMap::with_capacity(schema.fields.len());
         schema.fields.iter().enumerate().for_each(|(i, c)| {
             column_names.insert(c.name.as_str(), i);
         });
@@ -113,6 +109,7 @@ pub(crate) fn columns_to_projection(
 
 /// Because of threading every row starts from `0` or from `offset`.
 /// We must correct that so that they are monotonically increasing.
+#[cfg(any(feature = "csv", feature = "json"))]
 pub(crate) fn update_row_counts(dfs: &mut [(DataFrame, IdxSize)], offset: IdxSize) {
     if !dfs.is_empty() {
         let mut previous = dfs[0].1 + offset;
@@ -127,6 +124,7 @@ pub(crate) fn update_row_counts(dfs: &mut [(DataFrame, IdxSize)], offset: IdxSiz
 
 /// Because of threading every row starts from `0` or from `offset`.
 /// We must correct that so that they are monotonically increasing.
+#[cfg(any(feature = "csv", feature = "json"))]
 pub(crate) fn update_row_counts2(dfs: &mut [DataFrame], offset: IdxSize) {
     if !dfs.is_empty() {
         let mut previous = dfs[0].height() as IdxSize + offset;
@@ -140,6 +138,30 @@ pub(crate) fn update_row_counts2(dfs: &mut [DataFrame], offset: IdxSize) {
     }
 }
 
+/// Compute `remaining_rows_to_read` to be taken per file up front, so we can actually read
+/// concurrently/parallel
+///
+/// This takes an iterator over the number of rows per file.
+pub fn get_sequential_row_statistics<I>(
+    iter: I,
+    mut total_rows_to_read: usize,
+) -> Vec<(usize, usize)>
+where
+    I: Iterator<Item = usize>,
+{
+    let mut cumulative_read = 0;
+    iter.map(|rows_this_file| {
+        let remaining_rows_to_read = total_rows_to_read;
+        total_rows_to_read = total_rows_to_read.saturating_sub(rows_this_file);
+
+        let current_cumulative_read = cumulative_read;
+        cumulative_read += rows_this_file;
+
+        (remaining_rows_to_read, current_cumulative_read)
+    })
+    .collect()
+}
+
 #[cfg(feature = "json")]
 pub(crate) fn overwrite_schema(
     schema: &mut Schema,
@@ -149,6 +171,98 @@ pub(crate) fn overwrite_schema(
         *schema.try_get_mut(k)? = value.clone();
     }
     Ok(())
+}
+
+pub static FLOAT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^[-+]?((\d*\.\d+)([eE][-+]?\d+)?|inf|NaN|(\d+)[eE][-+]?\d+|\d+\.)$").unwrap()
+});
+
+pub static INTEGER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^-?(\d+)$").unwrap());
+
+pub static BOOLEAN_RE: Lazy<Regex> = Lazy::new(|| {
+    RegexBuilder::new(r"^(true|false)$")
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+});
+
+pub fn materialize_projection(
+    with_columns: Option<&[String]>,
+    schema: &Schema,
+    hive_partitions: Option<&[Series]>,
+    has_row_index: bool,
+) -> Option<Vec<usize>> {
+    match hive_partitions {
+        None => with_columns.map(|with_columns| {
+            with_columns
+                .iter()
+                .map(|name| schema.index_of(name).unwrap() - has_row_index as usize)
+                .collect()
+        }),
+        Some(part_cols) => {
+            with_columns.map(|with_columns| {
+                with_columns
+                    .iter()
+                    .flat_map(|name| {
+                        // the hive partitions are added at the end of the schema, but we don't want to project
+                        // them from the file
+                        if part_cols.iter().any(|s| s.name() == name.as_str()) {
+                            None
+                        } else {
+                            Some(schema.index_of(name).unwrap() - has_row_index as usize)
+                        }
+                    })
+                    .collect()
+            })
+        },
+    }
+}
+
+pub fn check_projected_schema_impl(
+    a: &Schema,
+    b: &Schema,
+    projected_names: Option<&[String]>,
+    msg: &str,
+) -> PolarsResult<()> {
+    if !projected_names
+        .map(|projected_names| {
+            projected_names
+                .iter()
+                .all(|name| a.get(name) == b.get(name))
+        })
+        .unwrap_or_else(|| a == b)
+    {
+        polars_bail!(ComputeError: "{msg}\n\n\
+                    Expected: {:?}\n\n\
+                    Got: {:?}", a, b)
+    }
+    Ok(())
+}
+
+/// Checks if the projected columns are equal
+pub fn check_projected_arrow_schema(
+    a: &ArrowSchema,
+    b: &ArrowSchema,
+    projected_names: Option<&[String]>,
+    msg: &str,
+) -> PolarsResult<()> {
+    if a != b {
+        let a = Schema::from(a);
+        let b = Schema::from(b);
+        check_projected_schema_impl(&a, &b, projected_names, msg)
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks if the projected columns are equal
+pub fn check_projected_schema(
+    a: &Schema,
+    b: &Schema,
+    projected_names: Option<&[String]>,
+    msg: &str,
+) -> PolarsResult<()> {
+    check_projected_schema_impl(a, b, projected_names, msg)
 }
 
 #[cfg(test)]

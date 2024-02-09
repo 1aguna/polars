@@ -25,6 +25,33 @@ pub enum NullValues {
     Named(Vec<(String, String)>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CommentPrefix {
+    /// A single byte character that indicates the start of a comment line.
+    Single(u8),
+    /// A string that indicates the start of a comment line.
+    /// This allows for multiple characters to be used as a comment identifier.
+    Multi(String),
+}
+
+impl CommentPrefix {
+    /// Creates a new `CommentPrefix` for the `Single` variant.
+    pub fn new_single(c: u8) -> Self {
+        CommentPrefix::Single(c)
+    }
+
+    /// Creates a new `CommentPrefix`. If `Multi` variant is used and the string is longer
+    /// than 5 characters, it will return `None`.
+    pub fn new_multi(s: String) -> Option<Self> {
+        if s.len() <= 5 {
+            Some(CommentPrefix::Multi(s))
+        } else {
+            None
+        }
+    }
+}
+
 pub(super) enum NullValuesCompiled {
     /// A single value that's used for all columns
     AllColumnsSingle(String),
@@ -109,7 +136,7 @@ where
     projection: Option<Vec<usize>>,
     /// Optional column names to project/ select.
     columns: Option<Vec<String>>,
-    delimiter: Option<u8>,
+    separator: Option<u8>,
     pub(crate) schema: Option<SchemaRef>,
     encoding: CsvEncoding,
     n_threads: Option<usize>,
@@ -118,13 +145,13 @@ where
     dtype_overwrite: Option<&'a [DataType]>,
     sample_size: usize,
     chunk_size: usize,
-    comment_char: Option<u8>,
+    comment_prefix: Option<CommentPrefix>,
     null_values: Option<NullValues>,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     quote_char: Option<u8>,
     skip_rows_after_header: usize,
     try_parse_dates: bool,
-    row_count: Option<RowCount>,
+    row_index: Option<RowIndex>,
     /// Aggregates chunk afterwards to a single chunk.
     rechunk: bool,
     raise_if_empty: bool,
@@ -146,9 +173,9 @@ where
         self
     }
 
-    /// Add a `row_count` column.
-    pub fn with_row_count(mut self, rc: Option<RowCount>) -> Self {
-        self.row_count = rc;
+    /// Add a row index column.
+    pub fn with_row_index(mut self, row_index: Option<RowIndex>) -> Self {
+        self.row_index = row_index;
         self
     }
 
@@ -204,15 +231,27 @@ where
         self
     }
 
-    /// Set the CSV file's column delimiter as a byte character
-    pub fn with_delimiter(mut self, delimiter: u8) -> Self {
-        self.delimiter = Some(delimiter);
+    /// Set the CSV file's column separator as a byte character
+    pub fn with_separator(mut self, separator: u8) -> Self {
+        self.separator = Some(separator);
         self
     }
 
-    /// Set the comment character. Lines starting with this character will be ignored.
-    pub fn with_comment_char(mut self, comment_char: Option<u8>) -> Self {
-        self.comment_char = comment_char;
+    /// Set the comment prefix for this instance. Lines starting with this prefix will be ignored.
+    pub fn with_comment_prefix(mut self, comment_prefix: Option<&str>) -> Self {
+        self.comment_prefix = comment_prefix.map(|s| {
+            if s.len() == 1 && s.chars().next().unwrap().is_ascii() {
+                CommentPrefix::Single(s.as_bytes()[0])
+            } else {
+                CommentPrefix::Multi(s.to_string())
+            }
+        });
+        self
+    }
+
+    /// Sets the comment prefix from `CsvParserOptions` for internal initialization.
+    pub fn _with_comment_prefix(mut self, comment_prefix: Option<CommentPrefix>) -> Self {
+        self.comment_prefix = comment_prefix;
         self
     }
 
@@ -310,12 +349,12 @@ where
     }
 
     /// Set the `char` used as quote char. The default is `b'"'`. If set to `[None]` quoting is disabled.
-    pub fn with_quote_char(mut self, quote: Option<u8>) -> Self {
-        self.quote_char = quote;
+    pub fn with_quote_char(mut self, quote_char: Option<u8>) -> Self {
+        self.quote_char = quote_char;
         self
     }
 
-    /// Automatically try to parse dates/ datetimes and time. If parsing fails, columns remain of dtype `[DataType::Utf8]`.
+    /// Automatically try to parse dates/ datetimes and time. If parsing fails, columns remain of dtype `[DataType::String]`.
     pub fn with_try_parse_dates(mut self, toggle: bool) -> Self {
         self.try_parse_dates = toggle;
         self
@@ -358,7 +397,7 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
             self.skip_rows_before_header,
             std::mem::take(&mut self.projection),
             self.max_records,
-            self.delimiter,
+            self.separator,
             self.has_header,
             self.ignore_errors,
             self.schema.clone(),
@@ -370,7 +409,7 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
             self.sample_size,
             self.chunk_size,
             self.low_memory,
-            self.comment_char,
+            std::mem::take(&mut self.comment_prefix),
             self.quote_char,
             self.eol_char,
             std::mem::take(&mut self.null_values),
@@ -378,7 +417,7 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
             std::mem::take(&mut self.predicate),
             to_cast,
             self.skip_rows_after_header,
-            std::mem::take(&mut self.row_count),
+            std::mem::take(&mut self.row_index),
             self.try_parse_dates,
             self.raise_if_empty,
             self.truncate_ragged_lines,
@@ -396,6 +435,7 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
         let mut _has_categorical = false;
         let mut _err: Option<PolarsError> = None;
 
+        #[allow(unused_mut)]
         let schema = overwriting_schema
             .iter_fields()
             .filter_map(|mut fld| {
@@ -406,14 +446,8 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
                         // let inference decide the column type
                         None
                     },
-                    Int8 | Int16 | UInt8 | UInt16 => {
-                        // We have not compiled these buffers, so we cast them later.
-                        to_cast.push(fld.clone());
-                        fld.coerce(DataType::Int32);
-                        Some(fld)
-                    },
                     #[cfg(feature = "dtype-categorical")]
-                    Categorical(_) => {
+                    Categorical(_, _) => {
                         _has_categorical = true;
                         Some(fld)
                     },
@@ -421,7 +455,7 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
                     Decimal(precision, scale) => match (precision, scale) {
                         (_, Some(_)) => {
                             to_cast.push(fld.clone());
-                            fld.coerce(Utf8);
+                            fld.coerce(String);
                             Some(fld)
                         },
                         _ => {
@@ -481,18 +515,19 @@ impl<'a> CsvReader<'a, Box<dyn MmapBytesReader>> {
 
                 let (inferred_schema, _, _) = infer_file_schema(
                     &reader_bytes,
-                    self.delimiter.unwrap_or(b','),
+                    self.separator.unwrap_or(b','),
                     self.max_records,
                     self.has_header,
                     None,
                     &mut self.skip_rows_before_header,
                     self.skip_rows_after_header,
-                    self.comment_char,
+                    self.comment_prefix.as_ref(),
                     self.quote_char,
                     self.eol_char,
                     self.null_values.as_ref(),
                     self.try_parse_dates,
                     self.raise_if_empty,
+                    &mut self.n_threads,
                 )?;
                 let schema = Arc::new(inferred_schema);
                 Ok(to_batched_owned_mmap(self, schema))
@@ -510,18 +545,19 @@ impl<'a> CsvReader<'a, Box<dyn MmapBytesReader>> {
 
                 let (inferred_schema, _, _) = infer_file_schema(
                     &reader_bytes,
-                    self.delimiter.unwrap_or(b','),
+                    self.separator.unwrap_or(b','),
                     self.max_records,
                     self.has_header,
                     None,
                     &mut self.skip_rows_before_header,
                     self.skip_rows_after_header,
-                    self.comment_char,
+                    self.comment_prefix.as_ref(),
                     self.quote_char,
                     self.eol_char,
                     self.null_values.as_ref(),
                     self.try_parse_dates,
                     self.raise_if_empty,
+                    &mut self.n_threads,
                 )?;
                 let schema = Arc::new(inferred_schema);
                 Ok(to_batched_owned_read(self, schema))
@@ -543,7 +579,7 @@ where
             max_records: Some(128),
             skip_rows_before_header: 0,
             projection: None,
-            delimiter: None,
+            separator: None,
             has_header: true,
             ignore_errors: false,
             schema: None,
@@ -556,7 +592,7 @@ where
             sample_size: 1024,
             chunk_size: 1 << 18,
             low_memory: false,
-            comment_char: None,
+            comment_prefix: None,
             eol_char: b'\n',
             null_values: None,
             missing_is_null: true,
@@ -564,7 +600,7 @@ where
             quote_char: Some(b'"'),
             skip_rows_after_header: 0,
             try_parse_dates: false,
-            row_count: None,
+            row_index: None,
             raise_if_empty: true,
             truncate_ragged_lines: false,
         }
@@ -584,7 +620,7 @@ where
 
             #[cfg(feature = "dtype-categorical")]
             if _has_cat {
-                _cat_lock = Some(polars_core::IUseStringCache::hold())
+                _cat_lock = Some(polars_core::StringCacheHolder::hold())
             }
 
             let mut csv_reader = self.core_reader(Some(Arc::new(schema)), to_cast)?;
@@ -598,11 +634,11 @@ where
                     .map(|schema| {
                         schema
                             .iter_dtypes()
-                            .any(|dtype| matches!(dtype, DataType::Categorical(_)))
+                            .any(|dtype| matches!(dtype, DataType::Categorical(_, _)))
                     })
                     .unwrap_or(false);
                 if has_cat {
-                    _cat_lock = Some(polars_core::IUseStringCache::hold())
+                    _cat_lock = Some(polars_core::StringCacheHolder::hold())
                 }
             }
             let mut csv_reader = self.core_reader(self.schema.clone(), vec![])?;
@@ -648,8 +684,8 @@ fn parse_dates(mut df: DataFrame, fixed_schema: &Schema) -> DataFrame {
         .into_par_iter()
         .map(|s| {
             match s.dtype() {
-                DataType::Utf8 => {
-                    let ca = s.utf8().unwrap();
+                DataType::String => {
+                    let ca = s.str().unwrap();
                     // don't change columns that are in the fixed schema.
                     if fixed_schema.index_of(s.name()).is_some() {
                         return s;

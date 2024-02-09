@@ -23,13 +23,17 @@ These functions are available from the polars module root and can be used as exp
    arctan2d
    arg_sort_by
    arg_where
-   avg
    coalesce
    concat_list
    concat_str
    corr
    count
    cov
+   cum_count
+   cum_fold
+   cum_reduce
+   cum_sum
+   cum_sum_horizontal
    cumfold
    cumreduce
    cumsum
@@ -53,6 +57,7 @@ These functions are available from the polars module root and can be used as exp
    int_range
    int_ranges
    last
+   len
    lit
    map
    map_batches
@@ -60,6 +65,7 @@ These functions are available from the polars module root and can be used as exp
    max
    max_horizontal
    mean
+   mean_horizontal
    median
    min
    min_horizontal

@@ -26,10 +26,13 @@ def test_streaming_group_by_sorted_fast_path_nulls_10273() -> None:
         df.set_sorted("x")
         .lazy()
         .group_by("x")
-        .agg(pl.count())
+        .agg(pl.len())
         .collect(streaming=True)
         .sort("x")
-    ).to_dict(False) == {"x": [None, 0, 1, 2, 3], "count": [100, 100, 100, 100, 100]}
+    ).to_dict(as_series=False) == {
+        "x": [None, 0, 1, 2, 3],
+        "len": [100, 100, 100, 100, 100],
+    }
 
 
 def test_streaming_group_by_types() -> None:
@@ -71,13 +74,13 @@ def test_streaming_group_by_types() -> None:
             .collect(streaming=True)
         )
         assert out.schema == {
-            "str_first": pl.Utf8,
-            "str_last": pl.Utf8,
-            "str_mean": pl.Utf8,
-            "str_sum": pl.Utf8,
+            "str_first": pl.String,
+            "str_last": pl.String,
+            "str_mean": pl.String,
+            "str_sum": pl.String,
             "bool_first": pl.Boolean,
             "bool_last": pl.Boolean,
-            "bool_mean": pl.Boolean,
+            "bool_mean": pl.Float64,
             "bool_sum": pl.UInt32,
             "date_sum": pl.Date,
             "date_mean": pl.Date,
@@ -87,7 +90,7 @@ def test_streaming_group_by_types() -> None:
             "date_max": pl.Date,
         }
 
-        assert out.to_dict(False) == {
+        assert out.to_dict(as_series=False) == {
             "str_first": ["bob"],
             "str_last": ["foo"],
             "str_mean": [None],
@@ -144,18 +147,14 @@ def test_streaming_group_by_min_max() -> None:
 def test_streaming_non_streaming_gb() -> None:
     n = 100
     df = pl.DataFrame({"a": np.random.randint(0, 20, n)})
-    q = df.lazy().group_by("a").agg(pl.count()).sort("a")
+    q = df.lazy().group_by("a").agg(pl.len()).sort("a")
     assert_frame_equal(q.collect(streaming=True), q.collect())
 
-    q = df.lazy().with_columns(pl.col("a").cast(pl.Utf8))
-    q = q.group_by("a").agg(pl.count()).sort("a")
+    q = df.lazy().with_columns(pl.col("a").cast(pl.String))
+    q = q.group_by("a").agg(pl.len()).sort("a")
     assert_frame_equal(q.collect(streaming=True), q.collect())
     q = df.lazy().with_columns(pl.col("a").alias("b"))
-    q = (
-        q.group_by(["a", "b"])
-        .agg(pl.count(), pl.col("a").sum().alias("sum_a"))
-        .sort("a")
-    )
+    q = q.group_by(["a", "b"]).agg(pl.len(), pl.col("a").sum().alias("sum_a")).sort("a")
     assert_frame_equal(q.collect(streaming=True), q.collect())
 
 
@@ -166,7 +165,7 @@ def test_streaming_group_by_sorted_fast_path() -> None:
             # test on int8 as that also tests proper conversions
             "a": pl.Series(np.sort(a), dtype=pl.Int8)
         }
-    ).with_row_count()
+    ).with_row_index()
 
     df_sorted = df.with_columns(pl.col("a").set_sorted())
 
@@ -286,11 +285,11 @@ def test_streaming_group_by_struct_key() -> None:
         {"A": [1, 2, 3, 2], "B": ["google", "ms", "apple", "ms"], "C": [2, 3, 4, 3]}
     )
     df1 = df.lazy().with_columns(pl.struct(["A", "C"]).alias("tuples"))
-    assert df1.group_by("tuples").agg(pl.count(), pl.col("B").first()).sort(
-        "B"
-    ).collect(streaming=True).to_dict(False) == {
+    assert df1.group_by("tuples").agg(pl.len(), pl.col("B").first()).sort("B").collect(
+        streaming=True
+    ).to_dict(as_series=False) == {
         "tuples": [{"A": 3, "C": 4}, {"A": 1, "C": 2}, {"A": 2, "C": 3}],
-        "count": [1, 1, 2],
+        "len": [1, 1, 2],
         "B": ["apple", "google", "ms"],
     }
 
@@ -346,7 +345,7 @@ def test_streaming_group_by_categorical_aggregate() -> None:
             .collect(streaming=True)
         )
 
-    assert out.sort("b").to_dict(False) == {
+    assert out.sort("b").to_dict(as_series=False) == {
         "a": ["a", "a", "b", "b", "c", "c", None, None],
         "b": [
             date(2023, 4, 28),
@@ -369,7 +368,7 @@ def test_streaming_group_by_list_9758() -> None:
         .group_by("a")
         .first()
         .collect(streaming=True)
-        .to_dict(False)
+        .to_dict(as_series=False)
         == payload
     )
 
@@ -389,7 +388,7 @@ def test_streaming_restart_non_streamable_group_by() -> None:
         )  # non-streamable UDF + nested_agg
     )
 
-    assert """--- PIPELINE""" in res.explain(streaming=True)
+    assert """--- STREAMING""" in res.explain(streaming=True)
 
 
 def test_group_by_min_max_string_type() -> None:
@@ -404,7 +403,7 @@ def test_group_by_min_max_string_type() -> None:
             .agg([pl.min("b").alias("min"), pl.max("b").alias("max")])
             .collect(streaming=streaming)
             .sort("a")
-            .to_dict(False)
+            .to_dict(as_series=False)
             == expected
         )
 
@@ -418,8 +417,24 @@ def test_streaming_group_by_literal(literal: Any) -> None:
             pl.col("a").count().alias("a_count"),
             pl.col("a").sum().alias("a_sum"),
         ]
-    ).collect(streaming=True).to_dict(False) == {
+    ).collect(streaming=True).to_dict(as_series=False) == {
         "literal": [literal],
         "a_count": [20],
         "a_sum": [190],
     }
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_group_by_multiple_keys_one_literal(streaming: bool) -> None:
+    df = pl.DataFrame({"a": [1, 1, 2], "b": [4, 5, 6]})
+
+    expected = {"a": [1, 2], "literal": [1, 1], "b": [5, 6]}
+    assert (
+        df.lazy()
+        .group_by("a", pl.lit(1))
+        .agg(pl.col("b").max())
+        .sort(["a", "b"])
+        .collect(streaming=streaming)
+        .to_dict(as_series=False)
+        == expected
+    )

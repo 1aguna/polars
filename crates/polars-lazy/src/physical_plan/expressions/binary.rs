@@ -3,6 +3,8 @@ use std::sync::Arc;
 use polars_core::frame::group_by::GroupsProxy;
 use polars_core::prelude::*;
 use polars_core::POOL;
+#[cfg(feature = "round_series")]
+use polars_ops::prelude::floor_div_series;
 
 use crate::physical_plan::state::ExecutionState;
 use crate::prelude::*;
@@ -74,6 +76,12 @@ pub fn apply_operator(left: &Series, right: &Series, op: Operator) -> PolarsResu
         },
         Operator::And => left.bitand(right),
         Operator::Or => left.bitor(right),
+        Operator::LogicalOr => left
+            .cast(&DataType::Boolean)?
+            .bitor(&right.cast(&DataType::Boolean)?),
+        Operator::LogicalAnd => left
+            .cast(&DataType::Boolean)?
+            .bitand(&right.cast(&DataType::Boolean)?),
         Operator::Xor => left.bitxor(right),
         Operator::Modulus => Ok(left % right),
         Operator::EqValidity => left.equal_missing(right).map(|ca| ca.into_series()),
@@ -100,6 +108,28 @@ impl BinaryExpr {
         Ok(ac_l)
     }
 
+    fn apply_all_literal<'a>(
+        &self,
+        mut ac_l: AggregationContext<'a>,
+        mut ac_r: AggregationContext<'a>,
+    ) -> PolarsResult<AggregationContext<'a>> {
+        let name = ac_l.series().name().to_string();
+        ac_l.groups();
+        ac_r.groups();
+        polars_ensure!(ac_l.groups.len() == ac_r.groups.len(), ComputeError: "lhs and rhs should have same group length");
+        let left_s = ac_l.series().rechunk();
+        let right_s = ac_r.series().rechunk();
+        let res_s = apply_operator(&left_s, &right_s, self.op)?;
+        ac_l.with_update_groups(UpdateGroups::WithSeriesLen);
+        let res_s = if res_s.len() == 1 {
+            res_s.new_from_index(0, ac_l.groups.len())
+        } else {
+            ListChunked::full(&name, &res_s, ac_l.groups.len()).into_series()
+        };
+        ac_l.with_series(res_s, true, Some(&self.expr))?;
+        Ok(ac_l)
+    }
+
     fn apply_group_aware<'a>(
         &self,
         mut ac_l: AggregationContext<'a>,
@@ -116,22 +146,8 @@ impl BinaryExpr {
                 .with_name(&name)
         };
 
-        // Try if we can reuse the groups.
-        use AggState::*;
-        match (ac_l.agg_state(), ac_r.agg_state()) {
-            // No need to change update groups.
-            (AggregatedList(_), _) => {},
-            // We can take the groups of the rhs.
-            (_, AggregatedList(_)) if matches!(ac_r.update_groups, UpdateGroups::No) => {
-                ac_l.groups = ac_r.groups
-            },
-            // We must update the groups.
-            _ => {
-                ac_l.with_update_groups(UpdateGroups::WithSeriesLen);
-            },
-        }
-
-        ac_l.with_series(ca.into_series(), true, Some(&self.expr))?;
+        ac_l.with_update_groups(UpdateGroups::WithSeriesLen);
+        ac_l.with_agg_state(AggState::AggregatedList(ca.into_series()));
         Ok(ac_l)
     }
 }
@@ -177,7 +193,7 @@ impl PhysicalExpr for BinaryExpr {
         polars_ensure!(
             lhs.len() == rhs.len() || lhs.len() == 1 || rhs.len() == 1,
             expr = self.expr,
-            ComputeError: "cannot evaluate two series of different lengths ({} and {})",
+            ComputeError: "cannot evaluate two Series of different lengths ({} and {})",
             lhs.len(), rhs.len(),
         );
         apply_operator_owned(lhs, rhs, self.op)
@@ -200,16 +216,21 @@ impl PhysicalExpr for BinaryExpr {
         let ac_r = result_b?;
 
         match (ac_l.agg_state(), ac_r.agg_state()) {
+            (AggState::Literal(s), AggState::NotAggregated(_))
+            | (AggState::NotAggregated(_), AggState::Literal(s)) => match s.len() {
+                1 => self.apply_elementwise(ac_l, ac_r, false),
+                _ => self.apply_group_aware(ac_l, ac_r),
+            },
+            (AggState::Literal(_), AggState::Literal(_)) => self.apply_all_literal(ac_l, ac_r),
+            (AggState::NotAggregated(_), AggState::NotAggregated(_)) => {
+                self.apply_elementwise(ac_l, ac_r, false)
+            },
             (
-                AggState::Literal(_) | AggState::NotAggregated(_),
-                AggState::Literal(_) | AggState::NotAggregated(_),
-            ) => self.apply_elementwise(ac_l, ac_r, false),
-            (
-                AggState::AggregatedFlat(_) | AggState::Literal(_),
-                AggState::AggregatedFlat(_) | AggState::Literal(_),
+                AggState::AggregatedScalar(_) | AggState::Literal(_),
+                AggState::AggregatedScalar(_) | AggState::Literal(_),
             ) => self.apply_elementwise(ac_l, ac_r, true),
-            (AggState::AggregatedFlat(_), AggState::NotAggregated(_))
-            | (AggState::NotAggregated(_), AggState::AggregatedFlat(_)) => {
+            (AggState::AggregatedScalar(_), AggState::NotAggregated(_))
+            | (AggState::NotAggregated(_), AggState::AggregatedScalar(_)) => {
                 self.apply_group_aware(ac_l, ac_r)
             },
             (AggState::AggregatedList(lhs), AggState::AggregatedList(rhs)) => {
@@ -236,19 +257,11 @@ impl PhysicalExpr for BinaryExpr {
     fn as_stats_evaluator(&self) -> Option<&dyn polars_io::predicates::StatsEvaluator> {
         Some(self)
     }
-
-    fn is_valid_aggregation(&self) -> bool {
-        // We don't want: col(a) == lit(1).
-        // We do want col(a).sum() == lit(1).
-        (!self.left.is_literal() && self.left.is_valid_aggregation())
-            || (!self.right.is_literal() && self.right.is_valid_aggregation())
-    }
 }
 
 #[cfg(feature = "parquet")]
 mod stats {
-    use polars_io::parquet::predicates::BatchStats;
-    use polars_io::predicates::StatsEvaluator;
+    use polars_io::predicates::{BatchStats, StatsEvaluator};
 
     use super::*;
 
@@ -267,10 +280,28 @@ mod stats {
         true
     }
 
+    fn apply_operator_stats_neq(min_max: &Series, literal: &Series) -> bool {
+        if min_max.len() < 2 || min_max.null_count() > 0 {
+            return true;
+        }
+        use ChunkCompare as C;
+
+        // First check proofs all values are the same (e.g. min/max is the same)
+        // Second check proofs all values are equal, so we can skip as we search
+        // for non-equal values.
+        if min_max.get(0).unwrap() == min_max.get(1).unwrap()
+            && C::equal(literal, min_max).map(|s| s.all()).unwrap_or(false)
+        {
+            return false;
+        }
+        true
+    }
+
     fn apply_operator_stats_rhs_lit(min_max: &Series, literal: &Series, op: Operator) -> bool {
         use ChunkCompare as C;
         match op {
             Operator::Eq => apply_operator_stats_eq(min_max, literal),
+            Operator::NotEq => apply_operator_stats_neq(min_max, literal),
             // col > lit
             // e.g.
             // [min, max] > 0
@@ -306,6 +337,7 @@ mod stats {
         use ChunkCompare as C;
         match op {
             Operator::Eq => apply_operator_stats_eq(min_max, literal),
+            Operator::NotEq => apply_operator_stats_eq(min_max, literal),
             Operator::Gt => {
                 // Literal is bigger than max value, selection needs all rows.
                 C::gt(literal, min_max).map(|ca| ca.any()).unwrap_or(false)
@@ -337,27 +369,29 @@ mod stats {
             use Expr::*;
             use Operator::*;
             if !self.expr.into_iter().all(|e| match e {
-                BinaryExpr { op, .. } => !matches!(
-                    op,
-                    Multiply | Divide | TrueDivide | FloorDivide | Modulus | NotEq
-                ),
+                BinaryExpr { op, .. } => {
+                    !matches!(op, Multiply | Divide | TrueDivide | FloorDivide | Modulus)
+                },
                 Column(_) | Literal(_) | Alias(_, _) => true,
                 _ => false,
             }) {
                 return Ok(true);
             }
-
             let schema = stats.schema();
-            let fld_l = self.left.to_field(schema)?;
-            let fld_r = self.right.to_field(schema)?;
+            let Some(fld_l) = self.left.to_field(schema).ok() else {
+                return Ok(true);
+            };
+            let Some(fld_r) = self.right.to_field(schema).ok() else {
+                return Ok(true);
+            };
 
             #[cfg(debug_assertions)]
             {
                 match (fld_l.data_type(), fld_r.data_type()) {
                     #[cfg(feature = "dtype-categorical")]
-                    (DataType::Utf8, DataType::Categorical(_)) => {},
+                    (DataType::String, DataType::Categorical(_, _) | DataType::Enum(_, _)) => {},
                     #[cfg(feature = "dtype-categorical")]
-                    (DataType::Categorical(_), DataType::Utf8) => {},
+                    (DataType::Categorical(_, _) | DataType::Enum(_, _), DataType::String) => {},
                     (l, r) if l != r => panic!("implementation error: {l:?}, {r:?}"),
                     _ => {},
                 }
@@ -411,13 +445,14 @@ mod stats {
                 return Ok(true);
             }
 
+            use Operator::*;
             match (
                 self.left.as_stats_evaluator(),
                 self.right.as_stats_evaluator(),
             ) {
                 (Some(l), Some(r)) => match self.op {
-                    Operator::And => Ok(l.should_read(stats)? && r.should_read(stats)?),
-                    Operator::Or => Ok(l.should_read(stats)? || r.should_read(stats)?),
+                    And | LogicalAnd => Ok(l.should_read(stats)? && r.should_read(stats)?),
+                    Or | LogicalOr => Ok(l.should_read(stats)? || r.should_read(stats)?),
                     _ => Ok(true),
                 },
                 _ => self.impl_should_read(stats),

@@ -10,15 +10,15 @@ fmt:  ## Run rustfmt and dprint
 
 .PHONY: check
 check:  ## Run cargo check with all features
-	cargo check --workspace --all-targets --exclude nano-arrow --all-features
+	cargo check -p polars --all-features
 
 .PHONY: clippy
 clippy:  ## Run clippy with all features
-	cargo clippy -p polars --all-features
+	cargo clippy -p polars --all-features -- -W clippy::dbg_macro
 
 .PHONY: clippy-default
 clippy-default:  ## Run clippy with default features
-	cargo clippy -p polars
+	cargo clippy -p polars -- -W clippy::dbg_macro
 
 .PHONY: pre-commit
 pre-commit: fmt clippy clippy-default  ## Run autoformatting and linting
@@ -37,35 +37,35 @@ miri:  ## Run miri
 	cargo miri test \
 	    --features object \
 	    -p polars-core \
-	    -p polars-arrow
+#	    -p polars-arrow
 
 .PHONY: test
 test:  ## Run tests
 	cargo test --all-features \
-		-p polars-lazy \
-		-p polars-io \
 		-p polars-core \
-		-p polars-arrow \
-		-p polars-time \
-		-p polars-utils \
+		-p polars-io \
+		-p polars-lazy \
+		-p polars-ops \
+		-p polars-plan \
 		-p polars-row \
 		-p polars-sql \
-		-p polars-plan \
+		-p polars-time \
+		-p polars-utils \
 		-- \
 		--test-threads=2
 
 .PHONY: nextest
 nextest:  ## Run tests with nextest
 	cargo nextest run --all-features \
-		-p polars-lazy \
-		-p polars-io \
 		-p polars-core \
-		-p polars-arrow \
-		-p polars-time \
-		-p polars-utils \
+		-p polars-io \
+		-p polars-lazy \
+		-p polars-ops \
+		-p polars-plan \
 		-p polars-row \
 		-p polars-sql \
-		-p polars-plan \
+		-p polars-time \
+		-p polars-utils \
 
 .PHONY: integration-tests
 integration-tests:  ## Run integration tests
@@ -77,7 +77,6 @@ test-doc:  ## Run doc examples
 	    -p polars-lazy \
 	    -p polars-io \
 	    -p polars-core \
-	    -p polars-arrow \
 		-p polars-sql
 
 .PHONY: bench-save
@@ -90,7 +89,6 @@ bench-cmp:  ## Run benchmark and compare
 
 .PHONY: doctest
 doctest:  ## Check that documentation builds
-	cargo doc --no-deps --all-features -p polars-arrow
 	cargo doc --no-deps --all-features -p polars-utils
 	cargo doc --no-deps --features=docs-selection -p polars-core
 	cargo doc --no-deps -p polars-time
@@ -104,18 +102,19 @@ doctest:  ## Check that documentation builds
 publish:  ## Publish Polars crates
 	cargo publish --allow-dirty -p polars-error
 	cargo publish --allow-dirty -p polars-utils
-	cargo publish --allow-dirty -p polars-row
 	cargo publish --allow-dirty -p polars-arrow
+	cargo publish --allow-dirty -p polars-compute
+	cargo publish --allow-dirty -p polars-row
 	cargo publish --allow-dirty -p polars-json
 	cargo publish --allow-dirty -p polars-core
 	cargo publish --allow-dirty -p polars-ffi
 	cargo publish --allow-dirty -p polars-ops
 	cargo publish --allow-dirty -p polars-time
+	cargo publish --allow-dirty -p polars-parquet
 	cargo publish --allow-dirty -p polars-io
 	cargo publish --allow-dirty -p polars-plan
 	cargo publish --allow-dirty -p polars-pipe
 	cargo publish --allow-dirty -p polars-lazy
-	cargo publish --allow-dirty -p polars-algo
 	cargo publish --allow-dirty -p polars-sql
 	cargo publish --allow-dirty -p polars
 
@@ -147,4 +146,5 @@ check-wasm:  ## Check wasm build without supported features
 		--exclude-features parquet            \
 		--exclude-features performant         \
 		--exclude-features streaming          \
+		--exclude-features http          	  \
 		--exclude-features test

@@ -32,7 +32,7 @@ pub(crate) fn concat_impl<L: AsRef<[LazyFrame]>>(
     };
 
     let lf = match &mut lf.logical_plan {
-        // re-use the same union
+        // reuse the same union
         LogicalPlan::Union {
             inputs: existing_inputs,
             options: opts,
@@ -118,12 +118,11 @@ pub(crate) fn concat_impl<L: AsRef<[LazyFrame]>>(
 #[cfg(feature = "diagonal_concat")]
 /// Concat [LazyFrame]s diagonally.
 /// Calls [`concat`][concat()] internally.
-pub fn diag_concat_lf<L: AsRef<[LazyFrame]>>(
-    lfs: L,
-    rechunk: bool,
-    parallel: bool,
+pub fn concat_lf_diagonal<L: AsRef<[LazyFrame]>>(
+    inputs: L,
+    args: UnionArgs,
 ) -> PolarsResult<LazyFrame> {
-    let lfs = lfs.as_ref().to_vec();
+    let lfs = inputs.as_ref();
     let schemas = lfs
         .iter()
         .map(|lf| lf.schema())
@@ -143,12 +142,17 @@ pub fn diag_concat_lf<L: AsRef<[LazyFrame]>>(
             }
         });
     }
-
     let lfs_with_all_columns = lfs
-        .into_iter()
+        .iter()
         // Zip Frames with their Schemas
         .zip(schemas)
-        .map(|(mut lf, lf_schema)| {
+        .filter_map(|(lf, lf_schema)| {
+            if lf_schema.is_empty() {
+                // if the frame is empty we discard
+                return None;
+            };
+
+            let mut lf = lf.clone();
             for (name, dtype) in total_schema.iter() {
                 // If a name from Total Schema is not present - append
                 if lf_schema.get_field(name).is_none() {
@@ -163,19 +167,53 @@ pub fn diag_concat_lf<L: AsRef<[LazyFrame]>>(
                     .map(|col_name| col(col_name))
                     .collect::<Vec<Expr>>(),
             );
-
-            Ok(reordered_lf)
+            Some(Ok(reordered_lf))
         })
         .collect::<PolarsResult<Vec<_>>>()?;
 
-    concat(
-        lfs_with_all_columns,
-        UnionArgs {
-            rechunk,
-            parallel,
-            to_supertypes: false,
-        },
-    )
+    concat(lfs_with_all_columns, args)
+}
+
+/// Concat [LazyFrame]s horizontally.
+pub fn concat_lf_horizontal<L: AsRef<[LazyFrame]>>(
+    inputs: L,
+    args: UnionArgs,
+) -> PolarsResult<LazyFrame> {
+    let lfs = inputs.as_ref();
+    let mut opt_state = lfs.first().map(|lf| lf.opt_state).ok_or_else(
+        || polars_err!(NoData: "Require at least one LazyFrame for horizontal concatenation"),
+    )?;
+
+    for lf in &lfs[1..] {
+        // ensure we enable file caching if any lf has it enabled
+        opt_state.file_caching |= lf.opt_state.file_caching;
+    }
+
+    let mut lps = Vec::with_capacity(lfs.len());
+    let mut schemas = Vec::with_capacity(lfs.len());
+
+    for lf in lfs.iter() {
+        let mut lf = lf.clone();
+        let schema = lf.schema()?;
+        schemas.push(schema);
+        let lp = std::mem::take(&mut lf.logical_plan);
+        lps.push(lp);
+    }
+
+    let combined_schema = merge_schemas(&schemas)?;
+
+    let options = HConcatOptions {
+        parallel: args.parallel,
+    };
+    let lp = LogicalPlan::HConcat {
+        inputs: lps,
+        schema: Arc::new(combined_schema),
+        options,
+    };
+    let mut lf = LazyFrame::from(lp);
+    lf.opt_state = opt_state;
+
+    Ok(lf)
 }
 
 #[derive(Clone, Copy)]
@@ -195,7 +233,7 @@ impl Default for UnionArgs {
     }
 }
 
-/// Concat multiple
+/// Concat multiple [`LazyFrame`]s vertically.
 pub fn concat<L: AsRef<[LazyFrame]>>(inputs: L, args: UnionArgs) -> PolarsResult<LazyFrame> {
     concat_impl(
         inputs,
@@ -241,7 +279,15 @@ mod test {
             "d" => [1, 2]
         ]?;
 
-        let out = diag_concat_lf(&[a.lazy(), b.lazy(), c.lazy()], false, false)?.collect()?;
+        let out = concat_lf_diagonal(
+            &[a.lazy(), b.lazy(), c.lazy()],
+            UnionArgs {
+                rechunk: false,
+                parallel: false,
+                ..Default::default()
+            },
+        )?
+        .collect()?;
 
         let expected = df![
             "a" => [Some(1), Some(2), None, None, Some(5), Some(7)],
@@ -250,7 +296,7 @@ mod test {
             "d" => [None, None, None, None, Some(1), Some(2)]
         ]?;
 
-        assert!(out.frame_equal_missing(&expected));
+        assert!(out.equals_missing(&expected));
 
         Ok(())
     }

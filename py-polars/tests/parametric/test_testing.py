@@ -78,7 +78,7 @@ def test_strategy_shape(
     )
 )
 def test_strategy_frame_columns(lf: pl.LazyFrame) -> None:
-    assert lf.schema == {"a": pl.UInt8, "b": pl.UInt8, "c": pl.Boolean, "d": pl.Utf8}
+    assert lf.schema == {"a": pl.UInt8, "b": pl.UInt8, "c": pl.Boolean, "d": pl.String}
     assert lf.columns == ["a", "b", "c", "d"]
     df = lf.collect()
 
@@ -117,13 +117,13 @@ def test_strategy_dtypes(
     s3: pl.Series,
 ) -> None:
     # dataframe, lazyframe
-    assert all(tp in TEMPORAL_DTYPES for tp in df.dtypes)
-    assert all(tp not in TEMPORAL_DTYPES for tp in lf.dtypes)
+    assert all(tp.is_temporal() for tp in df.dtypes)
+    assert all(not tp.is_temporal() for tp in lf.dtypes)
 
     # series
     assert s1.dtype == pl.Boolean
-    assert s2.dtype in TEMPORAL_DTYPES
-    assert s3.dtype not in TEMPORAL_DTYPES
+    assert s2.dtype.is_temporal()
+    assert not s3.dtype.is_temporal()
 
 
 @given(
@@ -210,12 +210,12 @@ def test_infinities(
 @given(
     df=dataframes(
         cols=[
-            column("colx", dtype=pl.List(pl.UInt8)),
+            column("colx", dtype=pl.Array(pl.UInt8, width=3)),
             column("coly", dtype=pl.List(pl.Datetime("ms"))),
             column(
                 name="colz",
                 strategy=create_list_strategy(
-                    inner_dtype=pl.List(pl.Utf8),
+                    inner_dtype=pl.List(pl.String),
                     select_from=["aa", "bb", "cc"],
                     min_size=1,
                 ),
@@ -223,15 +223,16 @@ def test_infinities(
         ]
     ),
 )
-def test_list_strategy(df: pl.DataFrame) -> None:
+def test_sequence_strategies(df: pl.DataFrame) -> None:
     assert df.schema == {
-        "colx": pl.List(pl.UInt8),
+        "colx": pl.Array(pl.UInt8, width=3),
         "coly": pl.List(pl.Datetime("ms")),
-        "colz": pl.List(pl.List(pl.Utf8)),
+        "colz": pl.List(pl.List(pl.String)),
     }
     uint8_max = (2**8) - 1
 
     for colx, coly, colz in df.iter_rows():
+        assert len(colx) == 3
         assert all(i <= uint8_max for i in colx)
         assert all(isinstance(d, datetime) for d in coly)
         for inner_list in colz:
@@ -266,3 +267,9 @@ def test_invalid_arguments() -> None:
 
     with pytest.raises(InvalidArgument, match="unable to determine dtype"):
         column("colx", strategy=sampled_from([None]))
+
+
+@given(s=series(allowed_dtypes=pl.Binary))
+@settings(max_examples=5)
+def test_strategy_dtype_binary(s: pl.Series) -> None:
+    assert s.dtype == pl.Binary

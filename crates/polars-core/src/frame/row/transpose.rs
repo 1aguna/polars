@@ -18,7 +18,7 @@ impl DataFrame {
             None => Vec::<Series>::with_capacity(new_width),
             Some(name) => {
                 let mut tmp = Vec::<Series>::with_capacity(new_width + 1);
-                tmp.push(Utf8Chunked::new(name, self.get_column_names()).into());
+                tmp.push(StringChunked::new(name, self.get_column_names()).into());
                 tmp
             },
         };
@@ -40,7 +40,7 @@ impl DataFrame {
             DataType::Float32 => numeric_transpose::<Float32Type>(cols, names_out, &mut cols_t),
             DataType::Float64 => numeric_transpose::<Float64Type>(cols, names_out, &mut cols_t),
             #[cfg(feature = "object")]
-            DataType::Object(_) => {
+            DataType::Object(_, _) => {
                 // this requires to support `Object` in Series::iter which we don't yet
                 polars_bail!(InvalidOperation: "Object dtype not supported in 'transpose'")
             },
@@ -72,7 +72,8 @@ impl DataFrame {
                     });
                 }
                 cols_t.extend(buffers.into_iter().zip(names_out).map(|(buf, name)| {
-                    let mut s = buf.into_series().cast(dtype).unwrap();
+                    // Safety: we are casting back to the supertype
+                    let mut s = unsafe { buf.into_series().cast_unchecked(dtype).unwrap() };
                     s.rename(name);
                     s
                 }));
@@ -92,8 +93,8 @@ impl DataFrame {
             None => (0..self.height()).map(|i| format!("column_{i}")).collect(),
             Some(cn) => match cn {
                 Either::Left(name) => {
-                    let new_names = self.column(&name).and_then(|x| x.utf8())?;
-                    polars_ensure!(!new_names.has_validity(), ComputeError: "Column with new names can't have null values");
+                    let new_names = self.column(&name).and_then(|x| x.str())?;
+                    polars_ensure!(new_names.null_count() == 0, ComputeError: "Column with new names can't have null values");
                     df = Cow::Owned(self.drop(&name)?);
                     new_names
                         .into_no_null_iter()
@@ -113,30 +114,27 @@ impl DataFrame {
         }
         polars_ensure!(
             df.height() != 0 && df.width() != 0,
-            NoData: "unable to transpose an empty dataframe"
+            NoData: "unable to transpose an empty DataFrame"
         );
         let dtype = df.get_supertype().unwrap()?;
         match dtype {
             #[cfg(feature = "dtype-categorical")]
-            DataType::Categorical(_) => {
+            DataType::Categorical(_, _) | DataType::Enum(_, _) => {
                 let mut valid = true;
-                let mut cache_id = None;
+                let mut rev_map: Option<&Arc<RevMapping>> = None;
                 for s in self.columns.iter() {
-                    if let DataType::Categorical(Some(rev_map)) = &s.dtype() {
-                        match &**rev_map {
-                            RevMapping::Local(_) => valid = false,
-                            RevMapping::Global(_, _, id) => {
-                                if let Some(cache_id) = cache_id {
-                                    if cache_id != *id {
-                                        valid = false;
-                                    }
-                                }
-                                cache_id = Some(*id);
+                    if let DataType::Categorical(Some(col_rev_map), _)
+                    | DataType::Enum(Some(col_rev_map), _) = &s.dtype()
+                    {
+                        match rev_map {
+                            Some(rev_map) => valid = valid && rev_map.same_src(col_rev_map),
+                            None => {
+                                rev_map = Some(col_rev_map);
                             },
                         }
                     }
                 }
-                polars_ensure!(valid, ComputeError: "'transpose' of categorical can only be done if all are from the same global string cache")
+                polars_ensure!(valid, string_cache_mismatch);
             },
             _ => {},
         }
@@ -193,7 +191,7 @@ where
             // we also ensured we allocated enough memory, so we never reallocate and thus
             // the pointers remain valid.
             if has_nulls {
-                for (col_idx, opt_v) in ca.into_iter().enumerate() {
+                for (col_idx, opt_v) in ca.iter().enumerate() {
                     match opt_v {
                         None => unsafe {
                             let column = (*(validity_buf_ptr as *mut Vec<Vec<bool>>))
@@ -247,7 +245,7 @@ where
                 };
 
                 let arr = PrimitiveArray::<T::Native>::new(
-                    T::get_dtype().to_arrow(),
+                    T::get_dtype().to_arrow(true),
                     values.into(),
                     validity,
                 );
@@ -274,7 +272,7 @@ mod test {
             "column_2" => [3, 30],
 
         ]?;
-        assert!(out.frame_equal_missing(&expected));
+        assert!(out.equals_missing(&expected));
 
         let df = df![
             "a" => [Some(1), None, Some(3)],
@@ -287,7 +285,7 @@ mod test {
             "column_2" => [Some(3), None],
 
         ]?;
-        assert!(out.frame_equal_missing(&expected));
+        assert!(out.equals_missing(&expected));
 
         let df = df![
             "a" => ["a", "b", "c"],
@@ -300,7 +298,7 @@ mod test {
             "column_2" => [Some("c"), None],
 
         ]?;
-        assert!(out.frame_equal_missing(&expected));
+        assert!(out.equals_missing(&expected));
         Ok(())
     }
 }

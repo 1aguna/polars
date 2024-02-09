@@ -13,7 +13,7 @@ pub(crate) fn get_file_chunks_iterator(
     chunk_size: usize,
     bytes: &[u8],
     expected_fields: usize,
-    delimiter: u8,
+    separator: u8,
     quote_char: Option<u8>,
     eol_char: u8,
 ) {
@@ -27,7 +27,7 @@ pub(crate) fn get_file_chunks_iterator(
         let end_pos = match next_line_position(
             &bytes[search_pos..],
             Some(expected_fields),
-            delimiter,
+            separator,
             quote_char,
             eol_char,
         ) {
@@ -49,7 +49,7 @@ struct ChunkOffsetIter<'a> {
     // not a promise, but something we want
     rows_per_batch: usize,
     expected_fields: usize,
-    delimiter: u8,
+    separator: u8,
     quote_char: Option<u8>,
     eol_char: u8,
 }
@@ -68,7 +68,7 @@ impl<'a> Iterator for ChunkOffsetIter<'a> {
                     let bytes_first_row = next_line_position(
                         &self.bytes[self.last_offset + 2..],
                         Some(self.expected_fields),
-                        self.delimiter,
+                        self.separator,
                         self.quote_char,
                         self.eol_char,
                     )
@@ -84,7 +84,7 @@ impl<'a> Iterator for ChunkOffsetIter<'a> {
                     self.rows_per_batch * bytes_first_row,
                     self.bytes,
                     self.expected_fields,
-                    self.delimiter,
+                    self.separator,
                     self.quote_char,
                     self.eol_char,
                 );
@@ -124,19 +124,17 @@ impl<'a> CoreReader<'a> {
             n_chunks: offset_batch_size,
             rows_per_batch: self.chunk_size,
             expected_fields: self.schema.len(),
-            delimiter: self.delimiter,
+            separator: self.separator,
             quote_char: self.quote_char,
             eol_char: self.eol_char,
         };
 
-        let projection = self.get_projection();
-
-        let str_columns = self.get_string_columns(&projection)?;
+        let projection = self.get_projection()?;
 
         // RAII structure that will ensure we maintain a global stringcache
         #[cfg(feature = "dtype-categorical")]
         let _cat_lock = if _has_cat {
-            Some(polars_core::IUseStringCache::hold())
+            Some(polars_core::StringCacheHolder::hold())
         } else {
             None
         };
@@ -149,12 +147,10 @@ impl<'a> CoreReader<'a> {
             chunk_size: self.chunk_size,
             file_chunks_iter: file_chunks,
             file_chunks: vec![],
-            str_capacities: self.init_string_size_stats(&str_columns, self.chunk_size),
-            str_columns,
             projection,
             starting_point_offset,
-            row_count: self.row_count,
-            comment_char: self.comment_char,
+            row_index: self.row_index,
+            comment_prefix: self.comment_prefix,
             quote_char: self.quote_char,
             eol_char: self.eol_char,
             null_values: self.null_values,
@@ -164,7 +160,7 @@ impl<'a> CoreReader<'a> {
             truncate_ragged_lines: self.truncate_ragged_lines,
             n_rows: self.n_rows,
             encoding: self.encoding,
-            delimiter: self.delimiter,
+            separator: self.separator,
             schema: self.schema,
             rows_read: 0,
             _cat_lock,
@@ -177,12 +173,10 @@ pub struct BatchedCsvReaderMmap<'a> {
     chunk_size: usize,
     file_chunks_iter: ChunkOffsetIter<'a>,
     file_chunks: Vec<(usize, usize)>,
-    str_capacities: Vec<RunningSize>,
-    str_columns: StringColumns,
     projection: Vec<usize>,
     starting_point_offset: Option<usize>,
-    row_count: Option<RowCount>,
-    comment_char: Option<u8>,
+    row_index: Option<RowIndex>,
+    comment_prefix: Option<CommentPrefix>,
     quote_char: Option<u8>,
     eol_char: u8,
     null_values: Option<NullValuesCompiled>,
@@ -192,11 +186,11 @@ pub struct BatchedCsvReaderMmap<'a> {
     ignore_errors: bool,
     n_rows: Option<usize>,
     encoding: CsvEncoding,
-    delimiter: u8,
+    separator: u8,
     schema: SchemaRef,
     rows_read: IdxSize,
     #[cfg(feature = "dtype-categorical")]
-    _cat_lock: Option<polars_core::IUseStringCache>,
+    _cat_lock: Option<polars_core::StringCacheHolder>,
     #[cfg(not(feature = "dtype-categorical"))]
     _cat_lock: Option<u8>,
 }
@@ -233,16 +227,15 @@ impl<'a> BatchedCsvReaderMmap<'a> {
                 .map(|(bytes_offset_thread, stop_at_nbytes)| {
                     let mut df = read_chunk(
                         bytes,
-                        self.delimiter,
+                        self.separator,
                         self.schema.as_ref(),
                         self.ignore_errors,
                         &self.projection,
                         bytes_offset_thread,
                         self.quote_char,
                         self.eol_char,
-                        self.comment_char,
+                        self.comment_prefix.as_ref(),
                         self.chunk_size,
-                        &self.str_capacities,
                         self.encoding,
                         self.null_values.as_ref(),
                         self.missing_is_null,
@@ -254,9 +247,8 @@ impl<'a> BatchedCsvReaderMmap<'a> {
 
                     cast_columns(&mut df, &self.to_cast, false, self.ignore_errors)?;
 
-                    update_string_stats(&self.str_capacities, &self.str_columns, &df)?;
-                    if let Some(rc) = &self.row_count {
-                        df.with_row_count_mut(&rc.name, Some(rc.offset));
+                    if let Some(rc) = &self.row_index {
+                        df.with_row_index_mut(&rc.name, Some(rc.offset));
                     }
                     Ok(df)
                 })
@@ -264,7 +256,7 @@ impl<'a> BatchedCsvReaderMmap<'a> {
         })?;
         self.file_chunks.clear();
 
-        if self.row_count.is_some() {
+        if self.row_index.is_some() {
             update_row_counts2(&mut chunks, self.rows_read)
         }
         for df in &chunks {

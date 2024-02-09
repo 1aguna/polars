@@ -15,7 +15,6 @@ class PolarsSlice:
     Apply Python slice object to Polars DataFrame or Series.
 
     Has full support for negative indexing and/or stride.
-
     """
 
     stop: int
@@ -42,13 +41,13 @@ class PolarsSlice:
     def _slice_positive(self, obj: LazyFrame) -> LazyFrame:
         """Logic for slices with positive stride."""
         # note: at this point stride is guaranteed to be > 1
-        return obj.slice(self.start, self.slice_length).take_every(self.stride)
+        return obj.slice(self.start, self.slice_length).gather_every(self.stride)
 
     def _slice_negative(self, obj: LazyFrame) -> LazyFrame:
         """Logic for slices with negative stride."""
         stride = abs(self.stride)
         lazyslice = obj.slice(self.stop + 1, self.slice_length).reverse()
-        return lazyslice.take_every(stride) if (stride > 1) else lazyslice
+        return lazyslice.gather_every(stride) if (stride > 1) else lazyslice
 
     def _slice_setup(self, s: slice) -> None:
         """Normalise slice bounds, identify unbounded and/or zero-length slices."""
@@ -113,7 +112,6 @@ class LazyPolarsSlice:
 
     Only slices with efficient computation paths that map directly
     to existing lazy methods are supported.
-
     """
 
     obj: LazyFrame
@@ -128,19 +126,18 @@ class LazyPolarsSlice:
         Note that LazyFrame is designed primarily for efficient computation and does not
         know its own length so, unlike DataFrame, certain slice patterns (such as those
         requiring negative stop/step) may not be supported.
-
         """
         start = s.start or 0
         step = s.step or 1
 
         # fail on operations that require length to do efficiently
         if s.stop and s.stop < 0:
-            raise ValueError("negative stop is not supported for lazy slices")
+            msg = "negative stop is not supported for lazy slices"
+            raise ValueError(msg)
         if step < 0 and (start > 0 or s.stop is not None) and (start != s.stop):
             if not (start > 0 > step and s.stop is None):
-                raise ValueError(
-                    "negative stride is not supported in conjunction with start+stop"
-                )
+                msg = "negative stride is not supported in conjunction with start+stop"
+                raise ValueError(msg)
 
         # ---------------------------------------
         # empty slice patterns
@@ -155,56 +152,57 @@ class LazyPolarsSlice:
 
         # ---------------------------------------
         # straight-through mappings for "reverse"
-        # and/or "take_every"
+        # and/or "gather_every"
         # ---------------------------------------
         # [:]    => clone()
-        # [::k]  => take_every(k),
+        # [::k]  => gather_every(k),
         # [::-1] => reverse(),
-        # [::-k] => reverse().take_every(abs(k))
+        # [::-k] => reverse().gather_every(abs(k))
         elif start == 0 and s.stop is None:
             if step == 1:
                 return self.obj.clone()
             elif step > 1:
-                return self.obj.take_every(step)
+                return self.obj.gather_every(step)
             elif step == -1:
                 return self.obj.reverse()
             elif step < -1:
-                return self.obj.reverse().take_every(abs(step))
+                return self.obj.reverse().gather_every(abs(step))
 
         elif start > 0 > step and s.stop is None:
             obj = self.obj.head(s.start + 1).reverse()
-            return obj if (abs(step) == 1) else obj.take_every(abs(step))
+            return obj if (abs(step) == 1) else obj.gather_every(abs(step))
 
         # ---------------------------------------
         # straight-through mappings for "head"
         # ---------------------------------------
         # [:j]    => head(j)
-        # [:j:k]  => head(j).take_every(k)
+        # [:j:k]  => head(j).gather_every(k)
         elif start == 0 and (s.stop or 0) >= 1:
             obj = self.obj.head(s.stop)
-            return obj if (step == 1) else obj.take_every(step)
+            return obj if (step == 1) else obj.gather_every(step)
 
         # ---------------------------------------
         # straight-through mappings for "tail"
         # ---------------------------------------
         # [-i:]    => tail(abs(i))
-        # [-i::k]  => tail(abs(i)).take_every(k)
+        # [-i::k]  => tail(abs(i)).gather_every(k)
         elif start < 0 and s.stop is None:
             obj = self.obj.tail(abs(start))
-            return obj if (step == 1) else obj.take_every(step)
+            return obj if (step == 1) else obj.gather_every(step)
 
         # ---------------------------------------
         # straight-through mappings for "slice"
         # ---------------------------------------
         # [i:]     => slice(i)
         # [i:j]    => slice(i,j-i)
-        # [i:j:k]  => slice(i,j-i).take_every(k)
+        # [i:j:k]  => slice(i,j-i).gather_every(k)
         elif start > 0 and (s.stop is None or s.stop >= 0):
             slice_length = None if (s.stop is None) else (s.stop - start)
             obj = self.obj.slice(start, slice_length)
-            return obj if (step == 1) else obj.take_every(step)
+            return obj if (step == 1) else obj.gather_every(step)
 
-        raise ValueError(
-            f"the given slice {s!r} is not supported by lazy computation; consider a"
-            " more efficient approach, or construct explicitly with other methods"
+        msg = (
+            f"the given slice {s!r} is not supported by lazy computation"
+            "\n\nConsider a more efficient approach, or construct explicitly with other methods."
         )
+        raise ValueError(msg)

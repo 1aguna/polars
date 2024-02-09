@@ -1,6 +1,10 @@
-use numpy::PyArray1;
+use numpy::{Element, PyArray1};
+use polars::export::arrow;
+use polars::export::arrow::array::Array;
+use polars::export::arrow::types::NativeType;
 use polars_core::prelude::*;
 use polars_core::utils::CustomIterTools;
+use polars_rs::export::arrow::bitmap::MutableBitmap;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -18,11 +22,7 @@ macro_rules! init_method {
         impl PySeries {
             #[staticmethod]
             fn $name(py: Python, name: &str, array: &PyArray1<$type>, _strict: bool) -> PySeries {
-                let array = array.readonly();
-                let vals = array.as_slice().unwrap();
-                py.allow_threads(|| PySeries {
-                    series: Series::new(name, vals),
-                })
+                mmap_numpy_array(py, name, array)
             }
         }
     };
@@ -32,46 +32,61 @@ init_method!(new_i8, i8);
 init_method!(new_i16, i16);
 init_method!(new_i32, i32);
 init_method!(new_i64, i64);
-init_method!(new_bool, bool);
 init_method!(new_u8, u8);
 init_method!(new_u16, u16);
 init_method!(new_u32, u32);
 init_method!(new_u64, u64);
 
+fn mmap_numpy_array<T: Element + NativeType>(
+    py: Python,
+    name: &str,
+    array: &PyArray1<T>,
+) -> PySeries {
+    let vals = unsafe { array.as_slice().unwrap() };
+
+    let arr = unsafe { arrow::ffi::mmap::slice_and_owner(vals, array.to_object(py)) };
+    Series::from_arrow(name, arr.to_boxed()).unwrap().into()
+}
+
 #[pymethods]
 impl PySeries {
     #[staticmethod]
-    fn new_f32(py: Python, name: &str, array: &PyArray1<f32>, nan_is_null: bool) -> PySeries {
+    fn new_bool(py: Python, name: &str, array: &PyArray1<bool>, _strict: bool) -> PySeries {
         let array = array.readonly();
         let vals = array.as_slice().unwrap();
-        py.allow_threads(|| {
-            if nan_is_null {
-                let ca: Float32Chunked = vals
-                    .iter()
-                    .map(|&val| if f32::is_nan(val) { None } else { Some(val) })
-                    .collect_trusted();
-                ca.with_name(name).into_series().into()
-            } else {
-                Series::new(name, vals).into()
-            }
+        py.allow_threads(|| PySeries {
+            series: Series::new(name, vals),
         })
     }
 
     #[staticmethod]
+    fn new_f32(py: Python, name: &str, array: &PyArray1<f32>, nan_is_null: bool) -> PySeries {
+        if nan_is_null {
+            let array = array.readonly();
+            let vals = array.as_slice().unwrap();
+            let ca: Float32Chunked = vals
+                .iter()
+                .map(|&val| if f32::is_nan(val) { None } else { Some(val) })
+                .collect_trusted();
+            ca.with_name(name).into_series().into()
+        } else {
+            mmap_numpy_array(py, name, array)
+        }
+    }
+
+    #[staticmethod]
     fn new_f64(py: Python, name: &str, array: &PyArray1<f64>, nan_is_null: bool) -> PySeries {
-        let array = array.readonly();
-        let vals = array.as_slice().unwrap();
-        py.allow_threads(|| {
-            if nan_is_null {
-                let ca: Float64Chunked = vals
-                    .iter()
-                    .map(|&val| if f64::is_nan(val) { None } else { Some(val) })
-                    .collect_trusted();
-                ca.with_name(name).into_series().into()
-            } else {
-                Series::new(name, vals).into()
-            }
-        })
+        if nan_is_null {
+            let array = array.readonly();
+            let vals = array.as_slice().unwrap();
+            let ca: Float64Chunked = vals
+                .iter()
+                .map(|&val| if f64::is_nan(val) { None } else { Some(val) })
+                .collect_trusted();
+            ca.with_name(name).into_series().into()
+        } else {
+            mmap_numpy_array(py, name, array)
+        }
     }
 }
 
@@ -169,7 +184,7 @@ init_method_opt!(new_opt_f64, Float64Type, f64);
 )]
 impl PySeries {
     #[staticmethod]
-    fn new_from_anyvalues(
+    fn new_from_any_values(
         name: &str,
         val: Vec<Wrap<AnyValue<'_>>>,
         strict: bool,
@@ -181,7 +196,20 @@ impl PySeries {
     }
 
     #[staticmethod]
-    fn new_str(name: &str, val: Wrap<Utf8Chunked>, _strict: bool) -> Self {
+    fn new_from_any_values_and_dtype(
+        name: &str,
+        val: Vec<Wrap<AnyValue<'_>>>,
+        dtype: Wrap<DataType>,
+        strict: bool,
+    ) -> PyResult<PySeries> {
+        let avs = slice_extract_wrapped(&val);
+        let s = Series::from_any_values_and_dtype(name, avs, &dtype.0, strict)
+            .map_err(PyPolarsErr::from)?;
+        Ok(s.into())
+    }
+
+    #[staticmethod]
+    fn new_str(name: &str, val: Wrap<StringChunked>, _strict: bool) -> Self {
         val.0.into_series().with_name(name).into()
     }
 
@@ -196,11 +224,23 @@ impl PySeries {
     }
 
     #[staticmethod]
-    pub fn new_object(name: &str, val: Vec<ObjectValue>, _strict: bool) -> Self {
+    pub fn new_object(py: Python, name: &str, val: Vec<ObjectValue>, _strict: bool) -> Self {
         #[cfg(feature = "object")]
         {
+            let mut validity = MutableBitmap::with_capacity(val.len());
+            val.iter().for_each(|v| {
+                if v.inner.is_none(py) {
+                    // SAFETY: we can ensure that validity has correct capacity.
+                    unsafe { validity.push_unchecked(false) };
+                } else {
+                    // SAFETY: we can ensure that validity has correct capacity.
+                    unsafe { validity.push_unchecked(true) };
+                }
+            });
             // Object builder must be registered. This is done on import.
-            let s = ObjectChunked::<ObjectValue>::new_from_vec(name, val).into_series();
+            let s =
+                ObjectChunked::<ObjectValue>::new_from_vec_and_validity(name, val, validity.into())
+                    .into_series();
             s.into()
         }
         #[cfg(not(feature = "object"))]
@@ -230,19 +270,30 @@ impl PySeries {
             Ok(series.into())
         } else {
             let val = vec_extract_wrapped(val);
-            let series = Series::new(name, &val);
-            match series.dtype() {
-                DataType::List(list_inner) => {
-                    let series = series
-                        .cast(&DataType::Array(
-                            Box::new(inner.map(|dt| dt.0).unwrap_or(*list_inner.clone())),
-                            width,
-                        ))
-                        .map_err(PyPolarsErr::from)?;
-                    Ok(series.into())
-                },
-                _ => Err(PyValueError::new_err("could not create Array from input")),
-            }
+            return if let Some(inner) = inner {
+                let series = Series::from_any_values_and_dtype(
+                    name,
+                    val.as_ref(),
+                    &DataType::Array(Box::new(inner.0), width),
+                    true,
+                )
+                .map_err(PyPolarsErr::from)?;
+                Ok(series.into())
+            } else {
+                let series = Series::new(name, &val);
+                match series.dtype() {
+                    DataType::List(list_inner) => {
+                        let series = series
+                            .cast(&DataType::Array(
+                                Box::new(inner.map(|dt| dt.0).unwrap_or(*list_inner.clone())),
+                                width,
+                            ))
+                            .map_err(PyPolarsErr::from)?;
+                        Ok(series.into())
+                    },
+                    _ => Err(PyValueError::new_err("could not create Array from input")),
+                }
+            };
         }
     }
 

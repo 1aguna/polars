@@ -8,6 +8,7 @@
 //! use polars_core::prelude::*;
 //! use polars_io::prelude::*;
 //! use std::io::Cursor;
+//! use std::num::NonZeroUsize;
 //!
 //! let basic_json = r#"{"a":1, "b":2.0, "c":false, "d":"4"}
 //! {"a":-10, "b":-3.5, "c":true, "d":"4"}
@@ -25,7 +26,7 @@
 //! let df = JsonReader::new(file)
 //! .with_json_format(JsonFormat::JsonLines)
 //! .infer_schema_len(Some(3))
-//! .with_batch_size(3)
+//! .with_batch_size(NonZeroUsize::new(3).unwrap())
 //! .finish()
 //! .unwrap();
 //!
@@ -61,18 +62,19 @@
 //! +-----+--------+-------+--------+
 //! ```
 //!
+pub(crate) mod infer;
+
 use std::convert::TryFrom;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 
-use arrow::array::StructArray;
-pub use arrow::error::Result as ArrowResult;
-use polars_arrow::conversion::chunk_to_struct;
-use polars_arrow::utils::CustomIterTools;
+use arrow::array::{ArrayRef, StructArray};
+use arrow::legacy::conversion::chunk_to_struct;
 use polars_core::error::to_compute_err;
 use polars_core::prelude::*;
 use polars_core::utils::try_get_supertype;
-use polars_json::json::infer;
+use polars_json::json::write::FallibleStreamingIterator;
 use simd_json::BorrowedValue;
 
 use crate::mmap::{MmapBytesReader, ReaderBytes};
@@ -133,9 +135,12 @@ where
 
     fn finish(&mut self, df: &mut DataFrame) -> PolarsResult<()> {
         df.align_chunks();
-        let fields = df.iter().map(|s| s.field().to_arrow()).collect::<Vec<_>>();
+        let fields = df
+            .iter()
+            .map(|s| s.field().to_arrow(true))
+            .collect::<Vec<_>>();
         let batches = df
-            .iter_chunks()
+            .iter_chunks(true)
             .map(|chunk| Ok(Box::new(chunk_to_struct(chunk, fields.clone())) as ArrayRef));
 
         match self.json_format {
@@ -143,7 +148,7 @@ where
                 let serializer = polars_json::ndjson::write::Serializer::new(batches, vec![]);
                 let writer =
                     polars_json::ndjson::write::FileWriter::new(&mut self.buffer, serializer);
-                writer.collect::<ArrowResult<()>>()?;
+                writer.collect::<PolarsResult<()>>()?;
             },
             JsonFormat::Json => {
                 let serializer = polars_json::json::write::Serializer::new(batches, vec![]);
@@ -151,6 +156,37 @@ where
             },
         }
 
+        Ok(())
+    }
+}
+
+pub struct BatchedWriter<W: Write> {
+    writer: W,
+}
+
+impl<W> BatchedWriter<W>
+where
+    W: Write,
+{
+    pub fn new(writer: W) -> Self {
+        BatchedWriter { writer }
+    }
+    /// Write a batch to the json writer.
+    ///
+    /// # Panics
+    /// The caller must ensure the chunks in the given [`DataFrame`] are aligned.
+    pub fn write_batch(&mut self, df: &DataFrame) -> PolarsResult<()> {
+        let fields = df
+            .iter()
+            .map(|s| s.field().to_arrow(true))
+            .collect::<Vec<_>>();
+        let chunks = df.iter_chunks(true);
+        let batches =
+            chunks.map(|chunk| Ok(Box::new(chunk_to_struct(chunk, fields.clone())) as ArrayRef));
+        let mut serializer = polars_json::ndjson::write::Serializer::new(batches, vec![]);
+        while let Some(block) = serializer.next()? {
+            self.writer.write_all(block)?;
+        }
         Ok(())
     }
 }
@@ -165,7 +201,7 @@ where
     rechunk: bool,
     ignore_errors: bool,
     infer_schema_len: Option<usize>,
-    batch_size: usize,
+    batch_size: NonZeroUsize,
     projection: Option<Vec<String>>,
     schema: Option<SchemaRef>,
     schema_overwrite: Option<&'a Schema>,
@@ -182,7 +218,7 @@ where
             rechunk: true,
             ignore_errors: false,
             infer_schema_len: Some(100),
-            batch_size: 8192,
+            batch_size: NonZeroUsize::new(8192).unwrap(),
             projection: None,
             schema: None,
             schema_overwrite: None,
@@ -216,50 +252,46 @@ where
                         let mut_schema = Arc::make_mut(&mut schema);
                         overwrite_schema(mut_schema, overwrite)?;
                     }
-                    DataType::Struct(schema.iter_fields().collect()).to_arrow()
+
+                    DataType::Struct(schema.iter_fields().collect()).to_arrow(true)
                 } else {
                     // infer
-                    if let BorrowedValue::Array(values) = &json_value {
-                        polars_ensure!(self.schema_overwrite.is_none() && self.schema.is_none(), ComputeError: "schema arguments not yet supported for Array json");
-
-                        // struct types may have missing fields so find supertype
-                        let dtype = values
-                            .iter()
-                            .take(self.infer_schema_len.unwrap_or(usize::MAX))
-                            .map(|value| {
-                                infer(value)
-                                    .map_err(PolarsError::from)
-                                    .map(|dt| DataType::from(&dt))
-                            })
-                            .fold_first_(|l, r| {
-                                let l = l?;
-                                let r = r?;
-                                try_get_supertype(&l, &r)
-                            })
-                            .unwrap()?;
-                        let dtype = DataType::List(Box::new(dtype));
-                        dtype.to_arrow()
+                    let inner_dtype = if let BorrowedValue::Array(values) = &json_value {
+                        infer::json_values_to_supertype(
+                            values,
+                            self.infer_schema_len.unwrap_or(usize::MAX),
+                        )?
+                        .to_arrow(true)
                     } else {
-                        let dtype = infer(&json_value)?;
-                        if let Some(overwrite) = self.schema_overwrite {
-                            let ArrowDataType::Struct(fields) = dtype else {
-                                polars_bail!(ComputeError: "can only deserialize json objects")
-                            };
+                        polars_json::json::infer(&json_value)?
+                    };
 
-                            let mut schema = Schema::from_iter(fields.iter());
-                            overwrite_schema(&mut schema, overwrite)?;
+                    if let Some(overwrite) = self.schema_overwrite {
+                        let ArrowDataType::Struct(fields) = inner_dtype else {
+                            polars_bail!(ComputeError: "can only deserialize json objects")
+                        };
 
-                            DataType::Struct(
-                                schema
-                                    .into_iter()
-                                    .map(|(name, dt)| Field::new(&name, dt))
-                                    .collect(),
-                            )
-                            .to_arrow()
-                        } else {
-                            dtype
-                        }
+                        let mut schema = Schema::from_iter(fields.iter());
+                        overwrite_schema(&mut schema, overwrite)?;
+
+                        DataType::Struct(
+                            schema
+                                .into_iter()
+                                .map(|(name, dt)| Field::new(&name, dt))
+                                .collect(),
+                        )
+                        .to_arrow(true)
+                    } else {
+                        inner_dtype
                     }
+                };
+
+                let dtype = if let BorrowedValue::Array(_) = &json_value {
+                    ArrowDataType::LargeList(Box::new(arrow::datatypes::Field::new(
+                        "item", dtype, true,
+                    )))
+                } else {
+                    dtype
                 };
 
                 let arr = polars_json::json::deserialize(&json_value, dtype)?;
@@ -276,7 +308,7 @@ where
                     self.schema_overwrite,
                     None,
                     1024, // sample size
-                    1 << 18,
+                    NonZeroUsize::new(1 << 18).unwrap(),
                     false,
                     self.infer_schema_len,
                     self.ignore_errors,
@@ -330,7 +362,7 @@ where
     /// Set the batch size (number of records to load at one time)
     ///
     /// This heavily influences loading time.
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+    pub fn with_batch_size(mut self, batch_size: NonZeroUsize) -> Self {
         self.batch_size = batch_size;
         self
     }

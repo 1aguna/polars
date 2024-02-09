@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import polars._reexport as pl
@@ -14,7 +14,6 @@ from polars.utils.convert import (
     _time_to_pl_time,
     _timedelta_to_pl_timedelta,
 )
-from polars.utils.deprecation import issue_deprecation_warning
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
@@ -46,11 +45,11 @@ def lit(
     -----
     Expected datatypes
 
-    - ``pl.lit([])`` -> empty  Series Float32
-    - ``pl.lit([1, 2, 3])`` -> Series Int64
-    - ``pl.lit([[]])``-> empty  Series List<Null>
-    - ``pl.lit([[1, 2, 3]])`` -> Series List<i64>
-    - ``pl.lit(None)`` -> Series Null
+    - `pl.lit([])` -> empty  Series Float32
+    - `pl.lit([1, 2, 3])` -> Series Int64
+    - `pl.lit([[]])`-> empty  Series List<Null>
+    - `pl.lit([[1, 2, 3]])` -> Series List<i64>
+    - `pl.lit(None)` -> Series Null
 
     Examples
     --------
@@ -72,7 +71,6 @@ def lit(
 
     >>> pl.lit([[1, 2], [3, 4]])  # doctest: +SKIP
     >>> pl.lit(pl.Series("y", [[1, 2], [3, 4]]))  # doctest: +IGNORE_RESULT
-
     """
     time_unit: TimeUnit
 
@@ -88,17 +86,21 @@ def lit(
             and getattr(dtype, "time_zone", None) is not None
             and dtype.time_zone != str(value.tzinfo)  # type: ignore[union-attr]
         ):
-            raise TypeError(
-                f"time zone of dtype ({dtype.time_zone!r}) differs from time zone of value ({value.tzinfo!r})"  # type: ignore[union-attr]
-            )
-        e = lit(_datetime_to_pl_timestamp(value, time_unit)).cast(Datetime(time_unit))
+            msg = f"time zone of dtype ({dtype.time_zone!r}) differs from time zone of value ({value.tzinfo!r})"  # type: ignore[union-attr]
+            raise TypeError(msg)
+        e = lit(
+            _datetime_to_pl_timestamp(value.replace(tzinfo=timezone.utc), time_unit)
+        ).cast(Datetime(time_unit))
         if time_zone is not None:
-            return e.dt.replace_time_zone(str(time_zone))
+            return e.dt.replace_time_zone(
+                str(time_zone), ambiguous="earliest" if value.fold == 0 else "latest"
+            )
         else:
             return e
 
     elif isinstance(value, timedelta):
-        time_unit = "us" if dtype is None else getattr(dtype, "time_unit", "us")
+        if dtype is None or (time_unit := getattr(dtype, "time_unit", "us")) is None:
+            time_unit = "us"
         return lit(_timedelta_to_pl_timedelta(value, time_unit)).cast(
             Duration(time_unit)
         )
@@ -110,24 +112,14 @@ def lit(
         return lit(datetime(value.year, value.month, value.day)).cast(Date)
 
     elif isinstance(value, pl.Series):
-        name = value.name
         value = value._s
-        e = wrap_expr(plr.lit(value, allow_object))
-        if name == "":
-            return e
-        return e.alias(name)
+        return wrap_expr(plr.lit(value, allow_object))
 
     elif _check_for_numpy(value) and isinstance(value, np.ndarray):
-        return lit(pl.Series("", value))
+        return lit(pl.Series("literal", value, dtype=dtype))
 
     elif isinstance(value, (list, tuple)):
-        issue_deprecation_warning(
-            "Behavior for `lit` will change for sequence inputs."
-            " The result will change to be a literal of type List."
-            " To retain the old behavior, pass a Series instead, e.g. `Series(sequence)`.",
-            version="0.18.14",
-        )
-        return lit(pl.Series("", value))
+        return lit(pl.Series("literal", [value], dtype=dtype))
 
     if dtype:
         return wrap_expr(plr.lit(value, allow_object)).cast(dtype)
@@ -143,13 +135,12 @@ def lit(
         # handle 'ns' units
         if isinstance(item, int) and hasattr(value, "dtype"):
             dtype_name = value.dtype.name
-            if dtype_name.startswith(("datetime64[", "timedelta64[")):
-                time_unit = dtype_name[11:-1]
-                return lit(item).cast(
-                    Datetime(time_unit)
-                    if dtype_name.startswith("date")
-                    else Duration(time_unit)
-                )
+            if dtype_name.startswith("datetime64["):
+                time_unit = dtype_name[len("datetime64[") : -1]
+                return lit(item).cast(Datetime(time_unit))
+            if dtype_name.startswith("timedelta64["):
+                time_unit = dtype_name[len("timedelta64[") : -1]
+                return lit(item).cast(Duration(time_unit))
 
     except AttributeError:
         item = value

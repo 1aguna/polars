@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence, overload
 
 import polars._reexport as pl
 from polars import functions as F
-from polars.datatypes import N_INFER_DEFAULT, Categorical, List, Object, Struct, Utf8
+from polars.datatypes import N_INFER_DEFAULT, Categorical, List, Object, String, Struct
 from polars.dependencies import pandas as pd
 from polars.dependencies import pyarrow as pa
 from polars.exceptions import NoDataError
@@ -17,6 +17,7 @@ from polars.utils.various import _cast_repr_strings_with_schema
 if TYPE_CHECKING:
     from polars import DataFrame, Series
     from polars.dependencies import numpy as np
+    from polars.interchange.protocol import SupportsInterchange
     from polars.type_aliases import Orientation, SchemaDefinition, SchemaDict
 
 
@@ -29,7 +30,7 @@ def from_dict(
     """
     Construct a DataFrame from a dictionary of sequences.
 
-    This operation clones data, unless you pass a ``{str: pl.Series,}`` dict.
+    This operation clones data, unless you pass a `{str: pl.Series,}` dict.
 
     Parameters
     ----------
@@ -67,7 +68,6 @@ def from_dict(
     │ 1   ┆ 3   │
     │ 2   ┆ 4   │
     └─────┴─────┘
-
     """
     return pl.DataFrame._from_dict(
         data, schema=schema, schema_overrides=schema_overrides
@@ -101,7 +101,7 @@ def from_dicts(
         to rename after loading the frame.
 
         If you want to drop some of the fields found in the input dictionaries, a
-        _partial_ schema can be declared, in which case omitted fields will not be
+        *partial* schema can be declared, in which case omitted fields will not be
         loaded. Similarly, you can extend the loaded frame with empty columns by
         adding them to the schema.
     schema_overrides : dict, default None
@@ -130,7 +130,7 @@ def from_dicts(
     │ 3   ┆ 6   │
     └─────┴─────┘
 
-    Declaring a partial ``schema`` will drop the omitted columns.
+    Declaring a partial `schema` will drop the omitted columns.
 
     >>> df = pl.from_dicts(data, schema={"a": pl.Int32})
     >>> df
@@ -145,13 +145,13 @@ def from_dicts(
     │ 3   │
     └─────┘
 
-    Can also use the ``schema`` param to extend the loaded columns with one
+    Can also use the `schema` param to extend the loaded columns with one
     or more additional (empty) columns that are not present in the input dicts:
 
     >>> pl.from_dicts(
     ...     data,
     ...     schema=["a", "b", "c", "d"],
-    ...     schema_overrides={"c": pl.Float64, "d": pl.Utf8},
+    ...     schema_overrides={"c": pl.Float64, "d": pl.String},
     ... )
     shape: (3, 4)
     ┌─────┬─────┬──────┬──────┐
@@ -163,10 +163,10 @@ def from_dicts(
     │ 2   ┆ 5   ┆ null ┆ null │
     │ 3   ┆ 6   ┆ null ┆ null │
     └─────┴─────┴──────┴──────┘
-
     """
     if not data and not (schema or schema_overrides):
-        raise NoDataError("no data, cannot infer schema")
+        msg = "no data, cannot infer schema"
+        raise NoDataError(msg)
 
     return pl.DataFrame(
         data,
@@ -233,7 +233,6 @@ def from_records(
     │ 2   ┆ 5   │
     │ 3   ┆ 6   │
     └─────┴─────┘
-
     """
     return pl.DataFrame._from_records(
         data,
@@ -285,28 +284,37 @@ def _from_dataframe_repr(m: re.Match[str]) -> DataFrame:
             if coldata:
                 coldata.pop(idx)
 
-    # init cols as utf8 Series, handle "null" -> None, create schema from repr dtype
-    data = [pl.Series([(None if v == "null" else v) for v in cd]) for cd in coldata]
+    # init cols as String Series, handle "null" -> None, create schema from repr dtype
+    data = [
+        pl.Series([(None if v == "null" else v) for v in cd], dtype=String)
+        for cd in coldata
+    ]
     schema = dict(zip(headers, (dtype_short_repr_to_dtype(d) for d in dtypes)))
+    if schema and data and (n_extend_cols := (len(schema) - len(data))) > 0:
+        empty_data = [None] * len(data[0])
+        data.extend((pl.Series(empty_data, dtype=String)) for _ in range(n_extend_cols))
     for dtype in set(schema.values()):
         if dtype in (List, Struct, Object):
-            raise NotImplementedError(
+            msg = (
                 f"`from_repr` does not support data type {dtype.base_type().__name__!r}"
             )
+            raise NotImplementedError(msg)
 
     # construct DataFrame from string series and cast from repr to native dtype
     df = pl.DataFrame(data=data, orient="col", schema=list(schema))
     if no_dtypes:
         if df.is_empty():
             # if no dtypes *and* empty, default to string
-            return df.with_columns(F.all().cast(Utf8))
+            return df.with_columns(F.all().cast(String))
         else:
             # otherwise, take a trip through our CSV inference logic
-            if all(tp == Utf8 for tp in df.schema.values()):
+            if all(tp == String for tp in df.schema.values()):
                 buf = io.BytesIO()
                 df.write_csv(file=buf)
                 df = read_csv(buf, new_columns=df.columns, try_parse_dates=True)
             return df
+    elif schema and not data:
+        return df.cast(schema)  # type: ignore[arg-type]
     else:
         return _cast_repr_strings_with_schema(df, schema)
 
@@ -338,10 +346,10 @@ def _from_series_repr(m: re.Match[str]) -> Series:
     if not values:
         return pl.Series(name=name, values=values, dtype=dtype)
     else:
-        srs = pl.Series(name=name, values=values, dtype=Utf8)
+        srs = pl.Series(name=name, values=values, dtype=String)
         if dtype is None:
             return srs
-        elif dtype in (Categorical, Utf8):
+        elif dtype in (Categorical, String):
             return srs.str.replace('^"(.*)"$', r"$1").cast(dtype)
 
         return _cast_repr_strings_with_schema(
@@ -404,15 +412,10 @@ def from_repr(tbl: str) -> DataFrame | Series:
     │ 123456780       ┆ 9876543210        ┆ a:b:c ┆ 2023-03-25 10:56:59.663053 JST │
     │ 803065983       ┆ 2055938745        ┆ x:y:z ┆ 2023-03-25 12:38:18.050545 JST │
     └─────────────────┴───────────────────┴───────┴────────────────────────────────┘
-    >>> df.schema
-    {'source_actor_id': Int32,
-     'source_channel_id': Int64,
-     'ident': Utf8,
-     'timestamp': Datetime(time_unit='us', time_zone='Asia/Tokyo')}
 
     From Series repr:
 
-    >>> srs = pl.from_repr(
+    >>> s = pl.from_repr(
     ...     '''
     ...     shape: (3,)
     ...     Series: 's' [bool]
@@ -423,9 +426,8 @@ def from_repr(tbl: str) -> DataFrame | Series:
     ...     ]
     ...     '''
     ... )
-    >>> srs.to_list()
+    >>> s.to_list()
     [True, False, True]
-
     """
     # find DataFrame table...
     m = re.search(r"([┌╭].*?[┘╯])", tbl, re.DOTALL)
@@ -441,7 +443,8 @@ def from_repr(tbl: str) -> DataFrame | Series:
     if m is not None:
         return _from_series_repr(m)
 
-    raise ValueError("input string does not contain DataFrame or Series")
+    msg = "input string does not contain DataFrame or Series"
+    raise ValueError(msg)
 
 
 def from_numpy(
@@ -498,7 +501,6 @@ def from_numpy(
     │ 2   ┆ 5   │
     │ 3   ┆ 6   │
     └─────┴─────┘
-
     """
     return pl.DataFrame._from_numpy(
         data, schema=schema, orient=orient, schema_overrides=schema_overrides
@@ -585,7 +587,6 @@ def from_arrow(
         2
         3
     ]
-
     """  # noqa: W505
     if isinstance(data, pa.Table):
         return pl.DataFrame._from_arrow(
@@ -619,9 +620,8 @@ def from_arrow(
             schema_overrides=schema_overrides,
         )
 
-    raise TypeError(
-        f"expected PyArrow Table, Array, or one or more RecordBatches; got {type(data).__name__!r}"
-    )
+    msg = f"expected PyArrow Table, Array, or one or more RecordBatches; got {type(data).__name__!r}"
+    raise TypeError(msg)
 
 
 @overload
@@ -649,7 +649,7 @@ def from_pandas(
 
 
 def from_pandas(
-    data: pd.DataFrame | pd.Series[Any] | pd.Index[Any],
+    data: pd.DataFrame | pd.Series[Any] | pd.Index[Any] | pd.DatetimeIndex,
     *,
     schema_overrides: SchemaDict | None = None,
     rechunk: bool = True,
@@ -672,7 +672,7 @@ def from_pandas(
     rechunk : bool, default True
         Make sure that all data is in contiguous memory.
     nan_to_null : bool, default True
-        If data contains `NaN` values PyArrow will convert the ``NaN`` to ``None``
+        If data contains `NaN` values PyArrow will convert the `NaN` to `None`
     include_index : bool, default False
         Load any non-default pandas indexes as columns.
 
@@ -711,9 +711,8 @@ def from_pandas(
         2
         3
     ]
-
     """
-    if isinstance(data, (pd.Series, pd.DatetimeIndex)):
+    if isinstance(data, (pd.Series, pd.Index, pd.DatetimeIndex)):
         return pl.Series._from_pandas("", data, nan_to_null=nan_to_null)
     elif isinstance(data, pd.DataFrame):
         return pl.DataFrame._from_pandas(
@@ -724,6 +723,49 @@ def from_pandas(
             include_index=include_index,
         )
     else:
-        raise TypeError(
-            f"expected pandas DataFrame or Series, got {type(data).__name__!r}"
-        )
+        msg = f"expected pandas DataFrame or Series, got {type(data).__name__!r}"
+        raise TypeError(msg)
+
+
+def from_dataframe(df: SupportsInterchange, *, allow_copy: bool = True) -> DataFrame:
+    """
+    Build a Polars DataFrame from any dataframe supporting the interchange protocol.
+
+    Parameters
+    ----------
+    df
+        Object supporting the dataframe interchange protocol, i.e. must have implemented
+        the `__dataframe__` method.
+    allow_copy
+        Allow memory to be copied to perform the conversion. If set to False, causes
+        conversions that are not zero-copy to fail.
+
+    Notes
+    -----
+    Details on the Python dataframe interchange protocol:
+    https://data-apis.org/dataframe-protocol/latest/index.html
+
+    Using a dedicated function like :func:`from_pandas` or :func:`from_arrow` is a more
+    efficient method of conversion.
+
+    Examples
+    --------
+    Convert a pandas dataframe to Polars through the interchange protocol.
+
+    >>> import pandas as pd
+    >>> df_pd = pd.DataFrame({"a": [1, 2], "b": [3.0, 4.0], "c": ["x", "y"]})
+    >>> dfi = df_pd.__dataframe__()
+    >>> pl.from_dataframe(dfi)
+    shape: (2, 3)
+    ┌─────┬─────┬─────┐
+    │ a   ┆ b   ┆ c   │
+    │ --- ┆ --- ┆ --- │
+    │ i64 ┆ f64 ┆ str │
+    ╞═════╪═════╪═════╡
+    │ 1   ┆ 3.0 ┆ x   │
+    │ 2   ┆ 4.0 ┆ y   │
+    └─────┴─────┴─────┘
+    """
+    from polars.interchange.from_dataframe import from_dataframe
+
+    return from_dataframe(df, allow_copy=allow_copy)

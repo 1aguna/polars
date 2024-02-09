@@ -1,6 +1,5 @@
-use arrow::bitmap::Bitmap;
-
-use crate::index::IdxSize;
+use crate::bitmap::Bitmap;
+use crate::legacy::index::IdxSize;
 
 /// # Safety
 /// doesn't do any bound checks

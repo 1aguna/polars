@@ -22,8 +22,39 @@ mod read;
 mod read_impl;
 mod write;
 
+use std::borrow::Cow;
+
+pub use polars_parquet::write::FileMetaData;
 pub use read::*;
 pub use write::{BrotliLevel, GzipLevel, ZstdLevel, *};
+
+use crate::parquet::read_impl::materialize_hive_partitions;
+use crate::utils::apply_projection;
+
+pub type FileMetaDataRef = Arc<FileMetaData>;
+
+pub fn materialize_empty_df(
+    projection: Option<&[usize]>,
+    reader_schema: &ArrowSchema,
+    hive_partition_columns: Option<&[Series]>,
+    row_index: Option<&RowIndex>,
+) -> DataFrame {
+    let schema = if let Some(projection) = projection {
+        Cow::Owned(apply_projection(reader_schema, projection))
+    } else {
+        Cow::Borrowed(reader_schema)
+    };
+    let mut df = DataFrame::from(schema.as_ref());
+
+    if let Some(row_index) = row_index {
+        df.insert_column(0, Series::new_empty(&row_index.name, &IDX_DTYPE))
+            .unwrap();
+    }
+
+    materialize_hive_partitions(&mut df, hive_partition_columns, 0);
+
+    df
+}
 
 use super::*;
 
@@ -67,7 +98,7 @@ mod test {
         f.seek(SeekFrom::Start(0))?;
 
         let read = ParquetReader::new(f).finish()?;
-        assert!(read.frame_equal_missing(&df));
+        assert!(read.equals_missing(&df));
         Ok(())
     }
 
@@ -87,7 +118,7 @@ mod test {
             .finish()
             .unwrap();
         assert_eq!(df_read.shape(), (3, 2));
-        df_read.frame_equal(&expected);
+        df_read.equals(&expected);
     }
 
     #[test]
@@ -106,6 +137,6 @@ mod test {
             .finish()
             .unwrap();
         assert_eq!(df_read.shape(), (3, 2));
-        df_read.frame_equal(&expected);
+        df_read.equals(&expected);
     }
 }

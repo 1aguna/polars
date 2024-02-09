@@ -22,7 +22,7 @@ def test_map_no_dtype_set_8531() -> None:
     df = pl.DataFrame({"a": [1]})
 
     result = df.with_columns(
-        pl.col("a").map_batches(lambda x: x * 2).shift_and_fill(fill_value=0, periods=0)
+        pl.col("a").map_batches(lambda x: x * 2).shift(n=0, fill_value=0)
     )
 
     expected = pl.DataFrame({"a": [2]})
@@ -36,8 +36,8 @@ def test_error_on_reducing_map() -> None:
     with pytest.raises(
         pl.InvalidOperationError,
         match=(
-            r"output length of `map` \(6\) must be equal to "
-            r"the input length \(1\); consider using `apply` instead"
+            r"output length of `map` \(1\) must be equal to "
+            r"the input length \(6\); consider using `apply` instead"
         ),
     ):
         df.group_by("id").agg(pl.map_batches(["t", "y"], np.trapz))
@@ -47,17 +47,27 @@ def test_error_on_reducing_map() -> None:
     with pytest.raises(
         pl.InvalidOperationError,
         match=(
-            r"output length of `map` \(4\) must be equal to "
-            r"the input length \(1\); consider using `apply` instead"
+            r"output length of `map` \(1\) must be equal to "
+            r"the input length \(4\); consider using `apply` instead"
         ),
     ):
         df.select(
             pl.col("x")
             .map_batches(
-                lambda x: x.cut(breaks=[1, 2, 3], include_breaks=True).struct.unnest()
+                lambda x: x.cut(breaks=[1, 2, 3], include_breaks=True).struct.unnest(),
+                is_elementwise=True,
             )
             .over("group")
         )
+
+
+def test_map_batches_group() -> None:
+    df = pl.DataFrame(
+        {"id": [0, 0, 0, 1, 1, 1], "t": [2, 4, 5, 10, 11, 14], "y": [0, 1, 1, 2, 3, 4]}
+    )
+    assert df.group_by("id").agg(pl.col("t").map_batches(lambda s: s.sum())).sort(
+        "id"
+    ).to_dict(as_series=False) == {"id": [0, 1], "t": [[11], [35]]}
 
 
 def test_map_deprecated() -> None:
@@ -67,3 +77,21 @@ def test_map_deprecated() -> None:
         pl.col("a").map(lambda x: x)
     with pytest.deprecated_call():
         pl.LazyFrame({"a": [1, 2]}).map(lambda x: x)
+
+
+def test_ufunc_args() -> None:
+    df = pl.DataFrame({"a": [1, 2, 3], "b": [2, 4, 6]})
+    result = df.select(
+        z=np.add(  # type: ignore[call-overload]
+            pl.col("a"), pl.col("b")
+        )
+    )
+    expected = pl.DataFrame({"z": [3, 6, 9]})
+    assert_frame_equal(result, expected)
+    result = df.select(
+        z=np.add(  # type: ignore[call-overload]
+            2, pl.col("a")
+        )
+    )
+    expected = pl.DataFrame({"z": [3, 4, 5]})
+    assert_frame_equal(result, expected)

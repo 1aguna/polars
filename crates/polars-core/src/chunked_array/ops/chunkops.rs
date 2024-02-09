@@ -1,6 +1,6 @@
 #[cfg(feature = "object")]
 use arrow::array::Array;
-use polars_arrow::kernels::concatenate::concatenate_owned_unchecked;
+use arrow::legacy::kernels::concatenate::concatenate_owned_unchecked;
 use polars_error::constants::LENGTH_LIMIT_MSG;
 
 use super::*;
@@ -9,7 +9,7 @@ use crate::chunked_array::object::builder::ObjectChunkedBuilder;
 use crate::utils::slice_offsets;
 
 #[inline]
-fn slice(
+pub(crate) fn slice(
     chunks: &[ArrayRef],
     offset: i64,
     slice_length: usize,
@@ -55,8 +55,27 @@ fn slice(
 
 impl<T: PolarsDataType> ChunkedArray<T> {
     /// Get the length of the ChunkedArray
+    #[inline]
     pub fn len(&self) -> usize {
         self.length as usize
+    }
+
+    /// Return the number of null values in the ChunkedArray.
+    #[inline]
+    pub fn null_count(&self) -> usize {
+        self.null_count as usize
+    }
+
+    /// Set the null count directly.
+    ///
+    /// This can be useful after mutably adjusting the validity of the
+    /// underlying arrays.
+    ///
+    /// # Safety
+    /// The new null count must match the total null count of the underlying
+    /// arrays.
+    pub unsafe fn set_null_count(&mut self, null_count: IdxSize) {
+        self.null_count = null_count;
     }
 
     /// Check if ChunkedArray is empty.
@@ -74,16 +93,17 @@ impl<T: PolarsDataType> ChunkedArray<T> {
             }
         }
         self.length = IdxSize::try_from(inner(&self.chunks)).expect(LENGTH_LIMIT_MSG);
-
-        if self.length <= 1 {
-            self.set_sorted_flag(IsSorted::Ascending)
-        }
+        self.null_count = self
+            .chunks
+            .iter()
+            .map(|arr| arr.null_count())
+            .sum::<usize>() as IdxSize;
     }
 
     pub fn rechunk(&self) -> Self {
         match self.dtype() {
             #[cfg(feature = "object")]
-            DataType::Object(_) => {
+            DataType::Object(_, _) => {
                 panic!("implementation error")
             },
             _ => {
@@ -108,10 +128,23 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     /// and will slice the best match when offset, or length is out of bounds
     #[inline]
     pub fn slice(&self, offset: i64, length: usize) -> Self {
-        let (chunks, len) = slice(&self.chunks, offset, length, self.len());
-        let mut out = unsafe { self.copy_with_chunks(chunks, true, true) };
-        out.length = len as IdxSize;
-        out
+        // The len: 0 special cases ensure we release memory.
+        // A normal slice, slice the buffers and thus keep the whole memory allocated.
+        let exec = || {
+            let (chunks, len) = slice(&self.chunks, offset, length, self.len());
+            let mut out = unsafe { self.copy_with_chunks(chunks, true, true) };
+            out.length = len as IdxSize;
+            out
+        };
+
+        match length {
+            0 => match self.dtype() {
+                #[cfg(feature = "object")]
+                DataType::Object(_, _) => exec(),
+                _ => self.clear(),
+            },
+            _ => exec(),
+        }
     }
 
     /// Take a view of top n elements
@@ -146,6 +179,23 @@ impl<T: PolarsDataType> ChunkedArray<T> {
             None => std::cmp::min(10, self.len()),
         };
         self.slice(-(len as i64), len)
+    }
+
+    /// Remove empty chunks.
+    pub fn prune_empty_chunks(&mut self) {
+        let mut count = 0u32;
+        unsafe {
+            self.chunks_mut().retain(|arr| {
+                count += 1;
+                // Always keep at least one chunk
+                if count == 1 {
+                    true
+                } else {
+                    // Remove the empty chunks
+                    arr.len() > 0
+                }
+            })
+        }
     }
 }
 
@@ -191,7 +241,9 @@ mod test {
     #[cfg(feature = "dtype-categorical")]
     fn test_categorical_map_after_rechunk() {
         let s = Series::new("", &["foo", "bar", "spam"]);
-        let mut a = s.cast(&DataType::Categorical(None)).unwrap();
+        let mut a = s
+            .cast(&DataType::Categorical(None, Default::default()))
+            .unwrap();
 
         a.append(&a.slice(0, 2)).unwrap();
         let a = a.rechunk();

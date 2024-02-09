@@ -8,7 +8,7 @@ from polars.datatypes import N_INFER_DEFAULT, py_type_to_dtype
 from polars.io.csv._utils import _update_columns
 from polars.utils._wrap import wrap_df
 from polars.utils.various import (
-    _prepare_row_count_args,
+    _prepare_row_index_args,
     _process_null_values,
     handle_projection_columns,
     normalize_filepath,
@@ -32,8 +32,8 @@ class BatchedCsvReader:
         has_header: bool = True,
         columns: Sequence[int] | Sequence[str] | None = None,
         separator: str = ",",
-        comment_char: str | None = None,
-        quote_char: str | None = r'"',
+        comment_prefix: str | None = None,
+        quote_char: str | None = '"',
         skip_rows: int = 0,
         dtypes: None | (SchemaDict | Sequence[PolarsDataType]) = None,
         null_values: str | Sequence[str] | dict[str, str] | None = None,
@@ -48,8 +48,8 @@ class BatchedCsvReader:
         low_memory: bool = False,
         rechunk: bool = True,
         skip_rows_after_header: int = 0,
-        row_count_name: str | None = None,
-        row_count_offset: int = 0,
+        row_index_name: str | None = None,
+        row_index_offset: int = 0,
         sample_size: int = 1024,
         eol_char: str = "\n",
         new_columns: Sequence[str] | None = None,
@@ -70,7 +70,8 @@ class BatchedCsvReader:
             elif isinstance(dtypes, Sequence):
                 dtype_slice = dtypes
             else:
-                raise TypeError("`dtypes` arg should be list or dict")
+                msg = "`dtypes` arg should be list or dict"
+                raise TypeError(msg)
 
         processed_null_values = _process_null_values(null_values)
         projection, columns = handle_projection_columns(columns)
@@ -92,13 +93,13 @@ class BatchedCsvReader:
             overwrite_dtype=dtype_list,
             overwrite_dtype_slice=dtype_slice,
             low_memory=low_memory,
-            comment_char=comment_char,
+            comment_prefix=comment_prefix,
             quote_char=quote_char,
             null_values=processed_null_values,
             missing_utf8_is_empty_string=missing_utf8_is_empty_string,
             try_parse_dates=try_parse_dates,
             skip_rows_after_header=skip_rows_after_header,
-            row_count=_prepare_row_count_args(row_count_name, row_count_offset),
+            row_index=_prepare_row_index_args(row_index_name, row_index_offset),
             sample_size=sample_size,
             eol_char=eol_char,
             raise_if_empty=raise_if_empty,
@@ -108,9 +109,9 @@ class BatchedCsvReader:
 
     def next_batches(self, n: int) -> list[DataFrame] | None:
         """
-        Read ``n`` batches from the reader.
+        Read `n` batches from the reader.
 
-        The ``n`` chunks will be parallelized over the
+        The `n` chunks will be parallelized over the
         available threads.
 
         Parameters
@@ -131,7 +132,6 @@ class BatchedCsvReader:
         Returns
         -------
         list of DataFrames
-
         """
         batches = self._reader.next_batches(n)
         if batches is not None:

@@ -93,7 +93,8 @@ def test_rows_by_key() -> None:
         "b": [("b", "q", 2.5, 8), ("b", "q", 3.0, 7)],
     }
     assert df.rows_by_key("w", include_key=True) == {
-        key: grp.rows() for key, grp in df.group_by("w")
+        key[0]: grp.rows()  # type: ignore[index]
+        for key, grp in df.group_by(["w"])
     }
     assert df.rows_by_key("w", include_key=True, unique=True) == {
         "a": ("a", "k", 4.5, 6),
@@ -135,7 +136,8 @@ def test_rows_by_key() -> None:
         ],
     }
     assert df.rows_by_key("w", named=True, include_key=True) == {
-        key: grp.rows(named=True) for key, grp in df.group_by("w")
+        key[0]: grp.rows(named=True)  # type: ignore[index]
+        for key, grp in df.group_by(["w"])
     }
     assert df.rows_by_key("w", named=True, include_key=True, unique=True) == {
         "a": {"w": "a", "x": "k", "y": 4.5, "z": 6},
@@ -220,9 +222,9 @@ def test_iter_rows() -> None:
     ]
 
 
-def test_row_constructor_schema() -> None:
-    expected = {"d": [1, 2, 3]}
-    for primitive in [
+@pytest.mark.parametrize(
+    "primitive",
+    [
         pl.UInt8,
         pl.Int8,
         pl.UInt16,
@@ -231,17 +233,16 @@ def test_row_constructor_schema() -> None:
         pl.Int32,
         pl.UInt64,
         pl.Int64,
-    ]:
-        out = pl.DataFrame(
-            data=[
-                [1],
-                [2],
-                [3],
-            ],
-            schema={"d": primitive},
-        )
-        assert out.dtypes == [primitive]
-        assert out.to_dict(False) == expected
+    ],
+)
+def test_row_constructor_schema(primitive: pl.DataType) -> None:
+    result = pl.DataFrame(
+        data=[[1], [2], [3]],
+        schema={"d": primitive},
+    )
+
+    assert result.dtypes == [primitive]
+    assert result.to_dict(as_series=False) == {"d": [1, 2, 3]}
 
 
 def test_row_constructor_uint64() -> None:

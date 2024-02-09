@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use polars::io::mmap::MmapBytesReader;
-use polars::io::RowCount;
+use polars::io::RowIndex;
 use polars::prelude::*;
 use polars_rs::prelude::read_impl::OwnedBatchedCsvReader;
 use pyo3::prelude::*;
@@ -25,12 +25,11 @@ pub struct PyBatchedCsv {
 #[allow(clippy::wrong_self_convention, clippy::should_implement_trait)]
 impl PyBatchedCsv {
     #[staticmethod]
-    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         infer_schema_length, chunk_size, has_header, ignore_errors, n_rows, skip_rows,
         projection, separator, rechunk, columns, encoding, n_threads, path, overwrite_dtype,
-        overwrite_dtype_slice, low_memory, comment_char, quote_char, null_values,
-        missing_utf8_is_empty_string, try_parse_dates, skip_rows_after_header, row_count,
+        overwrite_dtype_slice, low_memory, comment_prefix, quote_char, null_values,
+        missing_utf8_is_empty_string, try_parse_dates, skip_rows_after_header, row_index,
         sample_size, eol_char, raise_if_empty, truncate_ragged_lines)
     )]
     fn new(
@@ -50,22 +49,21 @@ impl PyBatchedCsv {
         overwrite_dtype: Option<Vec<(&str, Wrap<DataType>)>>,
         overwrite_dtype_slice: Option<Vec<Wrap<DataType>>>,
         low_memory: bool,
-        comment_char: Option<&str>,
+        comment_prefix: Option<&str>,
         quote_char: Option<&str>,
         null_values: Option<Wrap<NullValues>>,
         missing_utf8_is_empty_string: bool,
         try_parse_dates: bool,
         skip_rows_after_header: usize,
-        row_count: Option<(String, IdxSize)>,
+        row_index: Option<(String, IdxSize)>,
         sample_size: usize,
         eol_char: &str,
         raise_if_empty: bool,
         truncate_ragged_lines: bool,
     ) -> PyResult<PyBatchedCsv> {
         let null_values = null_values.map(|w| w.0);
-        let comment_char = comment_char.map(|s| s.as_bytes()[0]);
         let eol_char = eol_char.as_bytes()[0];
-        let row_count = row_count.map(|(name, offset)| RowCount { name, offset });
+        let row_index = row_index.map(|(name, offset)| RowIndex { name, offset });
         let quote_char = if let Some(s) = quote_char {
             if s.is_empty() {
                 None
@@ -99,7 +97,7 @@ impl PyBatchedCsv {
             .infer_schema(infer_schema_length)
             .has_header(has_header)
             .with_n_rows(n_rows)
-            .with_delimiter(separator.as_bytes()[0])
+            .with_separator(separator.as_bytes()[0])
             .with_skip_rows(skip_rows)
             .with_ignore_errors(ignore_errors)
             .with_projection(projection)
@@ -111,13 +109,13 @@ impl PyBatchedCsv {
             .with_dtypes_slice(overwrite_dtype_slice.as_deref())
             .with_missing_is_null(!missing_utf8_is_empty_string)
             .low_memory(low_memory)
-            .with_comment_char(comment_char)
+            .with_comment_prefix(comment_prefix)
             .with_null_values(null_values)
             .with_try_parse_dates(try_parse_dates)
             .with_quote_char(quote_char)
             .with_end_of_line_char(eol_char)
             .with_skip_rows_after_header(skip_rows_after_header)
-            .with_row_count(row_count)
+            .with_row_index(row_index)
             .sample_size(sample_size)
             .truncate_ragged_lines(truncate_ragged_lines)
             .raise_if_empty(raise_if_empty);

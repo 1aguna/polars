@@ -1,4 +1,3 @@
-use polars_arrow::data_types::IsFloat;
 use polars_row::{convert_columns, RowsEncoded, SortField};
 use polars_utils::iter::EnumerateIdxTrait;
 
@@ -23,7 +22,7 @@ pub(crate) fn args_validate<T: PolarsDataType>(
     Ok(())
 }
 
-pub(crate) fn arg_sort_multiple_impl<T: PartialOrd + Send + IsFloat + Copy>(
+pub(crate) fn arg_sort_multiple_impl<T: TotalOrd + Send + Copy>(
     mut vals: Vec<(IdxSize, T)>,
     options: &SortMultipleOptions,
 ) -> PolarsResult<IdxCa> {
@@ -32,13 +31,13 @@ pub(crate) fn arg_sort_multiple_impl<T: PartialOrd + Send + IsFloat + Copy>(
     let compare_inner: Vec<_> = options
         .other
         .iter()
-        .map(|s| s.into_partial_ord_inner())
+        .map(|s| s.into_total_ord_inner())
         .collect_trusted();
 
     let first_descending = descending[0];
     POOL.install(|| {
         vals.par_sort_by(|tpl_a, tpl_b| {
-            match (first_descending, compare_fn_nan_max(&tpl_a.1, &tpl_b.1)) {
+            match (first_descending, tpl_a.1.tot_cmp(&tpl_b.1)) {
                 // if ordering is equal, we check the other arrays until we find a non-equal ordering
                 // if we have exhausted all arrays, we keep the equal ordering.
                 (_, Ordering::Equal) => {
@@ -70,21 +69,21 @@ pub fn _get_rows_encoded_compat_array(by: &Series) -> PolarsResult<ArrayRef> {
 
     let out = match by.dtype() {
         #[cfg(feature = "dtype-categorical")]
-        DataType::Categorical(_) => {
+        DataType::Categorical(_, _) | DataType::Enum(_, _) => {
             let ca = by.categorical().unwrap();
             if ca.uses_lexical_ordering() {
-                by.to_arrow(0)
+                by.to_arrow(0, true)
             } else {
-                ca.logical().chunks[0].clone()
+                ca.physical().chunks[0].clone()
             }
         },
-        _ => by.to_arrow(0),
+        _ => by.to_arrow(0, true),
     };
     Ok(out)
 }
 
 #[cfg(feature = "dtype-struct")]
-pub(crate) fn encode_rows_vertical(by: &[Series]) -> PolarsResult<BinaryChunked> {
+pub(crate) fn encode_rows_vertical(by: &[Series]) -> PolarsResult<BinaryOffsetChunked> {
     let n_threads = POOL.current_num_threads();
     let len = by[0].len();
     let splits = _split_offsets(len, n_threads);
@@ -102,7 +101,7 @@ pub(crate) fn encode_rows_vertical(by: &[Series]) -> PolarsResult<BinaryChunked>
         })
         .collect();
 
-    Ok(BinaryChunked::from_chunk_iter("", chunks?))
+    Ok(BinaryOffsetChunked::from_chunk_iter("", chunks?))
 }
 
 pub fn _get_rows_encoded(
@@ -143,9 +142,9 @@ pub fn _get_rows_encoded_ca(
     by: &[Series],
     descending: &[bool],
     nulls_last: bool,
-) -> PolarsResult<BinaryChunked> {
+) -> PolarsResult<BinaryOffsetChunked> {
     _get_rows_encoded(by, descending, nulls_last)
-        .map(|rows| BinaryChunked::with_chunk(name, rows.into_array()))
+        .map(|rows| BinaryOffsetChunked::with_chunk(name, rows.into_array()))
 }
 
 pub(crate) fn argsort_multiple_row_fmt(

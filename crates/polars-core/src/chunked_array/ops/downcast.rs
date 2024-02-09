@@ -49,7 +49,17 @@ impl<'a, T> Chunks<'a, T> {
 #[doc(hidden)]
 impl<T: PolarsDataType> ChunkedArray<T> {
     #[inline]
-    pub fn downcast_iter(&self) -> impl Iterator<Item = &T::Array> + DoubleEndedIterator {
+    pub fn downcast_into_iter(mut self) -> impl DoubleEndedIterator<Item = T::Array> {
+        let chunks = std::mem::take(&mut self.chunks);
+        chunks.into_iter().map(|arr| {
+            // SAFETY: T::Array guarantees this is correct.
+            let ptr = Box::into_raw(arr).cast::<T::Array>();
+            unsafe { *Box::from_raw(ptr) }
+        })
+    }
+
+    #[inline]
+    pub fn downcast_iter(&self) -> impl DoubleEndedIterator<Item = &T::Array> {
         self.chunks.iter().map(|arr| {
             // SAFETY: T::Array guarantees this is correct.
             let arr = &**arr;
@@ -57,14 +67,25 @@ impl<T: PolarsDataType> ChunkedArray<T> {
         })
     }
 
+    #[inline]
+    pub fn downcast_slices(&self) -> Option<impl DoubleEndedIterator<Item = &[T::Physical<'_>]>> {
+        if self.null_count != 0 {
+            return None;
+        }
+        let arr = self.downcast_iter().next().unwrap();
+        if arr.as_slice().is_some() {
+            Some(self.downcast_iter().map(|arr| arr.as_slice().unwrap()))
+        } else {
+            None
+        }
+    }
+
     /// # Safety
     /// The caller must ensure:
     ///     * the length remains correct.
     ///     * the flags (sorted, etc) remain correct.
     #[inline]
-    pub unsafe fn downcast_iter_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut T::Array> + DoubleEndedIterator {
+    pub unsafe fn downcast_iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut T::Array> {
         self.chunks.iter_mut().map(|arr| {
             // SAFETY: T::Array guarantees this is correct.
             let arr = &mut **arr;
@@ -99,7 +120,13 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     #[inline]
     pub(crate) fn index_to_chunked_index(&self, index: usize) -> (usize, usize) {
         if self.chunks.len() == 1 {
-            return (0, index);
+            // SAFETY: chunks.len() == 1 guarantees this is correct.
+            let len = unsafe { self.chunks.get_unchecked(0).len() };
+            return if index < len {
+                (0, index)
+            } else {
+                (1, index - len)
+            };
         }
         index_to_chunked_index(self.downcast_iter().map(|arr| arr.len()), index)
     }

@@ -24,6 +24,7 @@ pub(crate) mod debug;
 mod file_scan;
 mod format;
 mod functions;
+pub(super) mod hive;
 pub(crate) mod iterator;
 mod lit;
 pub(crate) mod optimizer;
@@ -33,7 +34,6 @@ mod projection_expr;
 #[cfg(feature = "python")]
 mod pyarrow;
 mod schema;
-#[cfg(any(feature = "meta", feature = "cse"))]
 pub(crate) mod tree_format;
 pub mod visitor;
 
@@ -54,7 +54,14 @@ pub use schema::*;
 use serde::{Deserialize, Serialize};
 use strum_macros::IntoStaticStr;
 
-#[cfg(any(feature = "ipc", feature = "parquet", feature = "csv", feature = "cse"))]
+use self::tree_format::{TreeFmtNode, TreeFmtVisitor};
+#[cfg(any(
+    feature = "ipc",
+    feature = "parquet",
+    feature = "csv",
+    feature = "cse",
+    feature = "json"
+))]
 pub use crate::logical_plan::optimizer::file_caching::{
     collect_fingerprints, find_column_union_and_fingerprints, FileCacher, FileFingerPrint,
 };
@@ -68,72 +75,64 @@ pub enum Context {
 }
 
 #[derive(Debug)]
-pub enum ErrorState {
-    NotYetEncountered { err: PolarsError },
-    AlreadyEncountered { prev_err_msg: String },
-}
-
-impl std::fmt::Display for ErrorState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErrorState::NotYetEncountered { err } => write!(f, "NotYetEncountered({err})")?,
-            ErrorState::AlreadyEncountered { prev_err_msg } => {
-                write!(f, "AlreadyEncountered({prev_err_msg})")?
-            },
-        };
-
-        Ok(())
-    }
+pub(crate) struct ErrorStateUnsync {
+    n_times: usize,
+    err: PolarsError,
 }
 
 #[derive(Clone)]
-pub struct ErrorStateSync(Arc<Mutex<ErrorState>>);
+pub struct ErrorState(pub(crate) Arc<Mutex<ErrorStateUnsync>>);
 
-impl std::ops::Deref for ErrorStateSync {
-    type Target = Arc<Mutex<ErrorState>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for ErrorStateSync {
+impl std::fmt::Debug for ErrorState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ErrorStateSync({})", &*self.0.lock().unwrap())
+        let this = self.0.lock().unwrap();
+        // Skip over the Arc<Mutex<ErrorStateUnsync>> and just print the fields we care
+        // about. Technically this is misleading, but the insides of ErrorState are not
+        // public, so this only affects authors of polars, not users (and the odds that
+        // this affects authors is slim)
+        f.debug_struct("ErrorState")
+            .field("n_times", &this.n_times)
+            .field("err", &this.err)
+            .finish()
     }
 }
 
-impl ErrorStateSync {
-    fn take(&self) -> PolarsError {
-        let mut curr_err = self.0.lock().unwrap();
-
-        match &*curr_err {
-            ErrorState::NotYetEncountered { err: polars_err } => {
-                // Need to finish using `polars_err` here so that NLL considers `err` dropped
-                let prev_err_msg = polars_err.to_string();
-                // Place AlreadyEncountered in `self` for future users of `self`
-                let prev_err = std::mem::replace(
-                    &mut *curr_err,
-                    ErrorState::AlreadyEncountered { prev_err_msg },
-                );
-                // Since we're in this branch, we know err was a NotYetEncountered
-                match prev_err {
-                    ErrorState::NotYetEncountered { err } => err,
-                    ErrorState::AlreadyEncountered { .. } => unreachable!(),
-                }
-            },
-            ErrorState::AlreadyEncountered { prev_err_msg } => {
-                polars_err!(
-                    ComputeError: "LogicalPlan already failed with error: '{}'", prev_err_msg,
-                )
-            },
-        }
-    }
-}
-
-impl From<PolarsError> for ErrorStateSync {
+impl From<PolarsError> for ErrorState {
     fn from(err: PolarsError) -> Self {
-        Self(Arc::new(Mutex::new(ErrorState::NotYetEncountered { err })))
+        Self(Arc::new(Mutex::new(ErrorStateUnsync { n_times: 0, err })))
+    }
+}
+
+impl ErrorState {
+    fn take(&self) -> PolarsError {
+        let mut this = self.0.lock().unwrap();
+
+        let ret_err = if this.n_times == 0 {
+            this.err.wrap_msg(&|msg| msg.to_owned())
+        } else {
+            this.err.wrap_msg(&|msg| {
+                let n_times = this.n_times;
+
+                let plural_s;
+                let was_were;
+
+                if n_times == 1 {
+                    plural_s = "";
+                    was_were = "was"
+                } else {
+                    plural_s = "s";
+                    was_were = "were";
+                };
+                format!(
+                    "{msg}\n\nLogicalPlan had already failed with the above error; \
+                     after failure, {n_times} additional operation{plural_s} \
+                     {was_were} attempted on the LazyFrame",
+                )
+            })
+        };
+        this.n_times += 1;
+
+        ret_err
     }
 }
 
@@ -141,13 +140,6 @@ impl From<PolarsError> for ErrorStateSync {
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum LogicalPlan {
-    #[cfg_attr(feature = "serde", serde(skip))]
-    AnonymousScan {
-        function: Arc<dyn AnonymousScan>,
-        file_info: FileInfo,
-        predicate: Option<Expr>,
-        options: Arc<AnonymousScanOptions>,
-    },
     #[cfg(feature = "python")]
     PythonScan { options: PythonOptions },
     /// Filter on a boolean mask
@@ -162,7 +154,7 @@ pub enum LogicalPlan {
         count: usize,
     },
     Scan {
-        path: PathBuf,
+        paths: Arc<[PathBuf]>,
         file_info: FileInfo,
         predicate: Option<Expr>,
         file_options: FileScanOptions,
@@ -238,11 +230,17 @@ pub enum LogicalPlan {
         inputs: Vec<LogicalPlan>,
         options: UnionOptions,
     },
+    /// Horizontal concatenation of multiple plans
+    HConcat {
+        inputs: Vec<LogicalPlan>,
+        schema: SchemaRef,
+        options: HConcatOptions,
+    },
     /// Catches errors and throws them later
     #[cfg_attr(feature = "serde", serde(skip))]
     Error {
         input: Box<LogicalPlan>,
-        err: ErrorStateSync,
+        err: ErrorState,
     },
     /// This allows expressions to access other tables
     ExtContext {
@@ -273,6 +271,12 @@ impl Default for LogicalPlan {
 impl LogicalPlan {
     pub fn describe(&self) -> String {
         format!("{self:#?}")
+    }
+
+    pub fn describe_tree_format(&self) -> String {
+        let mut visitor = TreeFmtVisitor::default();
+        TreeFmtNode::root_logical_plan(self).traverse(&mut visitor);
+        format!("{visitor:#?}")
     }
 
     pub fn to_alp(self) -> PolarsResult<(Node, Arena<ALogicalPlan>, Arena<AExpr>)> {

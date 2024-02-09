@@ -1,6 +1,6 @@
 # Lists and Arrays
 
-`Polars` has first-class support for `List` columns: that is, columns where each row is a list of homogeneous elements, of varying lengths. `Polars` also has an `Array` datatype, which is analogous to `numpy`'s `ndarray` objects, where the length is identical across rows.
+Polars has first-class support for `List` columns: that is, columns where each row is a list of homogeneous elements, of varying lengths. Polars also has an `Array` datatype, which is analogous to NumPy's `ndarray` objects, where the length is identical across rows.
 
 Note: this is different from Python's `list` object, where the elements can be of any type. Polars can store these within columns, but as a generic `Object` datatype that doesn't have the special list manipulation features that we're about to discuss.
 
@@ -39,7 +39,7 @@ However, in Polars, we often do not need to do this to operate on the `List` ele
 
 Polars provides several standard operations on `List` columns. If we want the first three measurements, we can do a `head(3)`. The last three can be obtained via a `tail(3)`, or alternately, via `slice` (negative indexing is supported). We can also identify the number of observations via `lengths`. Let's see them in action:
 
-{{code_block('user-guide/expressions/lists','list_ops',['Expr.List'])}}
+{{code_block('user-guide/expressions/lists','list_ops',['Expr.list'])}}
 
 ```python exec="on" result="text" session="user-guide/lists"
 --8<-- "python/user-guide/expressions/lists.py:list_ops"
@@ -60,7 +60,7 @@ If we need to identify the stations that are giving the most number of errors fr
 
 The third step requires a casting (or alternately, a regex pattern search) operation to be perform on each element of the list. We can do this using by applying the operation on each element by first referencing them in the `pl.element()` context, and then calling a suitable Polars expression on them. Let's see how:
 
-{{code_block('user-guide/expressions/lists','count_errors',['Expr.List', 'element'])}}
+{{code_block('user-guide/expressions/lists','count_errors',['Expr.list', 'element'])}}
 
 ```python exec="on" result="text" session="user-guide/lists"
 --8<-- "python/user-guide/expressions/lists.py:count_errors"
@@ -74,7 +74,7 @@ What if we chose the regex route (i.e. recognizing the presence of _any_ alphabe
 --8<-- "python/user-guide/expressions/lists.py:count_errors_regex"
 ```
 
-If you're unfamiliar with the `(?i)`, it's a good time to look at the documentation for the `str.contains` function in Polars! The rust regex crate provides a lot of additional regex flags that might come in handy.
+If you're unfamiliar with the `(?i)`, it's a good time to look at the documentation for the `str.contains` function in Polars! The Rust regex crate provides a lot of additional regex flags that might come in handy.
 
 ## Row-wise computations
 
@@ -88,7 +88,7 @@ We can apply **any** Polars operations on the elements of the list with the `lis
 --8<-- "python/user-guide/expressions/lists.py:weather_by_day"
 ```
 
-Let's do something interesting, where we calculate the percentage rank of the temperatures by day, measured across stations. Pandas allows you to compute the percentages of the `rank` values. `Polars` doesn't provide a special function to do this directly, but because expressions are so versatile we can create our own percentage rank expression for highest temperature. Let's try that!
+Let's do something interesting, where we calculate the percentage rank of the temperatures by day, measured across stations. Pandas allows you to compute the percentages of the `rank` values. Polars doesn't provide a special function to do this directly, but because expressions are so versatile we can create our own percentage rank expression for highest temperature. Let's try that!
 
 {{code_block('user-guide/expressions/lists','weather_by_day_rank',['list.eval'])}}
 
@@ -110,7 +110,7 @@ We can define `Array` columns in this manner:
 
 Basic operations are available on it:
 
-{{code_block('user-guide/expressions/lists','array_ops',['arr'])}}
+{{code_block('user-guide/expressions/lists','array_ops',['Series.arr'])}}
 
 ```python exec="on" result="text" session="user-guide/lists"
 --8<-- "python/user-guide/expressions/lists.py:array_ops"

@@ -164,7 +164,7 @@ def test_dataset_foo(df: pl.DataFrame, tmp_path: Path) -> None:
         )
         helper_dataset_test(
             file_path,
-            lambda lf: lf.collect(),
+            lambda lf: lf.select(pl.exclude("enum")).collect(),
             batch_size=2,
             n_expected=3,
         )
@@ -196,4 +196,6 @@ def test_pyarrow_dataset_comm_subplan_elim(tmp_path: Path) -> None:
     lf0 = pl.scan_pyarrow_dataset(ds0)
     lf1 = pl.scan_pyarrow_dataset(ds1)
 
-    assert lf0.join(lf1, on="a", how="inner").collect().to_dict(False) == {"a": [1, 2]}
+    assert lf0.join(lf1, on="a", how="inner").collect().to_dict(as_series=False) == {
+        "a": [1, 2]
+    }

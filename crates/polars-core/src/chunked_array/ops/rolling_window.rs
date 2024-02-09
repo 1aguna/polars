@@ -1,4 +1,4 @@
-use polars_arrow::prelude::DynArgs;
+use arrow::legacy::prelude::DynArgs;
 
 #[derive(Clone)]
 pub struct RollingOptionsFixedWindow {
@@ -32,11 +32,11 @@ mod inner_mod {
 
     use arrow::array::{Array, PrimitiveArray};
     use arrow::bitmap::MutableBitmap;
+    use arrow::legacy::bit_util::unset_bit_raw;
+    use arrow::legacy::trusted_len::TrustedLenPush;
     use num_traits::pow::Pow;
     use num_traits::{Float, Zero};
-    use polars_arrow::bit_util::unset_bit_raw;
-    use polars_arrow::data_types::IsFloat;
-    use polars_arrow::trusted_len::TrustedLenPush;
+    use polars_utils::float::IsFloat;
 
     use crate::prelude::*;
 
@@ -111,6 +111,12 @@ mod inner_mod {
                         // we are in bounds
                         let arr_window = unsafe { arr.slice_typed_unchecked(start, size) };
 
+                        // ensure we still meet window size criteria after removing null values
+                        if size - arr_window.null_count() < options.min_periods {
+                            builder.append_null();
+                            continue;
+                        }
+
                         // Safety.
                         // ptr is not dropped as we are in scope
                         // We are also the only owner of the contents of the Arc
@@ -158,6 +164,12 @@ mod inner_mod {
                         // safety:
                         // we are in bounds
                         let arr_window = unsafe { arr.slice_typed_unchecked(start, size) };
+
+                        // ensure we still meet window size criteria after removing null values
+                        if size - arr_window.null_count() < options.min_periods {
+                            builder.append_null();
+                            continue;
+                        }
 
                         // Safety.
                         // ptr is not dropped as we are in scope
@@ -242,7 +254,7 @@ mod inner_mod {
                 }
             }
             let arr = PrimitiveArray::new(
-                T::get_dtype().to_arrow(),
+                T::get_dtype().to_arrow(true),
                 values.into(),
                 Some(validity.into()),
             );
@@ -250,6 +262,3 @@ mod inner_mod {
         }
     }
 }
-
-#[cfg(feature = "rolling_window")]
-pub use inner_mod::*;

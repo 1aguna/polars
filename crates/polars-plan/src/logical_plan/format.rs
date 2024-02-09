@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::prelude::*;
 
@@ -9,7 +9,7 @@ use crate::prelude::*;
 fn write_scan<P: Display>(
     f: &mut Formatter,
     name: &str,
-    path: &Path,
+    path: &[PathBuf],
     indent: usize,
     n_columns: i64,
     total_columns: usize,
@@ -19,7 +19,17 @@ fn write_scan<P: Display>(
     if indent != 0 {
         writeln!(f)?;
     }
-    write!(f, "{:indent$}{} SCAN {}", "", name, path.display())?;
+    let path_fmt = match path.len() {
+        1 => path[0].to_string_lossy(),
+        0 => "".into(),
+        _ => Cow::Owned(format!(
+            "{} files: first file: {}",
+            path.len(),
+            path[0].to_string_lossy()
+        )),
+    };
+
+    write!(f, "{:indent$}{name} SCAN {path_fmt}", "")?;
     if n_columns > 0 {
         write!(
             f,
@@ -27,7 +37,7 @@ fn write_scan<P: Display>(
             "",
         )?;
     } else {
-        write!(f, "\n{:indent$}PROJECT */{total_columns} COLUMNS", "",)?;
+        write!(f, "\n{:indent$}PROJECT */{total_columns} COLUMNS", "")?;
     }
     if let Some(predicate) = predicate {
         write!(f, "\n{:indent$}SELECTION: {predicate}", "")?;
@@ -58,7 +68,7 @@ impl LogicalPlan {
                 write_scan(
                     f,
                     "PYTHON",
-                    Path::new(""),
+                    &[],
                     sub_indent,
                     n_columns,
                     total_columns,
@@ -66,32 +76,10 @@ impl LogicalPlan {
                     options.n_rows,
                 )
             },
-            AnonymousScan {
-                file_info,
-                predicate,
-                options,
-                ..
-            } => {
-                let n_columns = options
-                    .with_columns
-                    .as_ref()
-                    .map(|columns| columns.len() as i64)
-                    .unwrap_or(-1);
-                write_scan(
-                    f,
-                    options.fmt_str,
-                    Path::new(""),
-                    sub_indent,
-                    n_columns,
-                    file_info.schema.len(),
-                    predicate,
-                    options.n_rows,
-                )
-            },
             Union { inputs, options } => {
                 let mut name = String::new();
                 let name = if let Some(slice) = options.slice {
-                    write!(name, "SLICED UNION: {:?}", slice)?;
+                    write!(name, "SLICED UNION: {slice:?}")?;
                     name.as_str()
                 } else {
                     "UNION"
@@ -101,19 +89,28 @@ impl LogicalPlan {
                 // - 1 => PLAN 0, PLAN 1, ... PLAN N
                 // - 2 => actual formatting of plans
                 let sub_sub_indent = sub_indent + 2;
-                write!(f, "{:indent$}{}", "", name)?;
+                write!(f, "{:indent$}{name}", "")?;
                 for (i, plan) in inputs.iter().enumerate() {
                     write!(f, "\n{:sub_indent$}PLAN {i}:", "")?;
                     plan._format(f, sub_sub_indent)?;
                 }
-                write!(f, "\n{:indent$}END {}", "", name)
+                write!(f, "\n{:indent$}END {name}", "")
+            },
+            HConcat { inputs, .. } => {
+                let sub_sub_indent = sub_indent + 2;
+                write!(f, "{:indent$}HCONCAT", "")?;
+                for (i, plan) in inputs.iter().enumerate() {
+                    write!(f, "\n{:sub_indent$}PLAN {i}:", "")?;
+                    plan._format(f, sub_sub_indent)?;
+                }
+                write!(f, "\n{:indent$}END HCONCAT", "")
             },
             Cache { input, id, count } => {
                 write!(f, "{:indent$}CACHE[id: {:x}, count: {}]", "", *id, *count)?;
                 input._format(f, sub_indent)
             },
             Scan {
-                path,
+                paths,
                 file_info,
                 predicate,
                 scan_type,
@@ -128,7 +125,7 @@ impl LogicalPlan {
                 write_scan(
                     f,
                     scan_type.into(),
-                    path,
+                    paths,
                     sub_indent,
                     n_columns,
                     file_info.schema.len(),
@@ -197,7 +194,7 @@ impl LogicalPlan {
                 input_left._format(f, sub_indent)?;
                 write!(f, "\n{:indent$}RIGHT PLAN ON: {right_on:?}", "")?;
                 input_right._format(f, sub_indent)?;
-                write!(f, "\n{:indent$}END {} JOIN", "", how)
+                write!(f, "\n{:indent$}END {how} JOIN", "")
             },
             HStack { input, exprs, .. } => {
                 write!(f, "{:indent$} WITH_COLUMNS:", "",)?;
@@ -219,7 +216,7 @@ impl LogicalPlan {
                 write!(f, "{:indent$}{function_fmt}", "")?;
                 input._format(f, sub_indent)
             },
-            Error { input, err } => write!(f, "{err:?}\n{input:?}"),
+            Error { err, .. } => write!(f, "{err:?}"),
             ExtContext { input, .. } => {
                 write!(f, "{:indent$}EXTERNAL_CONTEXT", "")?;
                 input._format(f, sub_indent)
@@ -231,7 +228,7 @@ impl LogicalPlan {
                     #[cfg(feature = "cloud")]
                     SinkType::Cloud { .. } => "SINK (cloud)",
                 };
-                write!(f, "{:indent$}{}", "", name)?;
+                write!(f, "{:indent$}{name}", "")?;
                 input._format(f, sub_indent)
             },
         }
@@ -257,18 +254,30 @@ impl Debug for Expr {
             Window {
                 function,
                 partition_by,
-                ..
-            } => write!(f, "{function:?}.over({partition_by:?})"),
+                options,
+            } => match options {
+                #[cfg(feature = "dynamic_group_by")]
+                WindowType::Rolling(options) => {
+                    write!(
+                        f,
+                        "{:?}.rolling(by='{}', offset={}, period={})",
+                        function, options.index_column, options.offset, options.period
+                    )
+                },
+                _ => {
+                    write!(f, "{function:?}.over({partition_by:?})")
+                },
+            },
             Nth(i) => write!(f, "nth({i})"),
-            Count => write!(f, "count()"),
+            Len => write!(f, "len()"),
             Explode(expr) => write!(f, "{expr:?}.explode()"),
             Alias(expr, name) => write!(f, "{expr:?}.alias(\"{name}\")"),
             Column(name) => write!(f, "col(\"{name}\")"),
             Literal(v) => {
                 match v {
-                    LiteralValue::Utf8(v) => {
+                    LiteralValue::String(v) => {
                         // dot breaks with debug fmt due to \"
-                        write!(f, "Utf8({v})")
+                        write!(f, "String({v})")
                     },
                     _ => {
                         write!(f, "{v:?}")
@@ -276,9 +285,12 @@ impl Debug for Expr {
                 }
             },
             BinaryExpr { left, op, right } => write!(f, "[({left:?}) {op:?} ({right:?})]"),
-            Sort { expr, options } => match options.descending {
-                true => write!(f, "{expr:?}.sort(desc)"),
-                false => write!(f, "{expr:?}.sort(asc)"),
+            Sort { expr, options } => {
+                if options.descending {
+                    write!(f, "{expr:?}.sort(desc)")
+                } else {
+                    write!(f, "{expr:?}.sort(asc)")
+                }
             },
             SortBy {
                 expr,
@@ -290,8 +302,19 @@ impl Debug for Expr {
             Filter { input, by } => {
                 write!(f, "{input:?}.filter({by:?})")
             },
-            Take { expr, idx } => {
-                write!(f, "{expr:?}.take({idx:?})")
+            Gather {
+                expr,
+                idx,
+                returns_scalar,
+            } => {
+                if *returns_scalar {
+                    write!(f, "{expr:?}.get({idx:?})")
+                } else {
+                    write!(f, "{expr:?}.gather({idx:?})")
+                }
+            },
+            SubPlan(lf, _) => {
+                write!(f, ".subplan({lf:?})")
             },
             Agg(agg) => {
                 use AggExpr::*;
@@ -324,7 +347,7 @@ impl Debug for Expr {
                     NUnique(expr) => write!(f, "{expr:?}.n_unique()"),
                     Sum(expr) => write!(f, "{expr:?}.sum()"),
                     AggGroups(expr) => write!(f, "{expr:?}.groups()"),
-                    Count(expr) => write!(f, "{expr:?}.count()"),
+                    Count(expr, _) => write!(f, "{expr:?}.count()"),
                     Var(expr, _) => write!(f, "{expr:?}.var()"),
                     Std(expr, _) => write!(f, "{expr:?}.std()"),
                     Quantile { expr, .. } => write!(f, "{expr:?}.quantile()"),
@@ -353,7 +376,7 @@ impl Debug for Expr {
                 input, function, ..
             } => {
                 if input.len() >= 2 {
-                    write!(f, "{:?}.{}({:?})", input[0], function, &input[1..])
+                    write!(f, "{:?}.{function}({:?})", input[0], &input[1..])
                 } else {
                     write!(f, "{:?}.{function}()", input[0])
                 }
@@ -372,7 +395,7 @@ impl Debug for Expr {
             } => write!(f, "{input:?}.slice(offset={offset:?}, length={length:?})",),
             Wildcard => write!(f, "*"),
             Exclude(column, names) => write!(f, "{column:?}.exclude({names:?})"),
-            KeepName(e) => write!(f, "{e:?}.keep_name()"),
+            KeepName(e) => write!(f, "{e:?}.name.keep()"),
             RenameAlias { expr, .. } => write!(f, ".rename_alias({expr:?})"),
             Columns(names) => write!(f, "cols({names:?})"),
             DtypeColumn(dt) => write!(f, "dtype_columns({dt:?})"),
@@ -403,7 +426,7 @@ impl Debug for LiteralValue {
                 }
             },
             _ => {
-                let av = self.to_anyvalue().unwrap();
+                let av = self.to_any_value().unwrap();
                 write!(f, "{av}")
             },
         }

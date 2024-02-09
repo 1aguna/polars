@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import glob
+import re
 from contextlib import contextmanager
 from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Any, BinaryIO, ContextManager, Iterator, TextIO, overload
+from tempfile import NamedTemporaryFile
+from typing import IO, Any, ContextManager, Iterator, cast, overload
 
 from polars.dependencies import _FSSPEC_AVAILABLE, fsspec
 from polars.exceptions import NoDataError
@@ -16,7 +18,7 @@ def _is_glob_pattern(file: str) -> bool:
 
 
 def _is_supported_cloud(file: str) -> bool:
-    return file.startswith(("s3", "gs", "az", "adl", "abfs"))
+    return bool(re.match("^(s3a?|gs|gcs|file|abfss?|azure|az|adl|https?)://", file))
 
 
 def _is_local_file(file: str) -> bool:
@@ -30,33 +32,48 @@ def _is_local_file(file: str) -> bool:
 
 @overload
 def _prepare_file_arg(
-    file: str | list[str] | Path | BinaryIO | bytes, **kwargs: Any
-) -> ContextManager[str | BinaryIO]:
+    file: str | list[str] | Path | IO[bytes] | bytes,
+    encoding: str | None = ...,
+    *,
+    use_pyarrow: bool = ...,
+    raise_if_empty: bool = ...,
+    storage_options: dict[str, Any] | None = ...,
+) -> ContextManager[str | BytesIO]:
     ...
 
 
 @overload
 def _prepare_file_arg(
-    file: str | TextIO | Path | BinaryIO | bytes, **kwargs: Any
-) -> ContextManager[str | BinaryIO]:
+    file: str | Path | IO[str] | IO[bytes] | bytes,
+    encoding: str | None = ...,
+    *,
+    use_pyarrow: bool = ...,
+    raise_if_empty: bool = ...,
+    storage_options: dict[str, Any] | None = ...,
+) -> ContextManager[str | BytesIO]:
     ...
 
 
 @overload
 def _prepare_file_arg(
-    file: str | list[str] | TextIO | Path | BinaryIO | bytes, **kwargs: Any
-) -> ContextManager[str | list[str] | BinaryIO | list[BinaryIO]]:
+    file: str | list[str] | Path | IO[str] | IO[bytes] | bytes,
+    encoding: str | None = ...,
+    *,
+    use_pyarrow: bool = ...,
+    raise_if_empty: bool = ...,
+    storage_options: dict[str, Any] | None = ...,
+) -> ContextManager[str | list[str] | BytesIO | list[BytesIO]]:
     ...
 
 
 def _prepare_file_arg(
-    file: str | list[str] | TextIO | Path | BinaryIO | bytes,
+    file: str | list[str] | Path | IO[str] | IO[bytes] | bytes,
     encoding: str | None = None,
     *,
-    use_pyarrow: bool | None = None,
+    use_pyarrow: bool = False,
     raise_if_empty: bool = True,
-    **kwargs: Any,
-) -> ContextManager[str | BinaryIO | list[str] | list[BinaryIO]]:
+    storage_options: dict[str, Any] | None = None,
+) -> ContextManager[str | list[str] | BytesIO | list[BytesIO]]:
     """
     Prepare file argument.
 
@@ -67,18 +84,18 @@ def _prepare_file_arg(
     A local path is returned as a string.
     An http URL is read into a buffer and returned as a :class:`BytesIO`.
 
-    When ``encoding`` is not ``utf8`` or ``utf8-lossy``, the whole file is
+    When `encoding` is not `utf8` or `utf8-lossy`, the whole file is
     first read in python and decoded using the specified encoding and
-    returned as a :class:`BytesIO` (for usage with ``read_csv``).
+    returned as a :class:`BytesIO` (for usage with `read_csv`).
 
-    A `bytes` file is returned as a :class:`BytesIO` if ``use_pyarrow=True``.
+    A `bytes` file is returned as a :class:`BytesIO` if `use_pyarrow=True`.
 
     When fsspec is installed, remote file(s) is (are) opened with
     `fsspec.open(file, **kwargs)` or `fsspec.open_files(file, **kwargs)`.
-    If encoding is not ``utf8`` or ``utf8-lossy``, decoding is handled by
+    If encoding is not `utf8` or `utf8-lossy`, decoding is handled by
     fsspec too.
-
     """
+    storage_options = storage_options or {}
 
     # Small helper to use a variable as context
     @contextmanager
@@ -99,15 +116,10 @@ def _prepare_file_arg(
 
     if isinstance(file, bytes):
         if not has_utf8_utf8_lossy_encoding:
-            return _check_empty(
-                BytesIO(file.decode(encoding_str).encode("utf8")),
-                context="bytes",
-                raise_if_empty=raise_if_empty,
-            )
-        if use_pyarrow:
-            return _check_empty(
-                BytesIO(file), context="bytes", raise_if_empty=raise_if_empty
-            )
+            file = file.decode(encoding_str).encode("utf8")
+        return _check_empty(
+            BytesIO(file), context="bytes", raise_if_empty=raise_if_empty
+        )
 
     if isinstance(file, StringIO):
         return _check_empty(
@@ -147,8 +159,8 @@ def _prepare_file_arg(
         # make sure that this is before fsspec
         # as fsspec needs requests to be installed
         # to read from http
-        if file.startswith("http"):
-            return _process_http_file(file, encoding_str)
+        if _looks_like_url(file):
+            return _process_file_url(file, encoding_str)
         if _FSSPEC_AVAILABLE:
             from fsspec.utils import infer_storage_options
 
@@ -166,8 +178,8 @@ def _prepare_file_arg(
                         context=f"{file!r}",
                         raise_if_empty=raise_if_empty,
                     )
-            kwargs["encoding"] = encoding
-            return fsspec.open(file, **kwargs)
+            storage_options["encoding"] = encoding
+            return fsspec.open(file, **storage_options)
 
     if isinstance(file, list) and bool(file) and all(isinstance(f, str) for f in file):
         if _FSSPEC_AVAILABLE:
@@ -181,8 +193,8 @@ def _prepare_file_arg(
                             for f in file
                         ]
                     )
-            kwargs["encoding"] = encoding
-            return fsspec.open_files(file, **kwargs)
+            storage_options["encoding"] = encoding
+            return fsspec.open_files(file, **storage_options)
 
     if isinstance(file, str):
         file = normalize_filepath(file, check_not_directory=check_not_dir)
@@ -206,11 +218,16 @@ def _check_empty(
             if context in ("StringIO", "BytesIO") and read_position
             else ""
         )
-        raise NoDataError(f"empty CSV data from {context}{hint}")
+        msg = f"empty CSV data from {context}{hint}"
+        raise NoDataError(msg)
     return b
 
 
-def _process_http_file(path: str, encoding: str | None = None) -> BytesIO:
+def _looks_like_url(path: str) -> bool:
+    return re.match("^(ht|f)tps?://", path, re.IGNORECASE) is not None
+
+
+def _process_file_url(path: str, encoding: str | None = None) -> BytesIO:
     from urllib.request import urlopen
 
     with urlopen(path) as f:
@@ -218,3 +235,44 @@ def _process_http_file(path: str, encoding: str | None = None) -> BytesIO:
             return BytesIO(f.read())
         else:
             return BytesIO(f.read().decode(encoding).encode("utf8"))
+
+
+@contextmanager
+def PortableTemporaryFile(
+    mode: str = "w+b",
+    *,
+    buffering: int = -1,
+    encoding: str | None = None,
+    newline: str | None = None,
+    suffix: str | None = None,
+    prefix: str | None = None,
+    dir: str | Path | None = None,
+    delete: bool = True,
+    errors: str | None = None,
+) -> Iterator[Any]:
+    """
+    Slightly more resilient version of the standard `NamedTemporaryFile`.
+
+    Plays better with Windows when using the 'delete' option.
+    """
+    params = cast(
+        Any,
+        {
+            "mode": mode,
+            "buffering": buffering,
+            "encoding": encoding,
+            "newline": newline,
+            "suffix": suffix,
+            "prefix": prefix,
+            "dir": dir,
+            "delete": False,
+            "errors": errors,
+        },
+    )
+    tmp = NamedTemporaryFile(**params)
+    try:
+        yield tmp
+    finally:
+        tmp.close()
+        if delete:
+            Path(tmp.name).unlink(missing_ok=True)

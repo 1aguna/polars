@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from datetime import date, datetime, time, timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -46,14 +46,19 @@ def test_dt_to_string(series_of_int_dates: pl.Series) -> None:
 @pytest.mark.parametrize(
     ("unit_attr", "expected"),
     [
+        ("millennium", pl.Series(values=[2, 3, 3], dtype=pl.Int32)),
+        ("century", pl.Series(values=[20, 21, 21], dtype=pl.Int32)),
         ("year", pl.Series(values=[1997, 2024, 2052], dtype=pl.Int32)),
-        ("month", pl.Series(values=[5, 10, 2], dtype=pl.UInt32)),
-        ("week", pl.Series(values=[21, 40, 8], dtype=pl.UInt32)),
-        ("day", pl.Series(values=[19, 4, 20], dtype=pl.UInt32)),
-        ("ordinal_day", pl.Series(values=[139, 278, 51], dtype=pl.UInt32)),
+        ("iso_year", pl.Series(values=[1997, 2024, 2052], dtype=pl.Int32)),
+        ("quarter", pl.Series(values=[2, 4, 1], dtype=pl.Int8)),
+        ("month", pl.Series(values=[5, 10, 2], dtype=pl.Int8)),
+        ("week", pl.Series(values=[21, 40, 8], dtype=pl.Int8)),
+        ("day", pl.Series(values=[19, 4, 20], dtype=pl.Int8)),
+        ("weekday", pl.Series(values=[1, 5, 2], dtype=pl.Int8)),
+        ("ordinal_day", pl.Series(values=[139, 278, 51], dtype=pl.Int16)),
     ],
 )
-def test_dt_extract_year_month_week_day_ordinal_day(
+def test_dt_extract_datetime_component(
     unit_attr: str,
     expected: pl.Series,
     series_of_int_dates: pl.Series,
@@ -64,12 +69,12 @@ def test_dt_extract_year_month_week_day_ordinal_day(
 @pytest.mark.parametrize(
     ("unit_attr", "expected"),
     [
-        ("hour", pl.Series(values=[0, 3], dtype=pl.UInt32)),
-        ("minute", pl.Series(values=[0, 20], dtype=pl.UInt32)),
-        ("second", pl.Series(values=[0, 10], dtype=pl.UInt32)),
-        ("millisecond", pl.Series(values=[0, 987], dtype=pl.UInt32)),
-        ("microsecond", pl.Series(values=[0, 987654], dtype=pl.UInt32)),
-        ("nanosecond", pl.Series(values=[0, 987654321], dtype=pl.UInt32)),
+        ("hour", pl.Series(values=[0, 3], dtype=pl.Int8)),
+        ("minute", pl.Series(values=[0, 20], dtype=pl.Int8)),
+        ("second", pl.Series(values=[0, 10], dtype=pl.Int8)),
+        ("millisecond", pl.Series(values=[0, 987], dtype=pl.Int32)),
+        ("microsecond", pl.Series(values=[0, 987654], dtype=pl.Int32)),
+        ("nanosecond", pl.Series(values=[0, 987654321], dtype=pl.Int32)),
     ],
 )
 def test_strptime_extract_times(
@@ -101,15 +106,24 @@ def test_dt_date_and_time(
 
 @pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu"])
 @pytest.mark.parametrize("time_unit", ["us", "ns", "ms"])
-def test_dt_datetime(time_zone: str | None, time_unit: TimeUnit) -> None:
+def test_dt_replace_time_zone_none(time_zone: str | None, time_unit: TimeUnit) -> None:
     ser = (
         pl.Series([datetime(2022, 1, 1, 23)])
         .dt.cast_time_unit(time_unit)
         .dt.replace_time_zone(time_zone)
     )
-    result = ser.dt.datetime()
+    result = ser.dt.replace_time_zone(None)
     expected = datetime(2022, 1, 1, 23)
     assert result.dtype == pl.Datetime(time_unit, None)
+    assert result.item() == expected
+
+
+def test_dt_datetime_deprecated() -> None:
+    s = pl.Series([datetime(2022, 1, 1, 23)]).dt.replace_time_zone("Asia/Kathmandu")
+    with pytest.deprecated_call():
+        result = s.dt.datetime()
+    expected = datetime(2022, 1, 1, 23)
+    assert result.dtype == pl.Datetime(time_zone=None)
     assert result.item() == expected
 
 
@@ -121,22 +135,47 @@ def test_dt_datetime(time_zone: str | None, time_unit: TimeUnit) -> None:
         ("UTC", True),
     ],
 )
-@pytest.mark.parametrize("attribute", ["datetime", "date"])
-def test_local_datetime_sortedness(
-    time_zone: str | None, expected: bool, attribute: str
-) -> None:
+def test_local_date_sortedness(time_zone: str | None, expected: bool) -> None:
+    # singleton - always sorted
     ser = (pl.Series([datetime(2022, 1, 1, 23)]).dt.replace_time_zone(time_zone)).sort()
-    result = getattr(ser.dt, attribute)()
+    result = ser.dt.date()
+    assert result.flags["SORTED_ASC"]
+    assert result.flags["SORTED_DESC"] is False
+
+    # 2 elements - depends on time zone
+    ser = (
+        pl.Series([datetime(2022, 1, 1, 23)] * 2).dt.replace_time_zone(time_zone)
+    ).sort()
+    result = ser.dt.date()
     assert result.flags["SORTED_ASC"] == expected
     assert result.flags["SORTED_DESC"] is False
 
 
 @pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu", "UTC"])
 def test_local_time_sortedness(time_zone: str | None) -> None:
+    # singleton - always sorted
     ser = (pl.Series([datetime(2022, 1, 1, 23)]).dt.replace_time_zone(time_zone)).sort()
     result = ser.dt.time()
-    assert result.flags["SORTED_ASC"] is False
-    assert result.flags["SORTED_DESC"] is False
+    assert result.flags["SORTED_ASC"]
+    assert not result.flags["SORTED_DESC"]
+
+    # two elements - not sorted
+    ser = (
+        pl.Series([datetime(2022, 1, 1, 23)] * 2).dt.replace_time_zone(time_zone)
+    ).sort()
+    result = ser.dt.time()
+    assert not result.flags["SORTED_ASC"]
+    assert not result.flags["SORTED_DESC"]
+
+
+@pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
+def test_local_time_before_epoch(time_unit: TimeUnit) -> None:
+    ser = pl.Series([datetime(1969, 7, 21, 2, 56, 2, 123000)]).dt.cast_time_unit(
+        time_unit
+    )
+    result = ser.dt.time().item()
+    expected = time(2, 56, 2, 123000)
+    assert result == expected
 
 
 @pytest.mark.parametrize(
@@ -171,18 +210,14 @@ def test_offset_by_sortedness(
 
 
 def test_dt_datetime_date_time_invalid() -> None:
-    with pytest.raises(ComputeError, match="expected Datetime"):
-        pl.Series([date(2021, 1, 2)]).dt.datetime()
     with pytest.raises(ComputeError, match="expected Datetime or Date"):
         pl.Series([time(23)]).dt.date()
-    with pytest.raises(ComputeError, match="expected Datetime"):
-        pl.Series([time(23)]).dt.datetime()
     with pytest.raises(ComputeError, match="expected Datetime or Date"):
         pl.Series([timedelta(1)]).dt.date()
-    with pytest.raises(ComputeError, match="expected Datetime"):
-        pl.Series([timedelta(1)]).dt.datetime()
-    with pytest.raises(ComputeError, match="expected Datetime, Date, or Time"):
+    with pytest.raises(ComputeError, match="expected Datetime or Time"):
         pl.Series([timedelta(1)]).dt.time()
+    with pytest.raises(ComputeError, match="expected Datetime or Time"):
+        pl.Series([date(2020, 1, 1)]).dt.time()
 
 
 @pytest.mark.parametrize(
@@ -374,7 +409,7 @@ def test_dst_offset_invalid() -> None:
         ("s", pl.Series(values=[1_577_836_800, 1_580_613_610], dtype=pl.Int64)),
         (
             "ms",
-            pl.Series(values=[1_577_836_800_000, 1_580_613_610_000], dtype=pl.Int64),
+            pl.Series(values=[1_577_836_800_000, 1_580_613_610_987], dtype=pl.Int64),
         ),
     ],
 )
@@ -400,13 +435,13 @@ def test_strptime_fractional_seconds(series_of_str_dates: pl.Series) -> None:
 @pytest.mark.parametrize(
     ("unit_attr", "expected"),
     [
-        ("days", pl.Series([1])),
-        ("hours", pl.Series([24])),
-        ("minutes", pl.Series([24 * 60])),
-        ("seconds", pl.Series([3600 * 24])),
-        ("milliseconds", pl.Series([3600 * 24 * int(1e3)])),
-        ("microseconds", pl.Series([3600 * 24 * int(1e6)])),
-        ("nanoseconds", pl.Series([3600 * 24 * int(1e9)])),
+        ("total_days", pl.Series([1])),
+        ("total_hours", pl.Series([24])),
+        ("total_minutes", pl.Series([24 * 60])),
+        ("total_seconds", pl.Series([3600 * 24])),
+        ("total_milliseconds", pl.Series([3600 * 24 * int(1e3)])),
+        ("total_microseconds", pl.Series([3600 * 24 * int(1e6)])),
+        ("total_nanoseconds", pl.Series([3600 * 24 * int(1e9)])),
     ],
 )
 def test_duration_extract_times(
@@ -416,6 +451,32 @@ def test_duration_extract_times(
     duration = pl.Series([datetime(2022, 1, 2)]) - pl.Series([datetime(2022, 1, 1)])
 
     assert_series_equal(getattr(duration.dt, unit_attr)(), expected)
+
+
+@pytest.mark.parametrize(
+    ("unit_attr", "expected"),
+    [
+        ("days", pl.Series([1])),
+        ("hours", pl.Series([24])),
+        ("minutes", pl.Series([24 * 60])),
+        ("seconds", pl.Series([3600 * 24])),
+        ("milliseconds", pl.Series([3600 * 24 * int(1e3)])),
+        ("microseconds", pl.Series([3600 * 24 * int(1e6)])),
+        ("nanoseconds", pl.Series([3600 * 24 * int(1e9)])),
+    ],
+)
+def test_duration_extract_times_deprecated_methods(
+    unit_attr: str,
+    expected: pl.Series,
+) -> None:
+    duration = pl.Series([datetime(2022, 1, 2)]) - pl.Series([datetime(2022, 1, 1)])
+
+    with pytest.deprecated_call():
+        assert_series_equal(getattr(duration.dt, unit_attr)(), expected)
+    with pytest.deprecated_call():
+        # Test Expr case too
+        result_df = pl.select(getattr(pl.lit(duration).dt, unit_attr)())
+        assert_series_equal(result_df[result_df.columns[0]], expected)
 
 
 @pytest.mark.parametrize(
@@ -565,7 +626,7 @@ def test_date_time_combine(tzinfo: ZoneInfo | None, time_zone: str | None) -> No
             datetime(2022, 7, 5, 4, 5, 6),
         ],
     }
-    assert df.to_dict(False) == expected_dict
+    assert df.to_dict(as_series=False) == expected_dict
 
     expected_schema = {
         "d1": pl.Datetime("us", time_zone),
@@ -672,10 +733,9 @@ def test_offset_by_crossing_dst(time_zone: str | None) -> None:
 
 
 def test_negative_offset_by_err_msg_8464() -> None:
-    with pytest.raises(
-        ComputeError, match=r"cannot advance '2022-03-30 00:00:00' by -1 month\(s\)"
-    ):
-        pl.Series([datetime(2022, 3, 30)]).dt.offset_by("-1mo")
+    result = pl.Series([datetime(2022, 3, 30)]).dt.offset_by("-1mo")
+    expected = pl.Series([datetime(2022, 2, 28)])
+    assert_series_equal(result, expected)
 
 
 def test_offset_by_truncate_sorted_flag() -> None:
@@ -735,7 +795,7 @@ def test_offset_by_broadcasting() -> None:
         ],
         "d5": [None, None, None, None],
     }
-    assert result.to_dict(False) == expected_dict
+    assert result.to_dict(as_series=False) == expected_dict
 
     # test broadcast rhs
     df = pl.DataFrame({"dt": [datetime(2020, 10, 25), datetime(2021, 1, 2), None]})
@@ -757,11 +817,11 @@ def test_offset_by_broadcasting() -> None:
         ],
         "d4": [datetime(2021, 11, 26).date(), datetime(2022, 2, 3).date(), None],
     }
-    assert result.to_dict(False) == expected_dict
+    assert result.to_dict(as_series=False) == expected_dict
 
     # test all literal
     result = df.select(d=pl.lit(datetime(2021, 11, 26)).dt.offset_by("1mo1d"))
-    assert result.to_dict(False) == {"d": [datetime(2021, 12, 27)]}
+    assert result.to_dict(as_series=False) == {"d": [datetime(2021, 12, 27)]}
 
 
 def test_offset_by_expressions() -> None:
@@ -784,24 +844,18 @@ def test_offset_by_expressions() -> None:
         e=pl.col("a").dt.replace_time_zone("Europe/London").dt.offset_by(pl.col("b")),
         f=pl.col("a").dt.date().dt.offset_by(pl.col("b")),
     )
-    expected = cast(
-        pl.DataFrame,
-        pl.from_repr(
-            """
-shape: (5, 4)
-┌─────────────────────┬─────────────────────┬─────────────────────────────┬────────────┐
-│ c                   ┆ d                   ┆ e                           ┆ f          │
-│ ---                 ┆ ---                 ┆ ---                         ┆ ---        │
-│ datetime[μs]        ┆ datetime[ms]        ┆ datetime[μs, Europe/London] ┆ date       │
-╞═════════════════════╪═════════════════════╪═════════════════════════════╪════════════╡
-│ null                ┆ null                ┆ null                        ┆ null       │
-│ null                ┆ null                ┆ null                        ┆ null       │
-│ 2020-10-26 00:00:00 ┆ 2020-10-26 00:00:00 ┆ 2020-10-26 00:00:00 GMT     ┆ 2020-10-26 │
-│ 2021-01-12 00:00:00 ┆ 2021-01-12 00:00:00 ┆ 2021-01-12 00:00:00 GMT     ┆ 2021-01-12 │
-│ null                ┆ null                ┆ null                        ┆ null       │
-└─────────────────────┴─────────────────────┴─────────────────────────────┴────────────┘
-"""
-        ),
+
+    expected = pl.DataFrame(
+        {
+            "c": [None, None, datetime(2020, 10, 26), datetime(2021, 1, 12), None],
+            "d": [None, None, datetime(2020, 10, 26), datetime(2021, 1, 12), None],
+            "e": [None, None, datetime(2020, 10, 26), datetime(2021, 1, 12), None],
+            "f": [None, None, date(2020, 10, 26), date(2021, 1, 12), None],
+        },
+        schema_overrides={
+            "d": pl.Datetime("ms"),
+            "e": pl.Datetime(time_zone="Europe/London"),
+        },
     )
     assert_frame_equal(result, expected)
     assert result.flags == {
@@ -823,30 +877,21 @@ shape: (5, 4)
             f=pl.col("a").dt.date().dt.offset_by(pl.col("b")),
         )
         assert_frame_equal(result, expected[i : i + 1])
-        if df_slice["b"].item() is None:
-            # Offset is None, so result will be all-None, so sortedness isn't preserved.
-            assert result.flags == {
-                "c": {"SORTED_ASC": False, "SORTED_DESC": False},
-                "d": {"SORTED_ASC": False, "SORTED_DESC": False},
-                "e": {"SORTED_ASC": False, "SORTED_DESC": False},
-                "f": {"SORTED_ASC": False, "SORTED_DESC": False},
-            }
-        else:
-            # For tz-aware, sortedness is not preserved.
-            assert result.flags == {
-                "c": {"SORTED_ASC": True, "SORTED_DESC": False},
-                "d": {"SORTED_ASC": True, "SORTED_DESC": False},
-                "e": {"SORTED_ASC": False, "SORTED_DESC": False},
-                "f": {"SORTED_ASC": True, "SORTED_DESC": False},
-            }
+        # single-row Series are always sorted
+        assert result.flags == {
+            "c": {"SORTED_ASC": True, "SORTED_DESC": False},
+            "d": {"SORTED_ASC": True, "SORTED_DESC": False},
+            "e": {"SORTED_ASC": True, "SORTED_DESC": False},
+            "f": {"SORTED_ASC": True, "SORTED_DESC": False},
+        }
 
 
 @pytest.mark.parametrize(
     ("duration", "input_date", "expected"),
     [
-        ("1mo_saturating", date(2018, 1, 31), date(2018, 2, 28)),
-        ("1y_saturating", date(2024, 2, 29), date(2025, 2, 28)),
-        ("1y1mo_saturating", date(2024, 1, 30), date(2025, 2, 28)),
+        ("1mo", date(2018, 1, 31), date(2018, 2, 28)),
+        ("1y", date(2024, 2, 29), date(2025, 2, 28)),
+        ("1y1mo", date(2024, 1, 30), date(2025, 2, 28)),
     ],
 )
 def test_offset_by_saturating_8217_8474(
@@ -859,6 +904,11 @@ def test_offset_by_saturating_8217_8474(
 def test_year_empty_df() -> None:
     df = pl.DataFrame(pl.Series(name="date", dtype=pl.Date))
     assert df.select(pl.col("date").dt.year()).dtypes == [pl.Int32]
+
+
+def test_epoch_invalid() -> None:
+    with pytest.raises(InvalidOperationError, match="not supported for dtype"):
+        pl.Series([timedelta(1)]).dt.epoch()
 
 
 @pytest.mark.parametrize(
@@ -881,12 +931,26 @@ def test_weekday(time_unit: TimeUnit) -> None:
         ([date(2022, 1, 1)], date(2022, 1, 1)),
         ([date(2022, 1, 1), date(2022, 1, 2), date(2022, 1, 3)], date(2022, 1, 2)),
         ([date(2022, 1, 1), date(2022, 1, 2), date(2024, 5, 15)], date(2022, 1, 2)),
+        (
+            [datetime(2022, 1, 1), datetime(2022, 1, 2), datetime(2024, 5, 15)],
+            datetime(2022, 1, 2),
+        ),
     ],
-    ids=["empty", "Nones", "single", "spread_even", "spread_skewed"],
+    ids=[
+        "empty",
+        "Nones",
+        "single",
+        "spread_even",
+        "spread_skewed",
+        "spread_skewed_dt",
+    ],
 )
 def test_median(values: list[date | None], expected_median: date | None) -> None:
-    result = pl.Series(values).cast(pl.Date).dt.median()
-    assert result == expected_median
+    s = pl.Series(values)
+    assert s.dt.median() == expected_median
+
+    if s.dtype == pl.Datetime:
+        assert s.median() == expected_median
 
 
 @pytest.mark.parametrize(
@@ -897,9 +961,100 @@ def test_median(values: list[date | None], expected_median: date | None) -> None
         ([date(2022, 1, 1)], date(2022, 1, 1)),
         ([date(2022, 1, 1), date(2022, 1, 2), date(2022, 1, 3)], date(2022, 1, 2)),
         ([date(2022, 1, 1), date(2022, 1, 2), date(2024, 5, 15)], date(2022, 10, 16)),
+        (
+            [datetime(2022, 1, 1), datetime(2022, 1, 2), datetime(2024, 5, 15)],
+            datetime(2022, 10, 16, 16, 0, 0),
+        ),
     ],
-    ids=["empty", "Nones", "single", "spread_even", "spread_skewed"],
+    ids=[
+        "empty",
+        "Nones",
+        "single",
+        "spread_even",
+        "spread_skewed",
+        "spread_skewed_dt",
+    ],
 )
-def test_mean(values: list[date | None], expected_mean: date | None) -> None:
-    result = pl.Series(values).cast(pl.Date).dt.mean()
-    assert result == expected_mean
+def test_mean(
+    values: list[date | datetime | None], expected_mean: date | datetime | None
+) -> None:
+    s = pl.Series(values)
+    assert s.dt.mean() == expected_mean
+
+    if s.dtype == pl.Datetime:
+        assert s.mean() == expected_mean
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_mean"),
+    [
+        (
+            [datetime(2022, 1, 1), datetime(2022, 1, 2), datetime(2024, 5, 15)],
+            datetime(2022, 10, 16, 16, 0, 0),
+        ),
+    ],
+    ids=["spread_skewed_dt"],
+)
+def test_datetime_mean_with_tu(values: list[datetime], expected_mean: datetime) -> None:
+    assert pl.Series(values, dtype=pl.Datetime("ms")).mean() == expected_mean
+    assert pl.Series(values, dtype=pl.Datetime("ms")).dt.mean() == expected_mean
+    assert pl.Series(values, dtype=pl.Datetime("us")).mean() == expected_mean
+    assert pl.Series(values, dtype=pl.Datetime("us")).dt.mean() == expected_mean
+    assert pl.Series(values, dtype=pl.Datetime("ns")).mean() == expected_mean
+    assert pl.Series(values, dtype=pl.Datetime("ns")).dt.mean() == expected_mean
+
+
+def test_agg_expr() -> None:
+    df = pl.DataFrame(
+        {
+            "datetime_ms": pl.Series(
+                [datetime(2023, 1, 1), datetime(2023, 1, 2), datetime(2023, 1, 4)],
+                dtype=pl.Datetime("ms"),
+            ),
+            "datetime_us": pl.Series(
+                [datetime(2023, 1, 1), datetime(2023, 1, 2), datetime(2023, 1, 4)],
+                dtype=pl.Datetime("us"),
+            ),
+            "datetime_ns": pl.Series(
+                [datetime(2023, 1, 1), datetime(2023, 1, 2), datetime(2023, 1, 4)],
+                dtype=pl.Datetime("ns"),
+            ),
+            "duration_ms": pl.Series(
+                [timedelta(days=1), timedelta(days=2), timedelta(days=4)],
+                dtype=pl.Duration("ms"),
+            ),
+            "duration_us": pl.Series(
+                [timedelta(days=1), timedelta(days=2), timedelta(days=4)],
+                dtype=pl.Duration("us"),
+            ),
+            "duration_ns": pl.Series(
+                [timedelta(days=1), timedelta(days=2), timedelta(days=4)],
+                dtype=pl.Duration("ns"),
+            ),
+        }
+    )
+
+    expected = pl.DataFrame(
+        {
+            "datetime_ms": pl.Series(
+                [datetime(2023, 1, 2, 8, 0, 0)], dtype=pl.Datetime("ms")
+            ),
+            "datetime_us": pl.Series(
+                [datetime(2023, 1, 2, 8, 0, 0)], dtype=pl.Datetime("us")
+            ),
+            "datetime_ns": pl.Series(
+                [datetime(2023, 1, 2, 8, 0, 0)], dtype=pl.Datetime("ns")
+            ),
+            "duration_ms": pl.Series(
+                [timedelta(days=2, hours=8)], dtype=pl.Duration("ms")
+            ),
+            "duration_us": pl.Series(
+                [timedelta(days=2, hours=8)], dtype=pl.Duration("us")
+            ),
+            "duration_ns": pl.Series(
+                [timedelta(days=2, hours=8)], dtype=pl.Duration("ns")
+            ),
+        }
+    )
+
+    assert_frame_equal(df.select(pl.all().mean()), expected)

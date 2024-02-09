@@ -1,6 +1,5 @@
 # --8<-- [start:setup]
 import polars as pl
-from datetime import date
 
 # --8<-- [end:setup]
 
@@ -16,7 +15,7 @@ dtypes = {
 }
 
 dataset = pl.read_csv(url, dtypes=dtypes).with_columns(
-    pl.col("birthday").str.strptime(pl.Date, strict=False)
+    pl.col("birthday").str.to_date(strict=False)
 )
 # --8<-- [end:dataframe]
 
@@ -25,11 +24,11 @@ q = (
     dataset.lazy()
     .group_by("first_name")
     .agg(
-        pl.count(),
+        pl.len(),
         pl.col("gender"),
         pl.first("last_name"),
     )
-    .sort("count", descending=True)
+    .sort("len", descending=True)
     .limit(5)
 )
 
@@ -72,8 +71,11 @@ print(df)
 
 
 # --8<-- [start:filter]
-def compute_age() -> pl.Expr:
-    return date(2021, 1, 1).year - pl.col("birthday").dt.year()
+from datetime import date
+
+
+def compute_age():
+    return date.today().year - pl.col("birthday").dt.year()
 
 
 def avg_birthday(gender: str) -> pl.Expr:
@@ -158,7 +160,9 @@ q = (
         get_person().first().alias("youngest"),
         get_person().last().alias("oldest"),
         get_person().sort().first().alias("alphabetical_first"),
-        pl.col("gender").sort_by("first_name").first().alias("gender"),
+        pl.col("gender")
+        .sort_by(pl.col("first_name").cast(pl.Categorical("lexical")))
+        .first(),
     )
     .sort("state")
     .limit(5)

@@ -61,8 +61,8 @@ df = pl.DataFrame(
 )
 
 out = df.select(
-    pl.col("integers").cast(pl.Utf8),
-    pl.col("float").cast(pl.Utf8),
+    pl.col("integers").cast(pl.String),
+    pl.col("float").cast(pl.String),
     pl.col("floats_as_string").cast(pl.Float64),
 )
 print(out)
@@ -122,8 +122,8 @@ df = pl.DataFrame(
 )
 
 out = df.select(
-    pl.col("date").dt.strftime("%Y-%m-%d"),
-    pl.col("string").str.strptime(pl.Datetime, "%Y-%m-%d"),
+    pl.col("date").dt.to_string("%Y-%m-%d"),
+    pl.col("string").str.to_datetime("%Y-%m-%d"),
 )
 print(out)
 # --8<-- [end:dates2]

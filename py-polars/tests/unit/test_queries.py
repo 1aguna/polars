@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import numpy as np
@@ -34,8 +34,8 @@ def test_repeat_expansion_in_group_by() -> None:
     out = (
         pl.DataFrame({"g": [1, 2, 2, 3, 3, 3]})
         .group_by("g", maintain_order=True)
-        .agg(pl.repeat(1, pl.count()).cumsum())
-        .to_dict(False)
+        .agg(pl.repeat(1, pl.len()).cum_sum())
+        .to_dict(as_series=False)
     )
     assert out == {"g": [1, 2, 3], "repeat": [[1], [1, 2], [1, 2, 3]]}
 
@@ -73,7 +73,7 @@ def test_overflow_uint16_agg_mean() -> None:
         )
         .group_by(["col1"])
         .agg(pl.col("col3").mean())
-        .to_dict(False)
+        .to_dict(as_series=False)
     ) == {"col1": ["A"], "col3": [64.0]}
 
 
@@ -96,7 +96,7 @@ def test_binary_on_list_agg_3345() -> None:
                 ).sum()
             ]
         )
-        .to_dict(False)
+        .to_dict(as_series=False)
     ) == {"group": ["A", "B"], "id": [0.6365141682948128, 1.0397207708399179]}
 
 
@@ -109,9 +109,10 @@ def test_maintain_order_after_sampling() -> None:
             "value": [1, 3, 2, 3, 4, 5, 3, 4],
         }
     )
-    assert df.group_by("type", maintain_order=True).agg(pl.col("value").sum()).to_dict(
-        False
-    ) == {"type": ["A", "B", "C", "D"], "value": [5, 8, 5, 7]}
+
+    result = df.group_by("type", maintain_order=True).agg(pl.col("value").sum())
+    expected = {"type": ["A", "B", "C", "D"], "value": [5, 8, 5, 7]}
+    assert result.to_dict(as_series=False) == expected
 
 
 def test_sorted_group_by_optimization(monkeypatch: Any) -> None:
@@ -125,10 +126,10 @@ def test_sorted_group_by_optimization(monkeypatch: Any) -> None:
         sorted_implicit = (
             df.with_columns(pl.col("a").sort(descending=descending))
             .group_by("a")
-            .agg(pl.count())
+            .agg(pl.len())
         )
         sorted_explicit = (
-            df.group_by("a").agg(pl.count()).sort("a", descending=descending)
+            df.group_by("a").agg(pl.len()).sort("a", descending=descending)
         )
         assert_frame_equal(sorted_explicit, sorted_implicit)
 
@@ -143,7 +144,7 @@ def test_median_on_shifted_col_3522() -> None:
             ]
         }
     )
-    diffs = df.select(pl.col("foo").diff().dt.seconds())
+    diffs = df.select(pl.col("foo").diff().dt.total_seconds())
     assert diffs.select(pl.col("foo").median()).to_series()[0] == 36828.5
 
 
@@ -159,7 +160,7 @@ def test_group_by_agg_equals_zero_3535() -> None:
             ("cc", None, 0.0),
         ],
         schema=[
-            ("key", pl.Utf8),
+            ("key", pl.String),
             ("val1", pl.Int16),
             ("val2", pl.Float32),
         ],
@@ -167,7 +168,7 @@ def test_group_by_agg_equals_zero_3535() -> None:
     # group by the key, aggregating the two numeric cols
     assert df.group_by(pl.col("key"), maintain_order=True).agg(
         [pl.col("val1").sum(), pl.col("val2").sum()]
-    ).to_dict(False) == {
+    ).to_dict(as_series=False) == {
         "key": ["aa", "bb", "cc"],
         "val1": [10, 0, -99],
         "val2": [0.0, 0.0, 10.5],
@@ -196,7 +197,7 @@ def test_arithmetic_in_aggregation_3739() -> None:
                 demean_dot(),
             ]
         )
-    ).to_dict(False) == {"key": ["a"], "demean_dot": [0.0]}
+    ).to_dict(as_series=False) == {"key": ["a"], "demean_dot": [0.0]}
 
 
 def test_dtype_concat_3735() -> None:
@@ -241,7 +242,10 @@ def test_opaque_filter_on_lists_3784() -> None:
                 and variant.to_list().index(pre) < variant.to_list().index(succ)
             )
         )
-    ).collect().to_dict(False) == {"group": [1], "str_list": [["A", "B", "B"]]}
+    ).collect().to_dict(as_series=False) == {
+        "group": [1],
+        "str_list": [["A", "B", "B"]],
+    }
 
 
 def test_ternary_none_struct() -> None:
@@ -254,7 +258,7 @@ def test_ternary_none_struct() -> None:
                 pl.struct(
                     [
                         pl.sum(name).alias("sum"),
-                        (pl.count() - pl.col(name).null_count()).alias("count"),
+                        (pl.len() - pl.col(name).null_count()).alias("count"),
                     ]
                 ),
             )
@@ -265,7 +269,7 @@ def test_ternary_none_struct() -> None:
         pl.DataFrame({"groups": [1, 2, 3, 4], "values": [None, None, 1, 2]})
         .group_by("groups", maintain_order=True)
         .agg([map_expr("values")])
-    ).to_dict(False) == {
+    ).to_dict(as_series=False) == {
         "groups": [1, 2, 3, 4],
         "out": [
             {"sum": None, "count": None},
@@ -284,7 +288,7 @@ def test_edge_cast_string_duplicates_4259() -> None:
             "a": [99, 54612, 546121],
             "b": [1, 14484, 4484],
         }
-    ).with_columns(pl.all().cast(pl.Utf8))
+    ).with_columns(pl.all().cast(pl.String))
 
     mask = df.select(["a", "b"]).is_duplicated()
     df_filtered = df.filter(pl.lit(mask))
@@ -348,14 +352,8 @@ def test_none_comparison_4773() -> None:
 def test_datetime_supertype_5236() -> None:
     df = pd.DataFrame(
         {
-            "StartDateTime": [
-                pd.Timestamp(datetime.utcnow(), tz="UTC"),
-                pd.Timestamp(datetime.utcnow(), tz="UTC"),
-            ],
-            "EndDateTime": [
-                pd.Timestamp(datetime.utcnow(), tz="UTC"),
-                pd.Timestamp(datetime.utcnow(), tz="UTC"),
-            ],
+            "StartDateTime": [pd.Timestamp.now(tz="UTC"), pd.Timestamp.now(tz="UTC")],
+            "EndDateTime": [pd.Timestamp.now(tz="UTC"), pd.Timestamp.now(tz="UTC")],
         }
     )
     out = pl.from_pandas(df).filter(
@@ -370,3 +368,37 @@ def test_shift_drop_nulls_10875() -> None:
     assert pl.LazyFrame({"a": [1, 2, 3]}).shift(1).drop_nulls().collect()[
         "a"
     ].to_list() == [1, 2]
+
+
+def test_temporal_downcasts() -> None:
+    s = pl.Series([-1, 0, 1]).cast(pl.Datetime("us"))
+
+    assert s.to_list() == [
+        datetime(1969, 12, 31, 23, 59, 59, 999999),
+        datetime(1970, 1, 1),
+        datetime(1970, 1, 1, 0, 0, 0, 1),
+    ]
+
+    # downcast (from us to ms, or from datetime to date) should NOT change the date
+    for s_dt in (s.dt.date(), s.cast(pl.Date)):
+        assert s_dt.to_list() == [
+            date(1969, 12, 31),
+            date(1970, 1, 1),
+            date(1970, 1, 1),
+        ]
+    assert s.cast(pl.Datetime("ms")).to_list() == [
+        datetime(1969, 12, 31, 23, 59, 59, 999000),
+        datetime(1970, 1, 1),
+        datetime(1970, 1, 1),
+    ]
+
+
+def test_temporal_time_casts() -> None:
+    s = pl.Series([-1, 0, 1]).cast(pl.Datetime("us"))
+
+    for s_dt in (s.dt.time(), s.cast(pl.Time)):
+        assert s_dt.to_list() == [
+            time(23, 59, 59, 999999),
+            time(0, 0, 0, 0),
+            time(0, 0, 0, 1),
+        ]

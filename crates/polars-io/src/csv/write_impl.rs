@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use arrow::legacy::time_zone::Tz;
 #[cfg(any(
     feature = "dtype-date",
     feature = "dtype-time",
@@ -9,7 +10,6 @@ use arrow::temporal_conversions;
 #[cfg(feature = "timezones")]
 use chrono::TimeZone;
 use memchr::{memchr, memchr2};
-use polars_arrow::time_zone::Tz;
 use polars_core::prelude::*;
 use polars_core::series::SeriesIter;
 use polars_core::POOL;
@@ -22,33 +22,33 @@ use super::write::QuoteStyle;
 
 fn fmt_and_escape_str(f: &mut Vec<u8>, v: &str, options: &SerializeOptions) -> std::io::Result<()> {
     if options.quote_style == QuoteStyle::Never {
-        write!(f, "{v}")
-    } else if v.is_empty() {
-        write!(f, "\"\"")
-    } else {
-        let needs_escaping = memchr(options.quote, v.as_bytes()).is_some();
-        if needs_escaping {
-            let replaced = unsafe {
-                // Replace from single quote " to double quote "".
-                v.replace(
-                    std::str::from_utf8_unchecked(&[options.quote]),
-                    std::str::from_utf8_unchecked(&[options.quote, options.quote]),
-                )
-            };
-            return write!(f, "\"{replaced}\"");
-        }
-        let surround_with_quotes = match options.quote_style {
-            QuoteStyle::Always | QuoteStyle::NonNumeric => true,
-            QuoteStyle::Necessary => memchr2(options.delimiter, b'\n', v.as_bytes()).is_some(),
-            QuoteStyle::Never => false,
+        return write!(f, "{v}");
+    }
+    let quote = options.quote_char as char;
+    if v.is_empty() {
+        return write!(f, "{quote}{quote}");
+    }
+    let needs_escaping = memchr(options.quote_char, v.as_bytes()).is_some();
+    if needs_escaping {
+        let replaced = unsafe {
+            // Replace from single quote " to double quote "".
+            v.replace(
+                std::str::from_utf8_unchecked(&[options.quote_char]),
+                std::str::from_utf8_unchecked(&[options.quote_char, options.quote_char]),
+            )
         };
+        return write!(f, "{quote}{replaced}{quote}");
+    }
+    let surround_with_quotes = match options.quote_style {
+        QuoteStyle::Always | QuoteStyle::NonNumeric => true,
+        QuoteStyle::Necessary => memchr2(options.separator, b'\n', v.as_bytes()).is_some(),
+        QuoteStyle::Never => false,
+    };
 
-        let quote = options.quote as char;
-        if surround_with_quotes {
-            write!(f, "{quote}{v}{quote}")
-        } else {
-            write!(f, "{v}")
-        }
+    if surround_with_quotes {
+        write!(f, "{quote}{v}{quote}")
+    } else {
+        write!(f, "{v}")
     }
 }
 
@@ -64,7 +64,8 @@ fn write_integer<I: itoa::Integer>(f: &mut Vec<u8>, val: I) {
     f.extend_from_slice(value.as_bytes())
 }
 
-unsafe fn write_anyvalue(
+#[allow(unused_variables)]
+unsafe fn write_any_value(
     f: &mut Vec<u8>,
     value: AnyValue,
     options: &SerializeOptions,
@@ -74,19 +75,19 @@ unsafe fn write_anyvalue(
 ) -> PolarsResult<()> {
     match value {
         // First do the string-like types as they know how to deal with quoting.
-        AnyValue::Utf8(v) => {
+        AnyValue::String(v) => {
             fmt_and_escape_str(f, v, options)?;
             Ok(())
         },
         #[cfg(feature = "dtype-categorical")]
-        AnyValue::Categorical(idx, rev_map, _) => {
+        AnyValue::Categorical(idx, rev_map, _) | AnyValue::Enum(idx, rev_map, _) => {
             let v = rev_map.get(idx);
             fmt_and_escape_str(f, v, options)?;
             Ok(())
         },
         _ => {
             // Then we deal with the numeric types
-            let quote = options.quote as char;
+            let quote = options.quote_char as char;
 
             let mut end_with_quote = matches!(options.quote_style, QuoteStyle::Always);
             if end_with_quote {
@@ -186,18 +187,19 @@ unsafe fn write_anyvalue(
                                 },
                                 _ => ndt.format(datetime_format),
                             };
-                            return write!(f, "{formatted}").map_err(|_|{
-
+                            let str_result = write!(f, "{formatted}");
+                            if str_result.is_err() {
                                 let datetime_format = unsafe { *datetime_formats.get_unchecked(i) };
                                 let type_name = if tz.is_some() {
                                     "DateTime"
                                 } else {
                                     "NaiveDateTime"
                                 };
-                                polars_err!(
-                ComputeError: "cannot format {} with format '{}'", type_name, datetime_format,
-            )
-                            });
+                                polars_bail!(
+                                    ComputeError: "cannot format {} with format '{}'", type_name, datetime_format,
+                                )
+                            };
+                            str_result
                         },
                         #[cfg(feature = "dtype-time")]
                         AnyValue::Time(v) => {
@@ -237,10 +239,10 @@ pub struct SerializeOptions {
     pub datetime_format: Option<String>,
     /// Used for [`DataType::Float64`] and [`DataType::Float32`].
     pub float_precision: Option<usize>,
-    /// Used as separator/delimiter.
-    pub delimiter: u8,
+    /// Used as separator.
+    pub separator: u8,
     /// Quoting character.
-    pub quote: u8,
+    pub quote_char: u8,
     /// Null value representation.
     pub null: String,
     /// String appended after every row.
@@ -255,8 +257,8 @@ impl Default for SerializeOptions {
             time_format: None,
             datetime_format: None,
             float_precision: None,
-            delimiter: b',',
-            quote: b'"',
+            separator: b',',
+            quote_char: b'"',
             null: String::new(),
             line_terminator: "\n".into(),
             quote_style: Default::default(),
@@ -279,6 +281,7 @@ pub(crate) fn write<W: Write>(
     df: &DataFrame,
     chunk_size: usize,
     options: &SerializeOptions,
+    n_threads: usize,
 ) -> PolarsResult<()> {
     for s in df.get_columns() {
         let nested = match s.dtype() {
@@ -286,7 +289,7 @@ pub(crate) fn write<W: Write>(
             #[cfg(feature = "dtype-struct")]
             DataType::Struct(_) => true,
             #[cfg(feature = "object")]
-            DataType::Object(_) => {
+            DataType::Object(_, _) => {
                 return Err(PolarsError::ComputeError(
                     "csv writer does not support object dtype".into(),
                 ))
@@ -301,10 +304,10 @@ pub(crate) fn write<W: Write>(
 
     // Check that the double quote is valid UTF-8.
     polars_ensure!(
-        std::str::from_utf8(&[options.quote, options.quote]).is_ok(),
+        std::str::from_utf8(&[options.quote_char, options.quote_char]).is_ok(),
         ComputeError: "quote char results in invalid utf-8",
     );
-    let delimiter = char::from(options.delimiter);
+    let separator = char::from(options.separator);
 
     let (datetime_formats, time_zones): (Vec<&str>, Vec<Option<Tz>>) = df
         .get_columns()
@@ -377,7 +380,6 @@ pub(crate) fn write<W: Write>(
     let time_zones = time_zones.into_iter().collect::<Vec<_>>();
 
     let len = df.height();
-    let n_threads = POOL.current_num_threads();
     let total_rows_per_pool_iter = n_threads * chunk_size;
     let any_value_iter_pool = LowContentionPool::<Vec<_>>::new(n_threads);
     let write_buffer_pool = LowContentionPool::<Vec<_>>::new(n_threads);
@@ -386,8 +388,9 @@ pub(crate) fn write<W: Write>(
 
     // holds the buffers that will be written
     let mut result_buf: Vec<PolarsResult<Vec<u8>>> = Vec::with_capacity(n_threads);
+
     while n_rows_finished < len {
-        let par_iter = (0..n_threads).into_par_iter().map(|thread_no| {
+        let buf_writer = |thread_no| {
             let thread_offset = thread_no * chunk_size;
             let total_offset = n_rows_finished + thread_offset;
             let mut df = df.slice(total_offset as i64, chunk_size);
@@ -422,7 +425,7 @@ pub(crate) fn write<W: Write>(
                 for (i, col) in &mut col_iters.iter_mut().enumerate() {
                     match col.next() {
                         Some(value) => unsafe {
-                            write_anyvalue(
+                            write_any_value(
                                 &mut write_buffer,
                                 value,
                                 options,
@@ -438,7 +441,7 @@ pub(crate) fn write<W: Write>(
                     }
                     let current_ptr = col as *const SeriesIter;
                     if current_ptr != last_ptr {
-                        write!(&mut write_buffer, "{delimiter}").unwrap()
+                        write!(&mut write_buffer, "{separator}").unwrap()
                     }
                 }
                 if !finished {
@@ -451,10 +454,15 @@ pub(crate) fn write<W: Write>(
             any_value_iter_pool.set(col_iters);
 
             Ok(write_buffer)
-        });
+        };
 
-        // rayon will ensure the right order
-        POOL.install(|| result_buf.par_extend(par_iter));
+        if n_threads > 1 {
+            let par_iter = (0..n_threads).into_par_iter().map(buf_writer);
+            // rayon will ensure the right order
+            POOL.install(|| result_buf.par_extend(par_iter));
+        } else {
+            result_buf.push(buf_writer(0));
+        }
 
         for buf in result_buf.drain(..) {
             let mut buf = buf?;
@@ -487,9 +495,16 @@ pub(crate) fn write_header<W: Write>(
     }
     writer.write_all(
         escaped_names
-            .join(std::str::from_utf8(&[options.delimiter]).unwrap())
+            .join(std::str::from_utf8(&[options.separator]).unwrap())
             .as_bytes(),
     )?;
     writer.write_all(options.line_terminator.as_bytes())?;
+    Ok(())
+}
+
+/// Writes a UTF-8 BOM to `writer`.
+pub(crate) fn write_bom<W: Write>(writer: &mut W) -> PolarsResult<()> {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    writer.write_all(&BOM)?;
     Ok(())
 }

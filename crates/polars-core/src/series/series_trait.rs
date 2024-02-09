@@ -3,16 +3,15 @@ use std::borrow::Cow;
 #[cfg(feature = "temporal")]
 use std::sync::Arc;
 
-use polars_arrow::prelude::QuantileInterpolOptions;
+use arrow::legacy::prelude::QuantileInterpolOptions;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "object")]
 use crate::chunked_array::object::PolarsObjectSafe;
-pub use crate::prelude::ChunkCompare;
 use crate::prelude::*;
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum IsSorted {
     Ascending,
@@ -21,7 +20,7 @@ pub enum IsSorted {
 }
 
 impl IsSorted {
-    pub(crate) fn reverse(self) -> Self {
+    pub fn reverse(self) -> Self {
         use IsSorted::*;
         match self {
             Ascending => Descending,
@@ -45,9 +44,9 @@ pub(crate) mod private {
     use ahash::RandomState;
 
     use super::*;
-    use crate::chunked_array::ops::compare_inner::{PartialEqInner, PartialOrdInner};
+    use crate::chunked_array::ops::compare_inner::{TotalEqInner, TotalOrdInner};
     use crate::chunked_array::Settings;
-    #[cfg(feature = "rows")]
+    #[cfg(feature = "algorithm_group_by")]
     use crate::frame::group_by::GroupsProxy;
 
     pub trait PrivateSeriesNumeric {
@@ -88,18 +87,6 @@ pub(crate) mod private {
             invalid_operation_panic!(explode_by_offsets, self)
         }
 
-        /// Get an array with the cumulative max computed at every element
-        #[cfg(feature = "cum_agg")]
-        fn _cummax(&self, _reverse: bool) -> Series {
-            panic!("operation cummax not supported for this dtype")
-        }
-
-        /// Get an array with the cumulative min computed at every element
-        #[cfg(feature = "cum_agg")]
-        fn _cummin(&self, _reverse: bool) -> Series {
-            panic!("operation cummin not supported for this dtype")
-        }
-
         unsafe fn equal_element(
             &self,
             _idx_self: usize,
@@ -109,12 +96,12 @@ pub(crate) mod private {
             invalid_operation_panic!(equal_element, self)
         }
         #[allow(clippy::wrong_self_convention)]
-        fn into_partial_eq_inner<'a>(&'a self) -> Box<dyn PartialEqInner + 'a> {
-            invalid_operation_panic!(into_partial_eq_inner, self)
+        fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
+            invalid_operation_panic!(into_total_eq_inner, self)
         }
         #[allow(clippy::wrong_self_convention)]
-        fn into_partial_ord_inner<'a>(&'a self) -> Box<dyn PartialOrdInner + 'a> {
-            invalid_operation_panic!(into_partial_ord_inner, self)
+        fn into_total_ord_inner<'a>(&'a self) -> Box<dyn TotalOrdInner + 'a> {
+            invalid_operation_panic!(into_total_ord_inner, self)
         }
         fn vec_hash(&self, _build_hasher: RandomState, _buf: &mut Vec<u64>) -> PolarsResult<()> {
             polars_bail!(opq = vec_hash, self._dtype());
@@ -259,14 +246,6 @@ pub trait SeriesTrait:
     /// Filter by boolean mask. This operation clones data.
     fn filter(&self, _filter: &BooleanChunked) -> PolarsResult<Series>;
 
-    #[doc(hidden)]
-    #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series;
-
-    #[doc(hidden)]
-    #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_opt_chunked_unchecked(&self, by: &[Option<ChunkId>]) -> Series;
-
     /// Take by index. This operation is clone.
     fn take(&self, _indices: &IdxCa) -> PolarsResult<Series>;
 
@@ -308,6 +287,18 @@ pub trait SeriesTrait:
     /// Returns the mean value in the array
     /// Returns an option because the array is nullable.
     fn mean(&self) -> Option<f64> {
+        None
+    }
+
+    /// Returns the std value in the array
+    /// Returns an option because the array is nullable.
+    fn std(&self, _ddof: u8) -> Option<f64> {
+        None
+    }
+
+    /// Returns the var value in the array
+    /// Returns an option because the array is nullable.
+    fn var(&self, _ddof: u8) -> Option<f64> {
         None
     }
 
@@ -425,28 +416,28 @@ pub trait SeriesTrait:
     ///
     /// If the [`DataType`] is one of `{Int8, UInt8, Int16, UInt16}` the `Series` is
     /// first cast to `Int64` to prevent overflow issues.
-    fn _sum_as_series(&self) -> Series {
-        Series::full_null(self.name(), 1, self.dtype())
+    fn _sum_as_series(&self) -> PolarsResult<Series> {
+        polars_bail!(opq = sum, self._dtype());
     }
     /// Get the max of the Series as a new Series of length 1.
-    fn max_as_series(&self) -> Series {
-        Series::full_null(self.name(), 1, self.dtype())
+    fn max_as_series(&self) -> PolarsResult<Series> {
+        polars_bail!(opq = max, self._dtype());
     }
     /// Get the min of the Series as a new Series of length 1.
-    fn min_as_series(&self) -> Series {
-        Series::full_null(self.name(), 1, self.dtype())
+    fn min_as_series(&self) -> PolarsResult<Series> {
+        polars_bail!(opq = min, self._dtype());
     }
     /// Get the median of the Series as a new Series of length 1.
-    fn median_as_series(&self) -> Series {
-        Series::full_null(self.name(), 1, self.dtype())
+    fn median_as_series(&self) -> PolarsResult<Series> {
+        polars_bail!(opq = median, self._dtype());
     }
     /// Get the variance of the Series as a new Series of length 1.
-    fn var_as_series(&self, _ddof: u8) -> Series {
-        Series::full_null(self.name(), 1, self.dtype())
+    fn var_as_series(&self, _ddof: u8) -> PolarsResult<Series> {
+        polars_bail!(opq = var, self._dtype());
     }
     /// Get the standard deviation of the Series as a new Series of length 1.
-    fn std_as_series(&self, _ddof: u8) -> Series {
-        Series::full_null(self.name(), 1, self.dtype())
+    fn std_as_series(&self, _ddof: u8) -> PolarsResult<Series> {
+        polars_bail!(opq = std, self._dtype());
     }
     /// Get the quantile of the ChunkedArray as a new Series of length 1.
     fn quantile_as_series(
@@ -454,7 +445,7 @@ pub trait SeriesTrait:
         _quantile: f64,
         _interpol: QuantileInterpolOptions,
     ) -> PolarsResult<Series> {
-        Ok(Series::full_null(self.name(), 1, self.dtype()))
+        polars_bail!(opq = quantile, self._dtype());
     }
 
     /// Clone inner ChunkedArray and wrap in a new Arc
@@ -464,6 +455,18 @@ pub trait SeriesTrait:
     /// Get the value at this index as a downcastable Any trait ref.
     fn get_object(&self, _index: usize) -> Option<&dyn PolarsObjectSafe> {
         invalid_operation_panic!(get_object, self)
+    }
+
+    #[cfg(feature = "object")]
+    /// Get the value at this index as a downcastable Any trait ref.
+    /// # Safety
+    /// This function doesn't do any bound checks.
+    unsafe fn get_object_chunked_unchecked(
+        &self,
+        _chunk: usize,
+        _index: usize,
+    ) -> Option<&dyn PolarsObjectSafe> {
+        invalid_operation_panic!(get_object_chunked_unchecked, self)
     }
 
     /// Get a hold to self as `Any` trait reference.
@@ -478,29 +481,9 @@ pub trait SeriesTrait:
         invalid_operation_panic!(as_any_mut, self)
     }
 
-    /// Get a boolean mask of the local maximum peaks.
-    fn peak_max(&self) -> BooleanChunked {
-        invalid_operation_panic!(peak_max, self)
-    }
-
-    /// Get a boolean mask of the local minimum peaks.
-    fn peak_min(&self) -> BooleanChunked {
-        invalid_operation_panic!(peak_min, self)
-    }
-
-    #[cfg(feature = "repeat_by")]
-    fn repeat_by(&self, _by: &IdxCa) -> PolarsResult<ListChunked> {
-        polars_bail!(opq = repeat_by, self._dtype());
-    }
     #[cfg(feature = "checked_arithmetic")]
     fn checked_div(&self, _rhs: &Series) -> PolarsResult<Series> {
         polars_bail!(opq = checked_div, self._dtype());
-    }
-
-    #[cfg(feature = "mode")]
-    /// Compute the most occurring element in the array.
-    fn mode(&self) -> PolarsResult<Series> {
-        polars_bail!(opq = mode, self._dtype());
     }
 
     #[cfg(feature = "rolling_window")]
@@ -512,14 +495,6 @@ pub trait SeriesTrait:
         _options: RollingOptionsFixedWindow,
     ) -> PolarsResult<Series> {
         polars_bail!(opq = rolling_map, self._dtype());
-    }
-    #[cfg(feature = "concat_str")]
-    /// Concat the values into a string array.
-    /// # Arguments
-    ///
-    /// * `delimiter` - A string that will act as delimiter between values.
-    fn str_concat(&self, _delimiter: &str) -> Utf8Chunked {
-        invalid_operation_panic!(str_concat, self);
     }
 
     fn tile(&self, _n: usize) -> Series {

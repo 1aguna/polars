@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -9,7 +10,6 @@ import polars as pl
 from polars import datatypes
 from polars.datatypes import (
     DTYPE_TEMPORAL_UNITS,
-    DataTypeClass,
     DataTypeGroup,
     Field,
     Int64,
@@ -18,16 +18,40 @@ from polars.datatypes import (
     py_type_to_dtype,
 )
 
+if TYPE_CHECKING:
+    from polars.datatypes import DataTypeClass
 
-def test_dtype_init_equivalence() -> None:
-    # check "DataType.__new__" behaviour for all datatypes
-    all_datatypes = {
-        dtype
-        for dtype in (getattr(datatypes, attr) for attr in dir(datatypes))
-        if isinstance(dtype, DataTypeClass)
+SIMPLE_DTYPES: list[DataTypeClass] = list(
+    pl.INTEGER_DTYPES  # type: ignore[arg-type]
+    | pl.FLOAT_DTYPES
+    | {
+        pl.Boolean,
+        pl.String,
+        pl.Binary,
+        pl.Time,
+        pl.Date,
+        pl.Object,
+        pl.Null,
+        pl.Unknown,
     }
-    for dtype in all_datatypes:
-        assert dtype == dtype()
+)
+
+
+def test_simple_dtype_init_takes_no_args() -> None:
+    for dtype in SIMPLE_DTYPES:
+        with pytest.raises(TypeError):
+            dtype(10)
+
+
+def test_simple_dtype_init_returns_instance() -> None:
+    dtype = pl.Int8()
+    assert isinstance(dtype, pl.Int8)
+
+
+def test_complex_dtype_init_returns_instance() -> None:
+    dtype = pl.Datetime()
+    assert isinstance(dtype, pl.Datetime)
+    assert dtype.time_unit == "us"
 
 
 def test_dtype_temporal_units() -> None:
@@ -36,8 +60,8 @@ def test_dtype_temporal_units() -> None:
         assert pl.Datetime == pl.Datetime(time_unit)
         assert pl.Duration == pl.Duration(time_unit)
 
-        assert pl.Datetime(time_unit) == pl.Datetime()
-        assert pl.Duration(time_unit) == pl.Duration()
+        assert pl.Datetime(time_unit) == pl.Datetime
+        assert pl.Duration(time_unit) == pl.Duration
 
     assert pl.Datetime("ms") != pl.Datetime("ns")
     assert pl.Duration("ns") != pl.Duration("us")
@@ -50,10 +74,10 @@ def test_dtype_temporal_units() -> None:
         assert inferred_dtype == expected_dtype
         assert inferred_dtype.time_unit == "us"  # type: ignore[union-attr]
 
-    with pytest.raises(ValueError, match="invalid time_unit"):
+    with pytest.raises(ValueError, match="invalid `time_unit`"):
         pl.Datetime("?")  # type: ignore[arg-type]
 
-    with pytest.raises(ValueError, match="invalid time_unit"):
+    with pytest.raises(ValueError, match="invalid `time_unit`"):
         pl.Duration("?")  # type: ignore[arg-type]
 
 
@@ -74,10 +98,6 @@ def test_dtype_groups() -> None:
 
     grp = DataTypeGroup([pl.Datetime])
     assert pl.Datetime("ms", "Asia/Tokyo") in grp
-
-
-def test_get_index_type() -> None:
-    assert pl.get_index_type() == pl.UInt32
 
 
 def test_dtypes_picklable() -> None:
@@ -114,8 +134,8 @@ def test_dtypes_hashable() -> None:
         (pl.List(pl.Duration(time_unit="ns")), "List(Duration(time_unit='ns'))"),
         (pl.Struct, "Struct"),
         (
-            pl.Struct({"name": pl.Utf8, "ids": pl.List(pl.UInt32)}),
-            "Struct([Field('name', Utf8), Field('ids', List(UInt32))])",
+            pl.Struct({"name": pl.String, "ids": pl.List(pl.UInt32)}),
+            "Struct({'name': String, 'ids': List(UInt32)})",
         ),
     ],
 )
@@ -138,22 +158,20 @@ def test_conversion_dtype() -> None:
             }
         )
         .select(
-            [
-                pl.struct(
-                    [pl.col("id_column"), pl.col("some_column").cast(pl.Categorical)]
-                ).alias("struct"),
-                pl.col("some_partition_column"),
-            ]
+            pl.struct(
+                pl.col("id_column"), pl.col("some_column").cast(pl.Categorical)
+            ).alias("struct"),
+            pl.col("some_partition_column"),
         )
-        .group_by(["some_partition_column"], maintain_order=True)
-        .agg([pl.col(["struct"])])
+        .group_by("some_partition_column", maintain_order=True)
+        .agg("struct")
     )
 
-    df = pl.from_arrow(df.to_arrow())  # type: ignore[assignment]
+    result: pl.DataFrame = pl.from_arrow(df.to_arrow())  # type: ignore[assignment]
     # the assertion is not the real test
     # this tests if dtype has bubbled up correctly in conversion
     # if not we would UB
-    assert df.to_dict(False) == {
+    expected = {
         "some_partition_column": ["partition_1", "partition_2"],
         "struct": [
             [
@@ -166,6 +184,7 @@ def test_conversion_dtype() -> None:
             ],
         ],
     }
+    assert result.to_dict(as_series=False) == expected
 
 
 def test_struct_field_iter() -> None:

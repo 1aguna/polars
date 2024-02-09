@@ -48,7 +48,7 @@ pub fn array_to_rust(obj: &PyAny) -> PyResult<ArrayRef> {
 
 pub fn to_rust_df(rb: &[&PyAny]) -> PyResult<DataFrame> {
     let schema = rb
-        .get(0)
+        .first()
         .ok_or_else(|| PyPolarsErr::Other("empty table".into()))?
         .getattr("schema")?;
     let names = schema.getattr("names")?.extract::<Vec<String>>()?;
@@ -71,7 +71,7 @@ pub fn to_rust_df(rb: &[&PyAny]) -> PyResult<DataFrame> {
                 .collect::<PyResult<Vec<_>>>()?;
 
             // we parallelize this part because we can have dtypes that are not zero copy
-            // for instance utf8 -> large-utf8
+            // for instance string -> large-utf8
             // dict encoded to categorical
             let columns = if run_parallel {
                 POOL.install(|| {

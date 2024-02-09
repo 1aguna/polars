@@ -1,7 +1,7 @@
 use polars::lazy::dsl;
 use polars::lazy::dsl::Expr;
 use polars::prelude::*;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyString};
 
@@ -177,19 +177,19 @@ pub fn concat_list(s: Vec<PyExpr>) -> PyResult<PyExpr> {
 }
 
 #[pyfunction]
-pub fn concat_str(s: Vec<PyExpr>, separator: &str) -> PyExpr {
+pub fn concat_str(s: Vec<PyExpr>, separator: &str, ignore_nulls: bool) -> PyExpr {
     let s = s.into_iter().map(|e| e.inner).collect::<Vec<_>>();
-    dsl::concat_str(s, separator).into()
+    dsl::concat_str(s, separator, ignore_nulls).into()
 }
 
 #[pyfunction]
-pub fn count() -> PyExpr {
-    dsl::count().into()
+pub fn len() -> PyExpr {
+    dsl::len().into()
 }
 
 #[pyfunction]
-pub fn cov(a: PyExpr, b: PyExpr) -> PyExpr {
-    dsl::cov(a.inner, b.inner).into()
+pub fn cov(a: PyExpr, b: PyExpr, ddof: u8) -> PyExpr {
+    dsl::cov(a.inner, b.inner, ddof).into()
 }
 
 #[pyfunction]
@@ -205,22 +205,21 @@ pub fn arctan2d(y: PyExpr, x: PyExpr) -> PyExpr {
 }
 
 #[pyfunction]
-pub fn cumfold(acc: PyExpr, lambda: PyObject, exprs: Vec<PyExpr>, include_init: bool) -> PyExpr {
+pub fn cum_fold(acc: PyExpr, lambda: PyObject, exprs: Vec<PyExpr>, include_init: bool) -> PyExpr {
     let exprs = exprs.to_exprs();
 
     let func = move |a: Series, b: Series| binary_lambda(&lambda, a, b);
-    dsl::cumfold_exprs(acc.inner, func, exprs, include_init).into()
+    dsl::cum_fold_exprs(acc.inner, func, exprs, include_init).into()
 }
 
 #[pyfunction]
-pub fn cumreduce(lambda: PyObject, exprs: Vec<PyExpr>) -> PyExpr {
+pub fn cum_reduce(lambda: PyObject, exprs: Vec<PyExpr>) -> PyExpr {
     let exprs = exprs.to_exprs();
 
     let func = move |a: Series, b: Series| binary_lambda(&lambda, a, b);
-    dsl::cumreduce_exprs(func, exprs).into()
+    dsl::cum_reduce_exprs(func, exprs).into()
 }
 
-#[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (year, month, day, hour=None, minute=None, second=None, microsecond=None, time_unit=Wrap(TimeUnit::Microseconds), time_zone=None, ambiguous=None))]
 pub fn datetime(
@@ -259,7 +258,12 @@ pub fn datetime(
 }
 
 #[pyfunction]
-pub fn diag_concat_lf(lfs: &PyAny, rechunk: bool, parallel: bool) -> PyResult<PyLazyFrame> {
+pub fn concat_lf_diagonal(
+    lfs: &PyAny,
+    rechunk: bool,
+    parallel: bool,
+    to_supertypes: bool,
+) -> PyResult<PyLazyFrame> {
     let iter = lfs.iter()?;
 
     let lfs = iter
@@ -269,7 +273,35 @@ pub fn diag_concat_lf(lfs: &PyAny, rechunk: bool, parallel: bool) -> PyResult<Py
         })
         .collect::<PyResult<Vec<_>>>()?;
 
-    let lf = dsl::functions::diag_concat_lf(lfs, rechunk, parallel).map_err(PyPolarsErr::from)?;
+    let lf = dsl::functions::concat_lf_diagonal(
+        lfs,
+        UnionArgs {
+            rechunk,
+            parallel,
+            to_supertypes,
+        },
+    )
+    .map_err(PyPolarsErr::from)?;
+    Ok(lf.into())
+}
+
+#[pyfunction]
+pub fn concat_lf_horizontal(lfs: &PyAny, parallel: bool) -> PyResult<PyLazyFrame> {
+    let iter = lfs.iter()?;
+
+    let lfs = iter
+        .map(|item| {
+            let item = item?;
+            get_lf(item)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    let args = UnionArgs {
+        rechunk: false, // No need to rechunk with horizontal concatenation
+        parallel,
+        to_supertypes: false,
+    };
+    let lf = dsl::functions::concat_lf_horizontal(lfs, args).map_err(PyPolarsErr::from)?;
     Ok(lf.into())
 }
 
@@ -286,37 +318,39 @@ pub fn dtype_cols(dtypes: Vec<Wrap<DataType>>) -> PyResult<PyExpr> {
     Ok(dsl::dtype_cols(dtypes).into())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (weeks, days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds, time_unit))]
 pub fn duration(
-    days: Option<PyExpr>,
-    seconds: Option<PyExpr>,
-    nanoseconds: Option<PyExpr>,
-    microseconds: Option<PyExpr>,
-    milliseconds: Option<PyExpr>,
-    minutes: Option<PyExpr>,
-    hours: Option<PyExpr>,
     weeks: Option<PyExpr>,
+    days: Option<PyExpr>,
+    hours: Option<PyExpr>,
+    minutes: Option<PyExpr>,
+    seconds: Option<PyExpr>,
+    milliseconds: Option<PyExpr>,
+    microseconds: Option<PyExpr>,
+    nanoseconds: Option<PyExpr>,
+    time_unit: Wrap<TimeUnit>,
 ) -> PyExpr {
     set_unwrapped_or_0!(
-        days,
-        seconds,
-        nanoseconds,
-        microseconds,
-        milliseconds,
-        minutes,
-        hours,
         weeks,
+        days,
+        hours,
+        minutes,
+        seconds,
+        milliseconds,
+        microseconds,
+        nanoseconds,
     );
     let args = DurationArgs {
-        days,
-        seconds,
-        nanoseconds,
-        microseconds,
-        milliseconds,
-        minutes,
-        hours,
         weeks,
+        days,
+        hours,
+        minutes,
+        seconds,
+        milliseconds,
+        microseconds,
+        nanoseconds,
+        time_unit: time_unit.0,
     };
     dsl::duration(args).into()
 }
@@ -345,18 +379,13 @@ pub fn lit(value: &PyAny, allow_object: bool) -> PyResult<PyExpr> {
         let val = value.extract::<bool>().unwrap();
         Ok(dsl::lit(val).into())
     } else if let Ok(int) = value.downcast::<PyInt>() {
-        match int.extract::<i64>() {
-            Ok(val) => {
-                if val >= 0 && val < i32::MAX as i64 || val <= 0 && val > i32::MIN as i64 {
-                    Ok(dsl::lit(val as i32).into())
-                } else {
-                    Ok(dsl::lit(val).into())
-                }
-            },
-            _ => {
-                let val = int.extract::<u64>().unwrap();
-                Ok(dsl::lit(val).into())
-            },
+        if let Ok(val) = int.extract::<i32>() {
+            Ok(dsl::lit(val).into())
+        } else if let Ok(val) = int.extract::<i64>() {
+            Ok(dsl::lit(val).into())
+        } else {
+            let val = int.extract::<u64>().unwrap();
+            Ok(dsl::lit(val).into())
         }
     } else if let Ok(float) = value.downcast::<PyFloat>() {
         let val = float.extract::<f64>().unwrap();
@@ -376,12 +405,12 @@ pub fn lit(value: &PyAny, allow_object: bool) -> PyResult<PyExpr> {
         Ok(dsl::lit(value.as_bytes()).into())
     } else if allow_object {
         let s = Python::with_gil(|py| {
-            PySeries::new_object("", vec![ObjectValue::from(value.into_py(py))], false).series
+            PySeries::new_object(py, "", vec![ObjectValue::from(value.into_py(py))], false).series
         });
         Ok(dsl::lit(s).into())
     } else {
-        Err(PyValueError::new_err(format!(
-            "could not convert value {:?} as a Literal",
+        Err(PyTypeError::new_err(format!(
+            "invalid literal value: {:?}",
             value.str()?
         )))
     }
@@ -423,7 +452,7 @@ pub fn repeat(value: PyExpr, n: PyExpr, dtype: Option<Wrap<DataType>>) -> PyResu
     }
 
     if let Expr::Literal(lv) = &value {
-        let av = lv.to_anyvalue().unwrap();
+        let av = lv.to_any_value().unwrap();
         // Integer inputs that fit in Int32 are parsed as such
         if let DataType::Int64 = av.dtype() {
             let int_value = av.try_extract::<i64>().unwrap();

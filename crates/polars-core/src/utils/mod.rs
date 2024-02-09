@@ -4,17 +4,18 @@ mod supertype;
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
+use arrow::bitmap::bitmask::BitMask;
 use arrow::bitmap::Bitmap;
+pub use arrow::legacy::utils::*;
+pub use arrow::trusted_len::TrustMyLength;
 use flatten::*;
 use num_traits::{One, Zero};
-pub use polars_arrow::utils::{TrustMyLength, *};
 use rayon::prelude::*;
 pub use series::*;
 use smartstring::alias::String as SmartString;
 pub use supertype::*;
 pub use {arrow, rayon};
 
-pub use crate::chunked_array::ops::sort::arg_sort_no_nulls;
 use crate::prelude::*;
 use crate::POOL;
 
@@ -28,20 +29,9 @@ impl<T> Deref for Wrap<T> {
     }
 }
 
+#[inline(always)]
 pub fn _set_partition_size() -> usize {
-    let mut n_partitions = POOL.current_num_threads();
-    if n_partitions == 1 {
-        return 1;
-    }
-    // set n_partitions to closest 2^n size
-    loop {
-        if n_partitions.is_power_of_two() {
-            break;
-        } else {
-            n_partitions -= 1;
-        }
-    }
-    n_partitions
+    POOL.current_num_threads()
 }
 
 /// Just a wrapper structure. Useful for certain impl specializations
@@ -145,7 +135,7 @@ pub fn split_series(s: &Series, n: usize) -> PolarsResult<Vec<Series>> {
 
 pub fn split_df_as_ref(df: &DataFrame, n: usize) -> PolarsResult<Vec<DataFrame>> {
     let total_len = df.height();
-    let chunk_size = std::cmp::max(total_len / n, 3);
+    let chunk_size = std::cmp::max(total_len / n, 1);
 
     if df.n_chunks() == n
         && df.get_columns()[0]
@@ -219,9 +209,9 @@ pub fn slice_offsets(offset: i64, length: usize, array_len: usize) -> (usize, us
 /// Apply a macro on the Series
 #[macro_export]
 macro_rules! match_dtype_to_physical_apply_macro {
-    ($obj:expr, $macro:ident, $macro_utf8:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
+    ($obj:expr, $macro:ident, $macro_string:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
         match $obj {
-            DataType::Utf8 => $macro_utf8!($($opt_args)*),
+            DataType::String => $macro_string!($($opt_args)*),
             DataType::Boolean => $macro_bool!($($opt_args)*),
             #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $macro!(u8 $(, $opt_args)*),
@@ -245,9 +235,9 @@ macro_rules! match_dtype_to_physical_apply_macro {
 /// Apply a macro on the Series
 #[macro_export]
 macro_rules! match_dtype_to_logical_apply_macro {
-    ($obj:expr, $macro:ident, $macro_utf8:ident, $macro_binary:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
+    ($obj:expr, $macro:ident, $macro_string:ident, $macro_binary:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
         match $obj {
-            DataType::Utf8 => $macro_utf8!($($opt_args)*),
+            DataType::String => $macro_string!($($opt_args)*),
             DataType::Binary => $macro_binary!($($opt_args)*),
             DataType::Boolean => $macro_bool!($($opt_args)*),
             #[cfg(feature = "dtype-u8")]
@@ -272,9 +262,9 @@ macro_rules! match_dtype_to_logical_apply_macro {
 /// Apply a macro on the Downcasted ChunkedArray's
 #[macro_export]
 macro_rules! match_arrow_data_type_apply_macro_ca {
-    ($self:expr, $macro:ident, $macro_utf8:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
+    ($self:expr, $macro:ident, $macro_string:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
         match $self.dtype() {
-            DataType::Utf8 => $macro_utf8!($self.utf8().unwrap() $(, $opt_args)*),
+            DataType::String => $macro_string!($self.str().unwrap() $(, $opt_args)*),
             DataType::Boolean => $macro_bool!($self.bool().unwrap() $(, $opt_args)*),
             #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $macro!($self.u8().unwrap() $(, $opt_args)*),
@@ -290,7 +280,7 @@ macro_rules! match_arrow_data_type_apply_macro_ca {
             DataType::Int64 => $macro!($self.i64().unwrap() $(, $opt_args)*),
             DataType::Float32 => $macro!($self.f32().unwrap() $(, $opt_args)*),
             DataType::Float64 => $macro!($self.f64().unwrap() $(, $opt_args)*),
-            _ => unimplemented!(),
+            dt => panic!("not implemented for dtype {:?}", dt),
         }
     }};
 }
@@ -312,7 +302,7 @@ macro_rules! with_match_physical_numeric_type {(
         UInt64 => __with_ty__! { u64 },
         Float32 => __with_ty__! { f32 },
         Float64 => __with_ty__! { f64 },
-        _ => unimplemented!()
+        dt => panic!("not implemented for dtype {:?}", dt),
     }
 })}
 
@@ -331,7 +321,20 @@ macro_rules! with_match_physical_integer_type {(
         UInt16 => __with_ty__! { u16 },
         UInt32 => __with_ty__! { u32 },
         UInt64 => __with_ty__! { u64 },
-        _ => unimplemented!()
+        dt => panic!("not implemented for dtype {:?}", dt),
+    }
+})}
+
+#[macro_export]
+macro_rules! with_match_physical_float_polars_type {(
+    $key_type:expr, | $_:tt $T:ident | $($body:tt)*
+) => ({
+    macro_rules! __with_ty__ {( $_ $T:ident ) => ( $($body)* )}
+    use $crate::datatypes::DataType::*;
+    match $key_type {
+        Float32 => __with_ty__! { Float32Type },
+        Float64 => __with_ty__! { Float64Type },
+        dt => panic!("not implemented for dtype {:?}", dt),
     }
 })}
 
@@ -356,7 +359,7 @@ macro_rules! with_match_physical_numeric_polars_type {(
         UInt64 => __with_ty__! { UInt64Type },
         Float32 => __with_ty__! { Float32Type },
         Float64 => __with_ty__! { Float64Type },
-        _ => unimplemented!()
+        dt => panic!("not implemented for dtype {:?}", dt),
     }
 })}
 
@@ -380,7 +383,7 @@ macro_rules! with_match_physical_integer_polars_type {(
         UInt16 => __with_ty__! { UInt16Type },
         UInt32 => __with_ty__! { UInt32Type },
         UInt64 => __with_ty__! { UInt64Type },
-        _ => unimplemented!()
+        dt => panic!("not implemented for dtype {:?}", dt),
     }
 })}
 
@@ -470,7 +473,7 @@ macro_rules! apply_method_all_arrow_series {
     ($self:expr, $method:ident, $($args:expr),*) => {
         match $self.dtype() {
             DataType::Boolean => $self.bool().unwrap().$method($($args),*),
-            DataType::Utf8 => $self.utf8().unwrap().$method($($args),*),
+            DataType::String => $self.str().unwrap().$method($($args),*),
             #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $self.u8().unwrap().$method($($args),*),
             #[cfg(feature = "dtype-u16")]
@@ -496,6 +499,18 @@ macro_rules! apply_method_all_arrow_series {
 }
 
 #[macro_export]
+macro_rules! apply_amortized_generic_list_or_array {
+        ($self:expr, $method:ident, $($args:expr),*) => {
+        match $self.dtype() {
+            #[cfg(feature = "dtype-array")]
+            DataType::Array(_, _) => $self.array().unwrap().apply_amortized_generic($($args),*),
+            DataType::List(_) => $self.list().unwrap().apply_amortized_generic($($args),*),
+            dt => panic!("not implemented for dtype {:?}", dt),
+        }
+    }
+}
+
+#[macro_export]
 macro_rules! apply_method_physical_integer {
     ($self:expr, $method:ident, $($args:expr),*) => {
         match $self.dtype() {
@@ -511,12 +526,12 @@ macro_rules! apply_method_physical_integer {
             DataType::Int16 => $self.i16().unwrap().$method($($args),*),
             DataType::Int32 => $self.i32().unwrap().$method($($args),*),
             DataType::Int64 => $self.i64().unwrap().$method($($args),*),
-            _ => unimplemented!(),
+            dt => panic!("not implemented for dtype {:?}", dt),
         }
     }
 }
 
-// doesn't include Bool and Utf8
+// doesn't include Bool and String
 #[macro_export]
 macro_rules! apply_method_physical_numeric {
     ($self:expr, $method:ident, $($args:expr),*) => {
@@ -617,6 +632,9 @@ pub fn accumulate_dataframes_horizontal(dfs: Vec<DataFrame>) -> PolarsResult<Dat
     Ok(acc_df)
 }
 
+/// Ensure the chunks in both ChunkedArrays have the same length.
+/// # Panics
+/// This will panic if `left.len() != right.len()` and array is chunked.
 pub fn align_chunks_binary<'a, T, B>(
     left: &'a ChunkedArray<T>,
     right: &'a ChunkedArray<B>,
@@ -625,17 +643,31 @@ where
     B: PolarsDataType,
     T: PolarsDataType,
 {
+    let assert = || {
+        assert_eq!(
+            left.len(),
+            right.len(),
+            "expected arrays of the same length"
+        )
+    };
     match (left.chunks.len(), right.chunks.len()) {
         (1, 1) => (Cow::Borrowed(left), Cow::Borrowed(right)),
-        (_, 1) => (
-            Cow::Borrowed(left),
-            Cow::Owned(right.match_chunks(left.chunk_id())),
-        ),
-        (1, _) => (
-            Cow::Owned(left.match_chunks(right.chunk_id())),
-            Cow::Borrowed(right),
-        ),
+        (_, 1) => {
+            assert();
+            (
+                Cow::Borrowed(left),
+                Cow::Owned(right.match_chunks(left.chunk_id())),
+            )
+        },
+        (1, _) => {
+            assert();
+            (
+                Cow::Owned(left.match_chunks(right.chunk_id())),
+                Cow::Borrowed(right),
+            )
+        },
         (_, _) => {
+            assert();
             // could optimize to choose to rechunk a primitive and not a string or list type
             let left = left.rechunk();
             (
@@ -672,6 +704,8 @@ where
     }
 }
 
+/// # Panics
+/// This will panic if `a.len() != b.len() || b.len() != c.len()` and array is chunked.
 #[allow(clippy::type_complexity)]
 pub fn align_chunks_ternary<'a, A, B, C>(
     a: &'a ChunkedArray<A>,
@@ -687,10 +721,16 @@ where
     B: PolarsDataType,
     C: PolarsDataType,
 {
-    debug_assert_eq!(a.len(), b.len());
-    debug_assert_eq!(b.len(), c.len());
+    if a.chunks.len() == 1 && b.chunks.len() == 1 && c.chunks.len() == 1 {
+        return (Cow::Borrowed(a), Cow::Borrowed(b), Cow::Borrowed(c));
+    }
+
+    assert!(
+        a.len() == b.len() && b.len() == c.len(),
+        "expected arrays of the same length"
+    );
+
     match (a.chunks.len(), b.chunks.len(), c.chunks.len()) {
-        (1, 1, 1) => (Cow::Borrowed(a), Cow::Borrowed(b), Cow::Borrowed(c)),
         (_, 1, 1) => (
             Cow::Borrowed(a),
             Cow::Owned(b.match_chunks(a.chunk_id())),
@@ -815,10 +855,9 @@ where
     let mut offset = 0;
     for validity in iter {
         if let Some(validity) = validity {
-            for (idx, is_valid) in validity.iter().enumerate() {
-                if is_valid {
-                    return Some(offset + idx);
-                }
+            let mask = BitMask::from_bitmap(validity);
+            if let Some(n) = mask.nth_set_bit_idx(0, 0) {
+                return Some(offset + n);
             }
             offset += validity.len()
         } else {
@@ -836,17 +875,16 @@ where
         return None;
     }
     let mut offset = 0;
-    let len = len - 1;
     for validity in iter.rev() {
         if let Some(validity) = validity {
-            for (idx, is_valid) in validity.iter().rev().enumerate() {
-                if is_valid {
-                    return Some(len - (offset + idx));
-                }
+            let mask = BitMask::from_bitmap(validity);
+            if let Some(n) = mask.nth_set_bit_idx_rev(0, mask.len()) {
+                let mask_start = len - offset - mask.len();
+                return Some(mask_start + n);
             }
             offset += validity.len()
         } else {
-            return Some(len - offset);
+            return Some(len - 1 - offset);
         }
     }
     None
@@ -867,6 +905,7 @@ pub fn coalesce_nulls<'a, T: PolarsDataType>(
                 *arr_b = arr_b.with_validity(arr.validity().cloned())
             }
         }
+        b.compute_len();
         (Cow::Owned(a), Cow::Owned(b))
     } else {
         (Cow::Borrowed(a), Cow::Borrowed(b))
@@ -887,6 +926,8 @@ pub fn coalesce_nulls_series(a: &Series, b: &Series) -> (Series, Series) {
             *arr_a = arr_a.with_validity(validity.clone());
             *arr_b = arr_b.with_validity(validity);
         }
+        a.compute_len();
+        b.compute_len();
         (a, b)
     } else {
         (a.clone(), b.clone())

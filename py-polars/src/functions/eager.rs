@@ -1,8 +1,10 @@
 use polars::functions;
 use polars_core::prelude::*;
+use polars_core::with_match_physical_integer_polars_type;
+use polars_ops::series::new_int_range;
 use pyo3::prelude::*;
 
-use crate::conversion::{get_df, get_series};
+use crate::conversion::{get_df, get_series, Wrap};
 use crate::error::PyPolarsErr;
 use crate::{PyDataFrame, PySeries};
 
@@ -63,7 +65,7 @@ pub fn concat_series(series: &PyAny) -> PyResult<PySeries> {
 }
 
 #[pyfunction]
-pub fn diag_concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
+pub fn concat_df_diagonal(dfs: &PyAny) -> PyResult<PyDataFrame> {
     let iter = dfs.iter()?;
 
     let dfs = iter
@@ -73,12 +75,12 @@ pub fn diag_concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
         })
         .collect::<PyResult<Vec<_>>>()?;
 
-    let df = functions::diag_concat_df(&dfs).map_err(PyPolarsErr::from)?;
+    let df = functions::concat_df_diagonal(&dfs).map_err(PyPolarsErr::from)?;
     Ok(df.into())
 }
 
 #[pyfunction]
-pub fn hor_concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
+pub fn concat_df_horizontal(dfs: &PyAny) -> PyResult<PyDataFrame> {
     let iter = dfs.iter()?;
 
     let dfs = iter
@@ -88,6 +90,24 @@ pub fn hor_concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
         })
         .collect::<PyResult<Vec<_>>>()?;
 
-    let df = functions::hor_concat_df(&dfs).map_err(PyPolarsErr::from)?;
+    let df = functions::concat_df_horizontal(&dfs).map_err(PyPolarsErr::from)?;
     Ok(df.into())
+}
+
+#[pyfunction]
+pub fn eager_int_range(
+    lower: &PyAny,
+    upper: &PyAny,
+    step: &PyAny,
+    dtype: Wrap<DataType>,
+) -> PyResult<PySeries> {
+    let ret = with_match_physical_integer_polars_type!(dtype.0, |$T| {
+        let start_v: <$T as PolarsNumericType>::Native = lower.extract()?;
+        let end_v: <$T as PolarsNumericType>::Native = upper.extract()?;
+        let step: i64 = step.extract()?;
+        new_int_range::<$T>(start_v, end_v, step, "literal")
+    });
+
+    let s = ret.map_err(PyPolarsErr::from)?;
+    Ok(s.into())
 }

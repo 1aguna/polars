@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from polars.io.pyarrow_dataset.anonymous_scan import _scan_pyarrow_dataset
+from polars.utils.unstable import unstable
 
 if TYPE_CHECKING:
     from polars import LazyFrame
     from polars.dependencies import pyarrow as pa
 
 
+@unstable()
 def scan_pyarrow_dataset(
     source: pa.dataset.Dataset,
     *,
@@ -17,6 +19,10 @@ def scan_pyarrow_dataset(
 ) -> LazyFrame:
     """
     Scan a pyarrow dataset.
+
+    .. warning::
+        This functionality is considered **unstable**. It may be changed
+        at any point without it being considered a breaking change.
 
     This can be useful to connect to cloud or partitioned datasets.
 
@@ -33,13 +39,15 @@ def scan_pyarrow_dataset(
 
     Warnings
     --------
-    This API is experimental and may change without it being considered a breaking
-    change.
+    This method can only can push down predicates that are allowed by PyArrow
+    (e.g. not the full Polars API).
+
+    If :func:`scan_parquet` works for your source, you should use that instead.
 
     Notes
     -----
-    When using partitioning, the appropriate ``partitioning`` option must be set on
-    ``pyarrow.dataset.dataset`` before passing to Polars or the partitioned-on column(s)
+    When using partitioning, the appropriate `partitioning` option must be set on
+    `pyarrow.dataset.dataset` before passing to Polars or the partitioned-on column(s)
     may not get passed to Polars.
 
     Examples
@@ -49,7 +57,7 @@ def scan_pyarrow_dataset(
     >>> (
     ...     pl.scan_pyarrow_dataset(dset)
     ...     .filter("bools")
-    ...     .select(["bools", "floats", "date"])
+    ...     .select("bools", "floats", "date")
     ...     .collect()
     ... )  # doctest: +SKIP
     shape: (1, 3)
@@ -60,7 +68,6 @@ def scan_pyarrow_dataset(
     ╞═══════╪════════╪════════════╡
     │ true  ┆ 2.0    ┆ 1970-05-04 │
     └───────┴────────┴────────────┘
-
     """
     return _scan_pyarrow_dataset(
         source,

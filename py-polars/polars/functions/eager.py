@@ -3,11 +3,12 @@ from __future__ import annotations
 import contextlib
 from functools import reduce
 from itertools import chain
-from typing import TYPE_CHECKING, Iterable, List, Sequence, cast
+from typing import TYPE_CHECKING, Iterable, List, Sequence, cast, get_args
 
 import polars._reexport as pl
 from polars import functions as F
-from polars.type_aliases import FrameType
+from polars.exceptions import InvalidOperationError
+from polars.type_aliases import ConcatMethod, FrameType
 from polars.utils._wrap import wrap_df, wrap_expr, wrap_ldf, wrap_s
 from polars.utils.various import ordered_unique
 
@@ -16,7 +17,7 @@ with contextlib.suppress(ImportError):  # Module not available when building doc
 
 if TYPE_CHECKING:
     from polars import DataFrame, Expr, LazyFrame, Series
-    from polars.type_aliases import ConcatMethod, JoinStrategy, PolarsType
+    from polars.type_aliases import JoinStrategy, PolarsType
 
 
 def concat(
@@ -33,19 +34,20 @@ def concat(
     ----------
     items
         DataFrames, LazyFrames, or Series to concatenate.
-    how : {'vertical', 'vertical_relaxed', 'diagonal', 'horizontal', 'align'}
+    how : {'vertical', 'vertical_relaxed', 'diagonal', 'diagonal_relaxed', 'horizontal', 'align'}
         Series only support the `vertical` strategy.
-        LazyFrames do not support the `horizontal` strategy.
 
         * vertical: Applies multiple `vstack` operations.
-        * vertical_relaxed: Applies multiple `vstack` operations and coerces column
-          dtypes that are not equal to their supertypes.
+        * vertical_relaxed: Same as `vertical`, but additionally coerces columns to
+          their common supertype *if* they are mismatched (eg: Int32 → Int64).
         * diagonal: Finds a union between the column schemas and fills missing column
-          values with ``null``.
-        * horizontal: Stacks Series from DataFrames horizontally and fills with ``null``
+          values with `null`.
+        * diagonal_relaxed: Same as `diagonal`, but additionally coerces columns to
+          their common supertype *if* they are mismatched (eg: Int32 → Int64).
+        * horizontal: Stacks Series from DataFrames horizontally and fills with `null`
           if the lengths don't match.
         * align: Combines frames horizontally, auto-determining the common key columns
-          and aligning rows using the same logic as ``align_frames``; this behaviour is
+          and aligning rows using the same logic as `align_frames`; this behaviour is
           patterned after a full outer join, but does not handle column-name collision.
           (If you need more control, you should use a suitable join method instead).
     rechunk
@@ -122,13 +124,13 @@ def concat(
     │ 2   ┆ 4    ┆ 5    ┆ null │
     │ 3   ┆ null ┆ 6    ┆ 8    │
     └─────┴──────┴──────┴──────┘
-
-    """
+    """  # noqa: W505
     # unpack/standardise (handles generator input)
     elems = list(items)
 
     if not len(elems) > 0:
-        raise ValueError("cannot concat empty list")
+        msg = "cannot concat empty list"
+        raise ValueError(msg)
     elif len(elems) == 1 and isinstance(
         elems[0], (pl.DataFrame, pl.Series, pl.LazyFrame)
     ):
@@ -136,9 +138,8 @@ def concat(
 
     if how == "align":
         if not isinstance(elems[0], (pl.DataFrame, pl.LazyFrame)):
-            raise TypeError(
-                f"'align' strategy is not supported for {type(elems[0]).__name__!r}"
-            )
+            msg = f"'align' strategy is not supported for {type(elems[0]).__name__!r}"
+            raise TypeError(msg)
 
         # establish common columns, maintaining the order in which they appear
         all_columns = list(chain.from_iterable(e.columns for e in elems))
@@ -150,10 +151,25 @@ def concat(
             ),
             key=lambda k: key.get(k, 0),
         )
+        # we require at least one key column for 'align'
+        if not common_cols:
+            msg = "'align' strategy requires at least one common column"
+            raise InvalidOperationError(msg)
+
         # align the frame data using an outer join with no suffix-resolution
         # (so we raise an error in case of column collision, like "horizontal")
         lf: LazyFrame = reduce(
-            lambda x, y: x.join(y, how="outer", on=common_cols, suffix=""),
+            lambda x, y: (
+                x.join(y, how="outer", on=common_cols, suffix="_PL_CONCAT_RIGHT")
+                # Coalesce outer join columns
+                .with_columns(
+                    [
+                        F.coalesce([name, f"{name}_PL_CONCAT_RIGHT"])
+                        for name in common_cols
+                    ]
+                )
+                .drop([f"{name}_PL_CONCAT_RIGHT" for name in common_cols])
+            ),
             [df.lazy() for df in elems],
         ).sort(by=common_cols)
 
@@ -175,50 +191,98 @@ def concat(
                     to_supertypes=True,
                 )
             ).collect(no_optimization=True)
+
         elif how == "diagonal":
-            out = wrap_df(plr.diag_concat_df(elems))
+            out = wrap_df(plr.concat_df_diagonal(elems))
+        elif how == "diagonal_relaxed":
+            out = wrap_ldf(
+                plr.concat_lf_diagonal(
+                    [df.lazy() for df in elems],
+                    rechunk=rechunk,
+                    parallel=parallel,
+                    to_supertypes=True,
+                )
+            ).collect(no_optimization=True)
         elif how == "horizontal":
-            out = wrap_df(plr.hor_concat_df(elems))
+            out = wrap_df(plr.concat_df_horizontal(elems))
         else:
-            raise ValueError(
-                f"`how` must be one of {{'vertical','vertical_relaxed','diagonal','horizontal','align'}},"
-                f" got {how!r}"
-            )
+            allowed = ", ".join(repr(m) for m in get_args(ConcatMethod))
+            msg = f"DataFrame `how` must be one of {{{allowed}}}, got {how!r}"
+            raise ValueError(msg)
+
     elif isinstance(first, pl.LazyFrame):
-        if how == "vertical":
+        if how in ("vertical", "vertical_relaxed"):
             return wrap_ldf(
                 plr.concat_lf(
-                    elems, rechunk=rechunk, parallel=parallel, to_supertypes=False
+                    elems,
+                    rechunk=rechunk,
+                    parallel=parallel,
+                    to_supertypes=how.endswith("relaxed"),
                 )
             )
-        if how == "vertical_relaxed":
+        elif how in ("diagonal", "diagonal_relaxed"):
             return wrap_ldf(
-                plr.concat_lf(
-                    elems, rechunk=rechunk, parallel=parallel, to_supertypes=True
+                plr.concat_lf_diagonal(
+                    elems,
+                    rechunk=rechunk,
+                    parallel=parallel,
+                    to_supertypes=how.endswith("relaxed"),
                 )
             )
-        if how == "diagonal":
+        elif how == "horizontal":
             return wrap_ldf(
-                plr.diag_concat_lf(elems, rechunk=rechunk, parallel=parallel)
+                plr.concat_lf_horizontal(
+                    elems,
+                    parallel=parallel,
+                )
             )
         else:
-            raise ValueError(
-                "'LazyFrame' only allows {'vertical','vertical_relaxed','diagonal','align'} concat strategies"
-            )
+            allowed = ", ".join(repr(m) for m in get_args(ConcatMethod))
+            msg = f"LazyFrame `how` must be one of {{{allowed}}}, got {how!r}"
+            raise ValueError(msg)
+
     elif isinstance(first, pl.Series):
         if how == "vertical":
             out = wrap_s(plr.concat_series(elems))
         else:
-            raise ValueError("Series only allows {'vertical'} concat strategy")
+            msg = "Series only supports 'vertical' concat strategy"
+            raise ValueError(msg)
 
     elif isinstance(first, pl.Expr):
         return wrap_expr(plr.concat_expr([e._pyexpr for e in elems], rechunk))
     else:
-        raise TypeError(f"did not expect type: {type(first).__name__!r} in `concat`")
+        msg = f"did not expect type: {type(first).__name__!r} in `concat`"
+        raise TypeError(msg)
 
     if rechunk:
         return out.rechunk()
     return out
+
+
+def _alignment_join(
+    *idx_frames: tuple[int, LazyFrame],
+    align_on: list[str],
+    how: JoinStrategy = "outer",
+    descending: bool | Sequence[bool] = False,
+) -> LazyFrame:
+    """Create a single master frame with all rows aligned on the common key values."""
+    # note: can stackoverflow if the join becomes too large, so we
+    # collect eagerly when hitting a large enough number of frames
+    post_align_collect = len(idx_frames) >= 250
+    if how == "outer":
+        how = "outer_coalesce"
+
+    def join_func(
+        idx_x: tuple[int, LazyFrame],
+        idx_y: tuple[int, LazyFrame],
+    ) -> tuple[int, LazyFrame]:
+        (_, x), (y_idx, y) = idx_x, idx_y
+        return y_idx, x.join(y, how=how, on=align_on, suffix=f":{y_idx}")
+
+    joined = reduce(join_func, idx_frames)[1].sort(by=align_on, descending=descending)
+    if post_align_collect:
+        joined = joined.collect(no_optimization=True).lazy()
+    return joined
 
 
 def align_frames(
@@ -234,12 +298,12 @@ def align_frames(
     Frames that do not contain the given key values have rows injected (with nulls
     filling the non-key columns), and each resulting frame is sorted by the key.
 
-    The original column order of input frames is not changed unless ``select`` is
+    The original column order of input frames is not changed unless `select` is
     specified (in which case the final column order is determined from that). In the
     case where duplicate key values exist, the alignment behaviour is determined by
-    the given alignment strategy specified in the ``how`` parameter (by default this
+    the given alignment strategy specified in the `how` parameter (by default this
     is a full outer join, but if your data is suitable you can get a large speedup
-    by setting ``how="left"`` instead).
+    by setting `how="left"` instead).
 
     Note that this function does not result in a joined frame - you receive the same
     number of frames back that you passed in, but each is now aligned by key and has
@@ -256,11 +320,11 @@ def align_frames(
         the columns returned from the newly aligned frames.
     descending
         Sort the alignment column values in descending order; can be a single
-        boolean or a list of booleans associated with each column in ``on``.
+        boolean or a list of booleans associated with each column in `on`.
     how
         By default the row alignment values are determined using a full outer join
         strategy across all frames; if you know that the first frame contains all
-        required keys, you can set ``how="left"`` for a large performance increase.
+        required keys, you can set `how="left"` for a large performance increase.
 
     Examples
     --------
@@ -360,55 +424,31 @@ def align_frames(
     ├╌╌╌╌╌╌╌┤
     │ 47.0  │
     └───────┘
-
     """  # noqa: W505
     if not frames:
         return []
     elif len({type(f) for f in frames}) != 1:
-        raise TypeError(
+        msg = (
             "input frames must be of a consistent type (all LazyFrame or all DataFrame)"
         )
+        raise TypeError(msg)
 
+    eager = isinstance(frames[0], pl.DataFrame)
     on = [on] if (isinstance(on, str) or not isinstance(on, Sequence)) else on
     align_on = [(c.meta.output_name() if isinstance(c, pl.Expr) else c) for c in on]
 
     # create aligned master frame (this is the most expensive part; afterwards
     # we just subselect out the columns representing the component frames)
-    eager = isinstance(frames[0], pl.DataFrame)
-
-    # we stackoverflow on many frames
-    # so we branch on an arbitrary chosen large number of frames
-    if len(frames) < 250:
-        # lazy variant
-        # this can SO
-        alignment_frame: LazyFrame = (
-            reduce(  # type: ignore[attr-defined]
-                lambda x, y: x.lazy().join(  # type: ignore[arg-type, return-value]
-                    y.lazy(), how=how, on=align_on, suffix=str(id(y))
-                ),
-                frames,
-            )
-            .sort(by=align_on, descending=descending)
-            .collect(no_optimization=True)
-            .lazy()
-        )
-    else:
-        # eager variant
-        # this doesn't SO
-        alignment_frame = (
-            reduce(
-                lambda x, y: x.join(y, how=how, on=align_on, suffix=str(id(y))),
-                frames,
-            )
-            .sort(by=align_on, descending=descending)
-            .lazy()
-        )
+    idx_frames = tuple((idx, df.lazy()) for idx, df in enumerate(frames))
+    alignment_frame = _alignment_join(
+        *idx_frames, align_on=align_on, how=how, descending=descending
+    )
 
     # select-out aligned components from the master frame
     aligned_cols = set(alignment_frame.columns)
     aligned_frames = []
-    for df in frames:
-        sfx = str(id(df))
+    for idx, df in idx_frames:
+        sfx = f":{idx}"
         df_cols = [
             F.col(f"{c}{sfx}").alias(c) if f"{c}{sfx}" in aligned_cols else F.col(c)
             for c in df.columns
@@ -419,5 +459,6 @@ def align_frames(
         aligned_frames.append(f)
 
     return cast(
-        List[FrameType], F.collect_all(aligned_frames) if eager else aligned_frames
+        List[FrameType],
+        F.collect_all(aligned_frames) if eager else aligned_frames,
     )

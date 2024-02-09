@@ -13,7 +13,13 @@ mod collect_members;
 #[cfg(feature = "cse")]
 mod cse_expr;
 mod fast_projection;
-#[cfg(any(feature = "ipc", feature = "parquet", feature = "csv", feature = "cse"))]
+#[cfg(any(
+    feature = "ipc",
+    feature = "parquet",
+    feature = "csv",
+    feature = "cse",
+    feature = "json"
+))]
 pub(crate) mod file_caching;
 mod flatten_union;
 #[cfg(feature = "fused")]
@@ -21,6 +27,7 @@ mod fused;
 mod predicate_pushdown;
 mod projection_pushdown;
 mod simplify_expr;
+mod simplify_functions;
 mod slice_pushdown_expr;
 mod slice_pushdown_lp;
 mod stack_opt;
@@ -31,6 +38,7 @@ use drop_nulls::ReplaceDropNulls;
 use fast_projection::FastProjectionAndCollapse;
 #[cfg(any(feature = "ipc", feature = "parquet", feature = "csv"))]
 use file_caching::{find_column_union_and_fingerprints, FileCacher};
+use polars_io::predicates::PhysicalIoExpr;
 pub use predicate_pushdown::PredicatePushDown;
 pub use projection_pushdown::ProjectionPushDown;
 pub use simplify_expr::{SimplifyBooleanRule, SimplifyExprRule};
@@ -42,6 +50,7 @@ use self::flatten_union::FlattenUnionRule;
 pub use crate::frame::{AllowedOptimizations, OptState};
 #[cfg(feature = "cse")]
 use crate::logical_plan::optimizer::cse_expr::CommonSubExprOptimizer;
+use crate::logical_plan::optimizer::predicate_pushdown::HiveEval;
 #[cfg(feature = "cse")]
 use crate::logical_plan::visitor::*;
 use crate::prelude::optimizer::collect_members::MemberCollector;
@@ -63,6 +72,7 @@ pub fn optimize(
     lp_arena: &mut Arena<ALogicalPlan>,
     expr_arena: &mut Arena<AExpr>,
     scratch: &mut Vec<Node>,
+    hive_partition_eval: HiveEval<'_>,
 ) -> PolarsResult<Node> {
     // get toggle values
     let predicate_pushdown = opt_state.predicate_pushdown;
@@ -134,7 +144,7 @@ pub fn optimize(
     }
 
     if predicate_pushdown {
-        let predicate_pushdown_opt = PredicatePushDown::default();
+        let predicate_pushdown_opt = PredicatePushDown::new(hive_partition_eval);
         let alp = lp_arena.take(lp_top);
         let alp = predicate_pushdown_opt.optimize(alp, lp_arena, expr_arena)?;
         lp_arena.replace(lp_top, alp);

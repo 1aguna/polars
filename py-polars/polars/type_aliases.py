@@ -14,6 +14,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypedDict,
     TypeVar,
     Union,
 )
@@ -21,8 +22,10 @@ from typing import (
 if TYPE_CHECKING:
     import sys
 
+    from sqlalchemy import Engine
+
     from polars import DataFrame, Expr, LazyFrame, Series
-    from polars.datatypes import DataType, DataTypeClass, IntegralType, TemporalType
+    from polars.datatypes import DataType, DataTypeClass, IntegerType, TemporalType
     from polars.dependencies import numpy as np
     from polars.dependencies import pandas as pd
     from polars.dependencies import pyarrow as pa
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
 # Data types
 PolarsDataType: TypeAlias = Union["DataTypeClass", "DataType"]
 PolarsTemporalType: TypeAlias = Union[Type["TemporalType"], "TemporalType"]
-PolarsIntegerType: TypeAlias = Union[Type["IntegralType"], "IntegralType"]
+PolarsIntegerType: TypeAlias = Union[Type["IntegerType"], "IntegerType"]
 OneOrMoreDataTypes: TypeAlias = Union[PolarsDataType, Iterable[PolarsDataType]]
 PythonDataType: TypeAlias = Union[
     Type[int],
@@ -60,12 +63,17 @@ SchemaDefinition: TypeAlias = Union[
 ]
 SchemaDict: TypeAlias = Mapping[str, PolarsDataType]
 
-# literal types that are allowed in expressions (auto-converted to pl.lit)
+NumericLiteral: TypeAlias = Union[int, float, Decimal]
+TemporalLiteral: TypeAlias = Union[date, time, datetime, timedelta]
+# Python literal types (can convert into a `lit` expression)
 PythonLiteral: TypeAlias = Union[
-    str, int, float, bool, date, time, datetime, timedelta, bytes, Decimal, List[Any]
+    NumericLiteral, TemporalLiteral, str, bool, bytes, List[Any]
 ]
+# Inputs that can convert into a `col` expression
+IntoExprColumn: TypeAlias = Union["Expr", "Series", str]
+# Inputs that can convert into an expression
+IntoExpr: TypeAlias = Union[PythonLiteral, IntoExprColumn, None]
 
-IntoExpr: TypeAlias = Union["Expr", PythonLiteral, "Series", None]
 ComparisonOperator: TypeAlias = Literal["eq", "neq", "gt", "lt", "gt_eq", "lt_eq"]
 
 # selector type, and related collection/sequence
@@ -85,6 +93,7 @@ FloatFmt: TypeAlias = Literal["full", "mixed"]
 IndexOrder: TypeAlias = Literal["c", "fortran"]
 IpcCompression: TypeAlias = Literal["uncompressed", "lz4", "zstd"]
 JoinValidation: TypeAlias = Literal["m:m", "m:1", "1:m", "1:1"]
+Label: TypeAlias = Literal["left", "right", "datapoint"]
 NullBehavior: TypeAlias = Literal["ignore", "drop"]
 NullStrategy: TypeAlias = Literal["ignore", "propagate"]
 ParallelStrategy: TypeAlias = Literal["auto", "columns", "row_groups", "none"]
@@ -92,7 +101,7 @@ ParquetCompression: TypeAlias = Literal[
     "lz4", "uncompressed", "snappy", "gzip", "lzo", "brotli", "zstd"
 ]
 PivotAgg: TypeAlias = Literal[
-    "first", "sum", "max", "min", "mean", "median", "last", "count"
+    "min", "max", "first", "last", "sum", "mean", "median", "len"
 ]
 RankMethod: TypeAlias = Literal["average", "min", "max", "dense", "ordinal", "random"]
 SizeUnit: TypeAlias = Literal[
@@ -128,7 +137,7 @@ AsofJoinStrategy: TypeAlias = Literal["backward", "forward", "nearest"]  # AsofS
 ClosedInterval: TypeAlias = Literal["left", "right", "both", "none"]  # ClosedWindow
 InterpolationMethod: TypeAlias = Literal["linear", "nearest"]
 JoinStrategy: TypeAlias = Literal[
-    "inner", "left", "outer", "semi", "anti", "cross"
+    "inner", "left", "outer", "semi", "anti", "cross", "outer_coalesce"
 ]  # JoinType
 RollingInterpolationMethod: TypeAlias = Literal[
     "nearest", "higher", "lower", "midpoint", "linear"
@@ -140,7 +149,12 @@ ToStructStrategy: TypeAlias = Literal[
 # The following have no equivalent on the Rust side
 Ambiguous: TypeAlias = Literal["earliest", "latest", "raise"]
 ConcatMethod = Literal[
-    "vertical", "vertical_relaxed", "diagonal", "horizontal", "align"
+    "vertical",
+    "vertical_relaxed",
+    "diagonal",
+    "diagonal_relaxed",
+    "horizontal",
+    "align",
 ]
 EpochTimeUnit = Literal["ns", "us", "ms", "s", "d"]
 Orientation: TypeAlias = Literal["col", "row"]
@@ -194,6 +208,20 @@ ParametricProfileNames: TypeAlias = Literal["fast", "balanced", "expensive"]
 # typevars for core polars types
 PolarsType = TypeVar("PolarsType", "DataFrame", "LazyFrame", "Series", "Expr")
 FrameType = TypeVar("FrameType", "DataFrame", "LazyFrame")
+BufferInfo: TypeAlias = Tuple[int, int, int]
+
+# type alias for supported spreadsheet engines
+ExcelSpreadsheetEngine: TypeAlias = Literal[
+    "xlsx2csv", "openpyxl", "calamine", "pyxlsb"
+]
+
+
+class SeriesBuffers(TypedDict):
+    """Underlying buffers of a Series."""
+
+    values: Series
+    validity: Series | None
+    offsets: Series | None
 
 
 # minimal protocol definitions that can reasonably represent
@@ -222,4 +250,4 @@ class Cursor(BasicCursor):  # noqa: D101
         """Fetch results in batches."""
 
 
-ConnectionOrCursor = Union[BasicConnection, BasicCursor, Cursor]
+ConnectionOrCursor = Union[BasicConnection, BasicCursor, Cursor, "Engine"]

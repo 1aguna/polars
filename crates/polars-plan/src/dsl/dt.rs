@@ -1,23 +1,20 @@
-use polars_time::prelude::TemporalMethods;
-
 use super::*;
-use crate::prelude::function_expr::TemporalFunction;
 
 /// Specialized expressions for [`Series`] with dates/datetimes.
 pub struct DateLikeNameSpace(pub(crate) Expr);
 
 impl DateLikeNameSpace {
-    /// Convert from Date/Time/Datetime into Utf8 with the given format.
+    /// Convert from Date/Time/Datetime into String with the given format.
     /// See [chrono strftime/strptime](https://docs.rs/chrono/0.4.19/chrono/format/strftime/index.html).
     pub fn to_string(self, format: &str) -> Expr {
         let format = format.to_string();
-        let function = move |s: Series| TemporalMethods::to_string(&s, &format).map(Some);
         self.0
-            .map(function, GetOutput::from_type(DataType::Utf8))
-            .with_fmt("to_string")
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::ToString(
+                format,
+            )))
     }
 
-    /// Convert from Date/Time/Datetime into Utf8 with the given format.
+    /// Convert from Date/Time/Datetime into String with the given format.
     /// See [chrono strftime/strptime](https://docs.rs/chrono/0.4.19/chrono/format/strftime/index.html).
     ///
     /// Alias for `to_string`.
@@ -27,70 +24,38 @@ impl DateLikeNameSpace {
 
     /// Change the underlying [`TimeUnit`]. And update the data accordingly.
     pub fn cast_time_unit(self, tu: TimeUnit) -> Expr {
-        self.0.map(
-            move |s| match s.dtype() {
-                DataType::Datetime(_, _) => {
-                    let ca = s.datetime().unwrap();
-                    Ok(Some(ca.cast_time_unit(tu).into_series()))
-                },
-                #[cfg(feature = "dtype-duration")]
-                DataType::Duration(_) => {
-                    let ca = s.duration().unwrap();
-                    Ok(Some(ca.cast_time_unit(tu).into_series()))
-                },
-                dt => polars_bail!(ComputeError: "dtype `{}` has no time unit", dt),
-            },
-            GetOutput::map_dtype(move |dtype| match dtype {
-                DataType::Duration(_) => DataType::Duration(tu),
-                DataType::Datetime(_, tz) => DataType::Datetime(tu, tz.clone()),
-                _ => panic!("expected duration or datetime"),
-            }),
-        )
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::CastTimeUnit(
+                tu,
+            )))
     }
 
     /// Change the underlying [`TimeUnit`] of the [`Series`]. This does not modify the data.
     pub fn with_time_unit(self, tu: TimeUnit) -> Expr {
-        self.0.map(
-            move |s| match s.dtype() {
-                DataType::Datetime(_, _) => {
-                    let mut ca = s.datetime().unwrap().clone();
-                    ca.set_time_unit(tu);
-                    Ok(Some(ca.into_series()))
-                },
-                #[cfg(feature = "dtype-duration")]
-                DataType::Duration(_) => {
-                    let mut ca = s.duration().unwrap().clone();
-                    ca.set_time_unit(tu);
-                    Ok(Some(ca.into_series()))
-                },
-                dt => polars_bail!(ComputeError: "dtype `{}` has no time unit", dt),
-            },
-            GetOutput::same_type(),
-        )
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::WithTimeUnit(
+                tu,
+            )))
     }
 
     /// Change the underlying [`TimeZone`] of the [`Series`]. This does not modify the data.
     #[cfg(feature = "timezones")]
     pub fn convert_time_zone(self, time_zone: TimeZone) -> Expr {
-        let time_zone_clone = time_zone.clone();
-        self.0.map(
-            move |s| match s.dtype() {
-                DataType::Datetime(_, Some(_)) => {
-                    let mut ca = s.datetime().unwrap().clone();
-                    ca.set_time_zone(time_zone.clone())?;
-                    Ok(Some(ca.into_series()))
-                },
-                _ => polars_bail!(
-                    ComputeError:
-                    "cannot call `convert_time_zone` on tz-naive; set a time zone first \
-                    with `replace_time_zone`"
-                ),
-            },
-            GetOutput::map_dtype(move |dtype| match dtype {
-                DataType::Datetime(tu, _) => DataType::Datetime(*tu, Some(time_zone_clone.clone())),
-                _ => panic!("expected datetime"),
-            }),
-        )
+        self.0.map_private(FunctionExpr::TemporalExpr(
+            TemporalFunction::ConvertTimeZone(time_zone),
+        ))
+    }
+
+    /// Get the millennium of a Date/Datetime
+    pub fn millennium(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Millennium))
+    }
+
+    /// Get the century of a Date/Datetime
+    pub fn century(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Century))
     }
 
     /// Get the year of a Date/Datetime
@@ -112,7 +77,7 @@ impl DateLikeNameSpace {
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::IsoYear))
     }
 
-    /// Get the month of a Date/Datetime
+    /// Get the month of a Date/Datetime.
     pub fn month(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Month))
@@ -144,113 +109,117 @@ impl DateLikeNameSpace {
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::WeekDay))
     }
 
-    /// Get the month of a Date/Datetime
+    /// Get the month of a Date/Datetime.
     pub fn day(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Day))
     }
 
-    /// Get the ordinal_day of a Date/Datetime
+    /// Get the ordinal_day of a Date/Datetime.
     pub fn ordinal_day(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::OrdinalDay))
     }
 
-    /// Get the (local) time of a Date/Datetime/Time
+    /// Get the (local) time of a Date/Datetime/Time.
     pub fn time(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Time))
     }
 
-    /// Get the (local) date of a Date/Datetime
+    /// Get the (local) date of a Date/Datetime.
     pub fn date(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Date))
     }
 
-    /// Get the (local) datetime of a Datetime
+    /// Get the (local) datetime of a Datetime.
     pub fn datetime(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Datetime))
     }
 
-    /// Get the hour of a Datetime/Time64
+    /// Get the hour of a Datetime/Time64.
     pub fn hour(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Hour))
     }
 
-    /// Get the minute of a Datetime/Time64
+    /// Get the minute of a Datetime/Time64.
     pub fn minute(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Minute))
     }
 
-    /// Get the second of a Datetime/Time64
+    /// Get the second of a Datetime/Time64.
     pub fn second(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Second))
     }
 
-    /// Get the millisecond of a Time64 (scaled from nanosecs)
+    /// Get the millisecond of a Time64 (scaled from nanosecs).
     pub fn millisecond(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Millisecond))
     }
 
-    /// Get the microsecond of a Time64 (scaled from nanosecs)
+    /// Get the microsecond of a Time64 (scaled from nanosecs).
     pub fn microsecond(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Microsecond))
     }
 
-    /// Get the nanosecond part of a Time64
+    /// Get the nanosecond part of a Time64.
     pub fn nanosecond(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Nanosecond))
     }
 
+    /// Return the timestamp (UNIX epoch) of a Datetime/Date.
     pub fn timestamp(self, tu: TimeUnit) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::TimeStamp(tu)))
     }
 
-    pub fn truncate(self, every: Expr, offset: String, ambiguous: Expr) -> Expr {
+    /// Truncate the Datetime/Date range into buckets.
+    pub fn truncate(self, every: Expr, offset: String) -> Expr {
         self.0.map_many_private(
             FunctionExpr::TemporalExpr(TemporalFunction::Truncate(offset)),
-            &[every, ambiguous],
+            &[every],
+            false,
             false,
         )
     }
 
-    // roll backward to the first day of the month
+    /// Roll backward to the first day of the month.
     #[cfg(feature = "date_offset")]
     pub fn month_start(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::MonthStart))
     }
 
-    // roll forward to the last day of the month
+    /// Roll forward to the last day of the month.
     #[cfg(feature = "date_offset")]
     pub fn month_end(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::MonthEnd))
     }
 
-    // Get the base offset from UTC
+    /// Get the base offset from UTC.
     #[cfg(feature = "timezones")]
     pub fn base_utc_offset(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::BaseUtcOffset))
     }
 
-    // Get the additional offset from UTC currently in effect (usually due to daylight saving time)
+    /// Get the additional offset from UTC currently in effect (usually due to daylight saving time).
     #[cfg(feature = "timezones")]
     pub fn dst_offset(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::DSTOffset))
     }
 
+    /// Round the Datetime/Date range into buckets.
     pub fn round<S: AsRef<str>>(self, every: S, offset: S) -> Expr {
         let every = every.as_ref().into();
         let offset = offset.as_ref().into();
@@ -265,7 +234,7 @@ impl DateLikeNameSpace {
     #[cfg(feature = "date_offset")]
     pub fn offset_by(self, by: Expr) -> Expr {
         self.0
-            .map_many_private(FunctionExpr::DateOffset, &[by], false)
+            .map_many_private(FunctionExpr::DateOffset, &[by], false, false)
     }
 
     #[cfg(feature = "timezones")]
@@ -274,14 +243,62 @@ impl DateLikeNameSpace {
             FunctionExpr::TemporalExpr(TemporalFunction::ReplaceTimeZone(time_zone)),
             &[ambiguous],
             false,
+            false,
         )
     }
 
+    /// Combine an existing Date/Datetime with a Time, creating a new Datetime value.
     pub fn combine(self, time: Expr, tu: TimeUnit) -> Expr {
         self.0.map_many_private(
             FunctionExpr::TemporalExpr(TemporalFunction::Combine(tu)),
             &[time],
             false,
+            false,
         )
+    }
+
+    /// Express a Duration in terms of its total number of integer days.
+    pub fn total_days(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::TotalDays))
+    }
+
+    /// Express a Duration in terms of its total number of integer hours.
+    pub fn total_hours(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::TotalHours))
+    }
+
+    /// Express a Duration in terms of its total number of integer minutes.
+    pub fn total_minutes(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::TotalMinutes))
+    }
+
+    /// Express a Duration in terms of its total number of integer seconds.
+    pub fn total_seconds(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::TotalSeconds))
+    }
+
+    /// Express a Duration in terms of its total number of milliseconds.
+    pub fn total_milliseconds(self) -> Expr {
+        self.0.map_private(FunctionExpr::TemporalExpr(
+            TemporalFunction::TotalMilliseconds,
+        ))
+    }
+
+    /// Express a Duration in terms of its total number of microseconds.
+    pub fn total_microseconds(self) -> Expr {
+        self.0.map_private(FunctionExpr::TemporalExpr(
+            TemporalFunction::TotalMicroseconds,
+        ))
+    }
+
+    /// Express a Duration in terms of its total number of nanoseconds.
+    pub fn total_nanoseconds(self) -> Expr {
+        self.0.map_private(FunctionExpr::TemporalExpr(
+            TemporalFunction::TotalNanoseconds,
+        ))
     }
 }

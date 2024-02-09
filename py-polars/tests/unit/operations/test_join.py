@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -19,28 +19,23 @@ def test_semi_anti_join() -> None:
 
     df_b = pl.DataFrame({"key": [3, 4, 5, None]})
 
-    assert df_a.join(df_b, on="key", how="anti").to_dict(False) == {
+    assert df_a.join(df_b, on="key", how="anti").to_dict(as_series=False) == {
         "key": [1, 2],
         "payload": ["f", "i"],
     }
-    assert df_a.join(df_b, on="key", how="semi").to_dict(False) == {
+    assert df_a.join(df_b, on="key", how="semi").to_dict(as_series=False) == {
         "key": [3],
         "payload": [None],
     }
 
     # lazy
-    assert df_a.lazy().join(df_b.lazy(), on="key", how="anti").collect().to_dict(
-        False
-    ) == {
-        "key": [1, 2],
-        "payload": ["f", "i"],
-    }
-    assert df_a.lazy().join(df_b.lazy(), on="key", how="semi").collect().to_dict(
-        False
-    ) == {
-        "key": [3],
-        "payload": [None],
-    }
+    result = df_a.lazy().join(df_b.lazy(), on="key", how="anti").collect()
+    expected_values = {"key": [1, 2], "payload": ["f", "i"]}
+    assert result.to_dict(as_series=False) == expected_values
+
+    result = df_a.lazy().join(df_b.lazy(), on="key", how="semi").collect()
+    expected_values = {"key": [3], "payload": [None]}
+    assert result.to_dict(as_series=False) == expected_values
 
     df_a = pl.DataFrame(
         {"a": [1, 2, 3, 1], "b": ["a", "b", "c", "a"], "payload": [10, 20, 30, 40]}
@@ -48,12 +43,12 @@ def test_semi_anti_join() -> None:
 
     df_b = pl.DataFrame({"a": [3, 3, 4, 5], "b": ["c", "c", "d", "e"]})
 
-    assert df_a.join(df_b, on=["a", "b"], how="anti").to_dict(False) == {
+    assert df_a.join(df_b, on=["a", "b"], how="anti").to_dict(as_series=False) == {
         "a": [1, 2, 1],
         "b": ["a", "b", "a"],
         "payload": [10, 20, 40],
     }
-    assert df_a.join(df_b, on=["a", "b"], how="semi").to_dict(False) == {
+    assert df_a.join(df_b, on=["a", "b"], how="semi").to_dict(as_series=False) == {
         "a": [3],
         "b": ["c"],
         "payload": [30],
@@ -66,7 +61,7 @@ def test_join_same_cat_src() -> None:
         schema=[("column", pl.Categorical), ("more", pl.Int32)],
     )
     df_agg = df.group_by("column").agg(pl.col("more").mean())
-    assert df.join(df_agg, on="column").to_dict(False) == {
+    assert df.join(df_agg, on="column").to_dict(as_series=False) == {
         "column": ["a", "a", "b"],
         "more": [1, 2, 3],
         "more_right": [1.5, 1.5, 3.0],
@@ -76,12 +71,12 @@ def test_join_same_cat_src() -> None:
 @pytest.mark.parametrize("reverse", [False, True])
 def test_sorted_merge_joins(reverse: bool) -> None:
     n = 30
-    df_a = pl.DataFrame({"a": np.sort(np.random.randint(0, n // 2, n))}).with_row_count(
+    df_a = pl.DataFrame({"a": np.sort(np.random.randint(0, n // 2, n))}).with_row_index(
         "row_a"
     )
     df_b = pl.DataFrame(
         {"a": np.sort(np.random.randint(0, n // 2, n // 2))}
-    ).with_row_count("row_b")
+    ).with_row_index("row_b")
 
     if reverse:
         df_a = df_a.select(pl.all().reverse())
@@ -128,7 +123,7 @@ def test_join_negative_integers() -> None:
         assert (
             df1.with_columns(pl.all().cast(dt))
             .join(df2.with_columns(pl.all().cast(dt)), on="a", how="inner")
-            .to_dict(False)
+            .to_dict(as_series=False)
             == expected
         )
 
@@ -183,7 +178,7 @@ def test_join() -> None:
     assert joined["c"].null_count() == 1
     assert joined["b"].null_count() == 1
     assert joined["k"].null_count() == 1
-    assert joined["a"].null_count() == 0
+    assert joined["a"].null_count() == 1
 
     # we need to pass in a column to join on, either by supplying `on`, or both
     # `left_on` and `right_on`
@@ -238,19 +233,22 @@ def test_joins_dispatch() -> None:
 def test_join_on_cast() -> None:
     df_a = (
         pl.DataFrame({"a": [-5, -2, 3, 3, 9, 10]})
-        .with_row_count()
+        .with_row_index()
         .with_columns(pl.col("a").cast(pl.Int32))
     )
 
     df_b = pl.DataFrame({"a": [-2, -3, 3, 10]})
 
-    assert df_a.join(df_b, on=pl.col("a").cast(pl.Int64)).to_dict(False) == {
-        "row_nr": [1, 2, 3, 5],
+    assert df_a.join(df_b, on=pl.col("a").cast(pl.Int64)).to_dict(as_series=False) == {
+        "index": [1, 2, 3, 5],
         "a": [-2, 3, 3, 10],
     }
     assert df_a.lazy().join(
         df_b.lazy(), on=pl.col("a").cast(pl.Int64)
-    ).collect().to_dict(False) == {"row_nr": [1, 2, 3, 5], "a": [-2, 3, 3, 10]}
+    ).collect().to_dict(as_series=False) == {
+        "index": [1, 2, 3, 5],
+        "a": [-2, 3, 3, 10],
+    }
 
 
 def test_join_chunks_alignment_4720() -> None:
@@ -280,7 +278,7 @@ def test_join_chunks_alignment_4720() -> None:
             on=["index1", "index2", "index3"],
             how="left",
         )
-    ).to_dict(False) == {
+    ).to_dict(as_series=False) == {
         "index1": [0, 0, 1, 1],
         "index2": [10, 10, 11, 11],
         "index3": [100, 101, 100, 101],
@@ -292,7 +290,7 @@ def test_join_chunks_alignment_4720() -> None:
             on=["index3", "index1", "index2"],
             how="left",
         )
-    ).to_dict(False) == {
+    ).to_dict(as_series=False) == {
         "index1": [0, 0, 1, 1],
         "index2": [10, 10, 11, 11],
         "index3": [100, 101, 100, 101],
@@ -407,7 +405,7 @@ def test_join_panic_on_binary_expr_5915() -> None:
     df_b = pl.DataFrame({"b": [1, 4, 9, 9, 0]}).lazy()
 
     z = df_a.join(df_b, left_on=[(pl.col("a") + 1).cast(int)], right_on=[pl.col("b")])
-    assert z.collect().to_dict(False) == {"a": [4]}
+    assert z.collect().to_dict(as_series=False) == {"a": [4]}
 
 
 def test_semi_join_projection_pushdown_6423() -> None:
@@ -418,7 +416,7 @@ def test_semi_join_projection_pushdown_6423() -> None:
         df1.join(df2, left_on="x", right_on="y", how="semi")
         .join(df2, left_on="x", right_on="y", how="semi")
         .select(["x"])
-    ).collect().to_dict(False) == {"x": [1]}
+    ).collect().to_dict(as_series=False) == {"x": [1]}
 
 
 def test_semi_join_projection_pushdown_6455() -> None:
@@ -436,31 +434,170 @@ def test_semi_join_projection_pushdown_6455() -> None:
 
     latest = df.group_by("id").agg(pl.col("timestamp").max())
     df = df.join(latest, on=["id", "timestamp"], how="semi")
-    assert df.select(["id", "value"]).collect().to_dict(False) == {
+    assert df.select(["id", "value"]).collect().to_dict(as_series=False) == {
         "id": [1, 2],
         "value": [2, 4],
     }
 
 
 def test_update() -> None:
+    df1 = pl.DataFrame(
+        {
+            "key1": [1, 2, 3, 4],
+            "key2": [1, 2, 3, 4],
+            "a": [1, 2, 3, 4],
+            "b": [1, 2, 3, 4],
+            "c": ["1", "2", "3", "4"],
+            "d": [
+                date(2023, 1, 1),
+                date(2023, 1, 2),
+                date(2023, 1, 3),
+                date(2023, 1, 4),
+            ],
+        }
+    )
+
+    df2 = pl.DataFrame(
+        {
+            "key1": [1, 2, 3, 4],
+            "key2": [1, 2, 3, 5],
+            "a": [1, 1, 1, 1],
+            "b": [2, 2, 2, 2],
+            "c": ["3", "3", "3", "3"],
+            "d": [
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+            ],
+        }
+    )
+
+    # update only on key1
+    expected = pl.DataFrame(
+        {
+            "key1": [1, 2, 3, 4],
+            "key2": [1, 2, 3, 5],
+            "a": [1, 1, 1, 1],
+            "b": [2, 2, 2, 2],
+            "c": ["3", "3", "3", "3"],
+            "d": [
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+            ],
+        }
+    )
+    assert_frame_equal(df1.update(df2, on="key1"), expected)
+
+    # update on key1 using different left/right names
+    assert_frame_equal(
+        df1.update(
+            df2.rename({"key1": "key1b"}),
+            left_on="key1",
+            right_on="key1b",
+        ),
+        expected,
+    )
+
+    # update on key1 and key2. This should fail to match the last item.
+    expected = pl.DataFrame(
+        {
+            "key1": [1, 2, 3, 4],
+            "key2": [1, 2, 3, 4],
+            "a": [1, 1, 1, 4],
+            "b": [2, 2, 2, 4],
+            "c": ["3", "3", "3", "4"],
+            "d": [
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+                date(2023, 5, 5),
+                date(2023, 1, 4),
+            ],
+        }
+    )
+    assert_frame_equal(df1.update(df2, on=["key1", "key2"]), expected)
+
+    # update on key1 and key2 using different left/right names
+    assert_frame_equal(
+        df1.update(
+            df2.rename({"key1": "key1b", "key2": "key2b"}),
+            left_on=["key1", "key2"],
+            right_on=["key1b", "key2b"],
+        ),
+        expected,
+    )
+
     df = pl.DataFrame({"A": [1, 2, 3, 4], "B": [400, 500, 600, 700]})
 
     new_df = pl.DataFrame({"B": [4, None, 6], "C": [7, 8, 9]})
 
-    assert df.update(new_df).to_dict(False) == {
+    assert df.update(new_df).to_dict(as_series=False) == {
         "A": [1, 2, 3, 4],
         "B": [4, 500, 6, 700],
     }
     df1 = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
     df2 = pl.DataFrame({"a": [2, 3], "b": [8, 9]})
 
-    assert df1.update(df2, on="a").to_dict(False) == {"a": [1, 2, 3], "b": [4, 8, 9]}
+    assert df1.update(df2, on="a").to_dict(as_series=False) == {
+        "a": [1, 2, 3],
+        "b": [4, 8, 9],
+    }
 
-    a = pl.DataFrame({"a": [1, 2, 3]})
-    b = pl.DataFrame({"b": [4, 5]})
+    a = pl.LazyFrame({"a": [1, 2, 3]})
+    b = pl.LazyFrame({"b": [4, 5], "c": [3, 1]})
     c = a.update(b)
 
-    assert c.rows() == a.rows()
+    assert_frame_equal(a, c)
+
+    # check behaviour of 'how' param
+    assert [1, 2, 3] == list(
+        a.update(b, left_on="a", right_on="c").collect().to_series()
+    )
+    assert [1, 3] == list(
+        a.update(b, how="inner", left_on="a", right_on="c").collect().to_series()
+    )
+    print(a, b)
+    print(a.update(b.rename({"b": "a"}), how="outer", on="a").collect())
+    assert [1, 2, 3, 4, 5] == sorted(
+        a.update(b.rename({"b": "a"}), how="outer", on="a").collect().to_series()
+    )
+
+    # check behavior of include_nulls=True
+    df = pl.DataFrame(
+        {
+            "A": [1, 2, 3, 4],
+            "B": [400, 500, 600, 700],
+        }
+    )
+    new_df = pl.DataFrame(
+        {
+            "B": [-66, None, -99],
+            "C": [5, 3, 1],
+        }
+    )
+    out = df.update(new_df, left_on="A", right_on="C", how="outer", include_nulls=True)
+    expected = pl.DataFrame(
+        {
+            "A": [1, 2, 3, 4, 5],
+            "B": [-99, 500, None, 700, -66],
+        }
+    )
+    assert_frame_equal(out, expected)
+
+    # edge-case #11684
+    x = pl.DataFrame({"a": [0, 1]})
+    y = pl.DataFrame({"a": [2, 3]})
+    assert [0, 1, 2, 3] == sorted(x.update(y, on="a", how="outer")["a"].to_list())
+
+    # disallowed join strategies
+    for join_strategy in ("cross", "anti", "semi"):
+        with pytest.raises(
+            ValueError,
+            match=f"`how` must be one of {{'left', 'inner', 'outer'}}; found '{join_strategy}'",
+        ):
+            a.update(b, how=join_strategy)  # type: ignore[arg-type]
 
 
 def test_join_frame_consistency() -> None:
@@ -492,18 +629,19 @@ def test_join_concat_projection_pd_case_7071() -> None:
 def test_join_sorted_fast_paths_null() -> None:
     df1 = pl.DataFrame({"x": [0, 1, 0]}).sort("x")
     df2 = pl.DataFrame({"x": [0, None], "y": [0, 1]})
-    assert df1.join(df2, on="x", how="inner").to_dict(False) == {
+    assert df1.join(df2, on="x", how="inner").to_dict(as_series=False) == {
         "x": [0, 0],
         "y": [0, 0],
     }
-    assert df1.join(df2, on="x", how="left").to_dict(False) == {
+    assert df1.join(df2, on="x", how="left").to_dict(as_series=False) == {
         "x": [0, 0, 1],
         "y": [0, 0, None],
     }
-    assert df1.join(df2, on="x", how="anti").to_dict(False) == {"x": [1]}
-    assert df1.join(df2, on="x", how="semi").to_dict(False) == {"x": [0, 0]}
-    assert df1.join(df2, on="x", how="outer").to_dict(False) == {
+    assert df1.join(df2, on="x", how="anti").to_dict(as_series=False) == {"x": [1]}
+    assert df1.join(df2, on="x", how="semi").to_dict(as_series=False) == {"x": [0, 0]}
+    assert df1.join(df2, on="x", how="outer").to_dict(as_series=False) == {
         "x": [0, 0, 1, None],
+        "x_right": [0, 0, None, None],
         "y": [0, 0, None, 1],
     }
 
@@ -513,75 +651,141 @@ def test_outer_join_list_() -> None:
 
     df1 = pl.DataFrame({"id": [1], "vals": [[]]}, schema=schema)  # type: ignore[arg-type]
     df2 = pl.DataFrame({"id": [2, 3], "vals": [[], [4]]}, schema=schema)  # type: ignore[arg-type]
-    assert df1.join(df2, on="id", how="outer").to_dict(False) == {
-        "id": [2, 3, 1],
+    assert df1.join(df2, on="id", how="outer").to_dict(as_series=False) == {
+        "id": [None, None, 1],
         "vals": [None, None, []],
+        "id_right": [2, 3, None],
         "vals_right": [[], [4.0], None],
     }
 
 
+@pytest.mark.slow()
 def test_join_validation() -> None:
     def test_each_join_validation(
-        unique: pl.DataFrame, duplicate: pl.DataFrame, how: JoinStrategy
+        unique: pl.DataFrame, duplicate: pl.DataFrame, on: str, how: JoinStrategy
     ) -> None:
         # one_to_many
         _one_to_many_success_inner = unique.join(
-            duplicate, on="id", how=how, validate="1:m"
+            duplicate, on=on, how=how, validate="1:m"
         )
 
         with pytest.raises(pl.ComputeError):
             _one_to_many_fail_inner = duplicate.join(
-                unique, on="id", how=how, validate="1:m"
+                unique, on=on, how=how, validate="1:m"
             )
 
         # one to one
         with pytest.raises(pl.ComputeError):
             _one_to_one_fail_1_inner = unique.join(
-                duplicate, on="id", how=how, validate="1:1"
+                duplicate, on=on, how=how, validate="1:1"
             )
 
         with pytest.raises(pl.ComputeError):
             _one_to_one_fail_2_inner = duplicate.join(
-                unique, on="id", how=how, validate="1:1"
+                unique, on=on, how=how, validate="1:1"
             )
 
         # many to one
         with pytest.raises(pl.ComputeError):
             _many_to_one_fail_inner = unique.join(
-                duplicate, on="id", how=how, validate="m:1"
+                duplicate, on=on, how=how, validate="m:1"
             )
 
         _many_to_one_success_inner = duplicate.join(
-            unique, on="id", how=how, validate="m:1"
+            unique, on=on, how=how, validate="m:1"
         )
 
         # many to many
         _many_to_many_success_1_inner = duplicate.join(
-            unique, on="id", how=how, validate="m:m"
+            unique, on=on, how=how, validate="m:m"
         )
 
         _many_to_many_success_2_inner = unique.join(
-            duplicate, on="id", how=how, validate="m:m"
+            duplicate, on=on, how=how, validate="m:m"
         )
 
     # test data
     short_unique = pl.DataFrame(
-        {"id": [1, 2, 3, 4], "name": ["hello", "world", "rust", "polars"]}
+        {
+            "id": [1, 2, 3, 4],
+            "id_str": ["1", "2", "3", "4"],
+            "name": ["hello", "world", "rust", "polars"],
+        }
     )
-    short_duplicate = pl.DataFrame({"id": [1, 2, 3, 1], "cnt": [2, 4, 6, 1]})
+    short_duplicate = pl.DataFrame(
+        {"id": [1, 2, 3, 1], "id_str": ["1", "2", "3", "1"], "cnt": [2, 4, 6, 1]}
+    )
     long_unique = pl.DataFrame(
-        {"id": [1, 2, 3, 4, 5], "name": ["hello", "world", "rust", "polars", "meow"]}
+        {
+            "id": [1, 2, 3, 4, 5],
+            "id_str": ["1", "2", "3", "4", "5"],
+            "name": ["hello", "world", "rust", "polars", "meow"],
+        }
     )
-    long_duplicate = pl.DataFrame({"id": [1, 2, 3, 1, 5], "cnt": [2, 4, 6, 1, 8]})
+    long_duplicate = pl.DataFrame(
+        {
+            "id": [1, 2, 3, 1, 5],
+            "id_str": ["1", "2", "3", "1", "5"],
+            "cnt": [2, 4, 6, 1, 8],
+        }
+    )
 
     join_strategies: list[JoinStrategy] = ["inner", "outer", "left"]
 
-    for how in join_strategies:
-        # same size
-        test_each_join_validation(long_unique, long_duplicate, how)
+    for join_col in ["id", "id_str"]:
+        for how in join_strategies:
+            # same size
+            test_each_join_validation(long_unique, long_duplicate, join_col, how)
 
-        # left longer
-        test_each_join_validation(long_unique, short_duplicate, how)
+            # left longer
+            test_each_join_validation(long_unique, short_duplicate, join_col, how)
 
-        # right longer
-        test_each_join_validation(short_unique, long_duplicate, how)
+            # right longer
+            test_each_join_validation(short_unique, long_duplicate, join_col, how)
+
+
+def test_outer_join_bool() -> None:
+    df1 = pl.DataFrame({"id": [True, False], "val": [1, 2]})
+    df2 = pl.DataFrame({"id": [True, False], "val": [0, -1]})
+    assert df1.join(df2, on="id", how="outer").to_dict(as_series=False) == {
+        "id": [True, False],
+        "val": [1, 2],
+        "id_right": [True, False],
+        "val_right": [0, -1],
+    }
+
+
+def test_outer_join_coalesce_different_names_13450() -> None:
+    df1 = pl.DataFrame({"L1": ["a", "b", "c"], "L3": ["b", "c", "d"], "L2": [1, 2, 3]})
+    df2 = pl.DataFrame({"L3": ["a", "c", "d"], "R2": [7, 8, 9]})
+
+    expected = pl.DataFrame(
+        {
+            "L1": ["a", "c", "d", "b"],
+            "L3": ["b", "d", None, "c"],
+            "L2": [1, 3, None, 2],
+            "R2": [7, 8, 9, None],
+        }
+    )
+
+    out = df1.join(df2, left_on="L1", right_on="L3", how="outer_coalesce")
+    assert_frame_equal(out, expected)
+
+
+# https://github.com/pola-rs/polars/issues/10663
+def test_join_on_wildcard_error() -> None:
+    df = pl.DataFrame({"x": [1]})
+    df2 = pl.DataFrame({"x": [1], "y": [2]})
+    with pytest.raises(
+        pl.ComputeError, match="wildcard column selection not supported at this point"
+    ):
+        df.join(df2, on=pl.all())
+
+
+def test_join_on_nth_error() -> None:
+    df = pl.DataFrame({"x": [1]})
+    df2 = pl.DataFrame({"x": [1], "y": [2]})
+    with pytest.raises(
+        pl.ComputeError, match="nth column selection not supported at this point"
+    ):
+        df.join(df2, on=pl.first())

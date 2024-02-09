@@ -3,15 +3,13 @@ mod batched_read;
 
 use std::fmt;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub use batched_mmap::*;
 pub use batched_read::*;
-use polars_arrow::array::*;
 use polars_core::config::verbose;
 use polars_core::prelude::*;
-use polars_core::utils::{accumulate_dataframes_vertical, get_casting_failures};
+use polars_core::utils::{accumulate_dataframes_vertical, handle_casting_failures};
 use polars_core::POOL;
 #[cfg(feature = "polars-time")]
 use polars_time::prelude::*;
@@ -20,13 +18,13 @@ use rayon::prelude::*;
 
 use crate::csv::buffer::*;
 use crate::csv::parser::*;
-use crate::csv::read::NullValuesCompiled;
+use crate::csv::read::{CommentPrefix, NullValuesCompiled};
 use crate::csv::utils::*;
 use crate::csv::{CsvEncoding, NullValues};
 use crate::mmap::ReaderBytes;
 use crate::predicates::PhysicalIoExpr;
 use crate::utils::update_row_counts;
-use crate::RowCount;
+use crate::RowIndex;
 
 pub(crate) fn cast_columns(
     df: &mut DataFrame,
@@ -37,14 +35,14 @@ pub(crate) fn cast_columns(
     let cast_fn = |s: &Series, fld: &Field| {
         let out = match (s.dtype(), fld.data_type()) {
             #[cfg(feature = "temporal")]
-            (DataType::Utf8, DataType::Date) => s
-                .utf8()
+            (DataType::String, DataType::Date) => s
+                .str()
                 .unwrap()
                 .as_date(None, false)
                 .map(|ca| ca.into_series()),
             #[cfg(feature = "temporal")]
-            (DataType::Utf8, DataType::Datetime(tu, _)) => s
-                .utf8()
+            (DataType::String, DataType::Datetime(tu, _)) => s
+                .str()
                 .unwrap()
                 .as_datetime(
                     None,
@@ -52,18 +50,13 @@ pub(crate) fn cast_columns(
                     false,
                     false,
                     None,
-                    &Utf8Chunked::from_iter(std::iter::once("raise")),
+                    &StringChunked::from_iter(std::iter::once("raise")),
                 )
                 .map(|ca| ca.into_series()),
             (_, dt) => s.cast(dt),
         }?;
         if !ignore_errors && s.null_count() != out.null_count() {
-            let failures = get_casting_failures(s, &out)?;
-            polars_bail!(
-                ComputeError:
-                "parsing to `{}` failed for column: {}, value(s) {};",
-                fld.data_type(), s.name(), failures.fmt_list(),
-            )
+            handle_casting_failures(s, &out)?;
         }
         Ok(out)
     };
@@ -85,7 +78,7 @@ pub(crate) fn cast_columns(
         // cast to the original dtypes in the schema
         for fld in to_cast {
             // field may not be projected
-            if let Some(idx) = df.find_idx_by_name(fld.name()) {
+            if let Some(idx) = df.get_column_index(fld.name()) {
                 df.try_apply_at_idx(idx, |s| cast_fn(s, fld))?;
             }
         }
@@ -110,18 +103,18 @@ pub(crate) struct CoreReader<'a> {
     encoding: CsvEncoding,
     n_threads: Option<usize>,
     has_header: bool,
-    delimiter: u8,
+    separator: u8,
     sample_size: usize,
     chunk_size: usize,
     low_memory: bool,
-    comment_char: Option<u8>,
+    comment_prefix: Option<CommentPrefix>,
     quote_char: Option<u8>,
     eol_char: u8,
     null_values: Option<NullValuesCompiled>,
     missing_is_null: bool,
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     to_cast: Vec<Field>,
-    row_count: Option<RowCount>,
+    row_index: Option<RowIndex>,
     truncate_ragged_lines: bool,
 }
 
@@ -135,54 +128,6 @@ impl<'a> fmt::Debug for CoreReader<'a> {
     }
 }
 
-pub(crate) struct RunningSize {
-    max: AtomicUsize,
-    sum: AtomicUsize,
-    count: AtomicUsize,
-    last: AtomicUsize,
-}
-
-fn compute_size_hint(max: usize, sum: usize, count: usize, last: usize) -> usize {
-    let avg = (sum as f32 / count as f32) as usize;
-    let size = std::cmp::max(last, avg) as f32;
-    if (max as f32) < (size * 1.5) {
-        max
-    } else {
-        size as usize
-    }
-}
-impl RunningSize {
-    fn new(size: usize) -> Self {
-        Self {
-            max: AtomicUsize::new(size),
-            sum: AtomicUsize::new(size),
-            count: AtomicUsize::new(1),
-            last: AtomicUsize::new(size),
-        }
-    }
-
-    pub(crate) fn update(&self, size: usize) -> (usize, usize, usize, usize) {
-        let max = self.max.fetch_max(size, Ordering::Release);
-        let sum = self.sum.fetch_add(size, Ordering::Release);
-        let count = self.count.fetch_add(1, Ordering::Release);
-        let last = self.last.fetch_add(size, Ordering::Release);
-        (
-            max,
-            sum / count,
-            last,
-            compute_size_hint(max, sum, count, last),
-        )
-    }
-
-    pub(crate) fn size_hint(&self) -> usize {
-        let max = self.max.load(Ordering::Acquire);
-        let sum = self.sum.load(Ordering::Acquire);
-        let count = self.count.load(Ordering::Acquire);
-        let last = self.last.load(Ordering::Acquire);
-        compute_size_hint(max, sum, count, last)
-    }
-}
-
 impl<'a> CoreReader<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -191,19 +136,19 @@ impl<'a> CoreReader<'a> {
         mut skip_rows: usize,
         mut projection: Option<Vec<usize>>,
         max_records: Option<usize>,
-        delimiter: Option<u8>,
+        separator: Option<u8>,
         has_header: bool,
         ignore_errors: bool,
         schema: Option<SchemaRef>,
         columns: Option<Vec<String>>,
         encoding: CsvEncoding,
-        n_threads: Option<usize>,
+        mut n_threads: Option<usize>,
         schema_overwrite: Option<SchemaRef>,
         dtype_overwrite: Option<&'a [DataType]>,
         sample_size: usize,
         chunk_size: usize,
         low_memory: bool,
-        comment_char: Option<u8>,
+        comment_prefix: Option<CommentPrefix>,
         quote_char: Option<u8>,
         eol_char: u8,
         null_values: Option<NullValues>,
@@ -211,7 +156,7 @@ impl<'a> CoreReader<'a> {
         predicate: Option<Arc<dyn PhysicalIoExpr>>,
         to_cast: Vec<Field>,
         skip_rows_after_header: usize,
-        row_count: Option<RowCount>,
+        row_index: Option<RowIndex>,
         try_parse_dates: bool,
         raise_if_empty: bool,
         truncate_ragged_lines: bool,
@@ -228,7 +173,7 @@ impl<'a> CoreReader<'a> {
         }
 
         // check if schema should be inferred
-        let delimiter = delimiter.unwrap_or(b',');
+        let separator = separator.unwrap_or(b',');
 
         let mut schema = match schema {
             Some(schema) => schema,
@@ -238,26 +183,32 @@ impl<'a> CoreReader<'a> {
                     // In case the file is compressed this schema inference is wrong and has to be done
                     // again after decompression.
                     #[cfg(any(feature = "decompress", feature = "decompress-fast"))]
-                    if let Some(b) =
-                        decompress(&reader_bytes, n_rows, delimiter, quote_char, eol_char)
                     {
-                        reader_bytes = ReaderBytes::Owned(b);
+                        let total_n_rows = n_rows.map(|n| {
+                            skip_rows + (has_header as usize) + skip_rows_after_header + n
+                        });
+                        if let Some(b) =
+                            decompress(&reader_bytes, total_n_rows, separator, quote_char, eol_char)
+                        {
+                            reader_bytes = ReaderBytes::Owned(b);
+                        }
                     }
 
                     let (inferred_schema, _, _) = infer_file_schema(
                         &reader_bytes,
-                        delimiter,
+                        separator,
                         max_records,
                         has_header,
                         schema_overwrite.as_deref(),
                         &mut skip_rows,
                         skip_rows_after_header,
-                        comment_char,
+                        comment_prefix.as_ref(),
                         quote_char,
                         eol_char,
                         null_values.as_ref(),
                         try_parse_dates,
                         raise_if_empty,
+                        &mut n_threads,
                     )?;
                     Arc::new(inferred_schema)
                 }
@@ -300,18 +251,18 @@ impl<'a> CoreReader<'a> {
             encoding,
             n_threads,
             has_header,
-            delimiter,
+            separator,
             sample_size,
             chunk_size,
             low_memory,
-            comment_char,
+            comment_prefix,
             quote_char,
             eol_char,
             null_values,
             missing_is_null,
             predicate,
             to_cast,
-            row_count,
+            row_index,
             truncate_ragged_lines,
         })
     }
@@ -325,18 +276,14 @@ impl<'a> CoreReader<'a> {
         let starting_point_offset = bytes.as_ptr() as usize;
 
         // Skip all leading white space and the occasional utf8-bom
-        bytes = skip_whitespace_exclude(skip_bom(bytes), self.delimiter);
+        bytes = skip_whitespace_exclude(skip_bom(bytes), self.separator);
         // \n\n can be a empty string row of a single column
         // in other cases we skip it.
         if self.schema.len() > 1 {
             bytes = skip_line_ending(bytes, eol_char)
         }
 
-        // If there is a header we skip it.
-        if self.has_header {
-            bytes = skip_header(bytes, quote_char, eol_char);
-        }
-
+        // skip 'n' leading rows
         if self.skip_rows_before_header > 0 {
             for _ in 0..self.skip_rows_before_header {
                 let pos = next_line_position_naive(bytes, eol_char)
@@ -345,16 +292,25 @@ impl<'a> CoreReader<'a> {
             }
         }
 
+        // skip lines that are comments
+        while is_comment_line(bytes, self.comment_prefix.as_ref()) {
+            bytes = skip_this_line(bytes, quote_char, eol_char);
+        }
+
+        // skip header row
+        if self.has_header {
+            bytes = skip_this_line(bytes, quote_char, eol_char);
+        }
+        // skip 'n' rows following the header
         if self.skip_rows_after_header > 0 {
             for _ in 0..self.skip_rows_after_header {
-                let pos = match bytes.first() {
-                    Some(first) if Some(*first) == self.comment_char => {
-                        next_line_position_naive(bytes, eol_char)
-                    },
+                let pos = if is_comment_line(bytes, self.comment_prefix.as_ref()) {
+                    next_line_position_naive(bytes, eol_char)
+                } else {
                     // we don't pass expected fields
                     // as we want to skip all rows
                     // no matter the no. of fields
-                    _ => next_line_position(bytes, None, self.delimiter, self.quote_char, eol_char),
+                    next_line_position(bytes, None, self.separator, self.quote_char, eol_char)
                 }
                 .ok_or_else(|| polars_err!(NoData: "not enough lines to skip"))?;
 
@@ -391,7 +347,7 @@ impl<'a> CoreReader<'a> {
             self.sample_size,
             self.eol_char,
             self.schema.len(),
-            self.delimiter,
+            self.separator,
             self.quote_char,
         ) {
             if logging {
@@ -415,7 +371,7 @@ impl<'a> CoreReader<'a> {
                     if let Some(pos) = next_line_position(
                         &bytes[n_bytes..],
                         Some(self.schema.len()),
-                        self.delimiter,
+                        self.separator,
                         self.quote_char,
                         self.eol_char,
                     ) {
@@ -471,7 +427,7 @@ impl<'a> CoreReader<'a> {
             bytes,
             n_file_chunks,
             self.schema.len(),
-            self.delimiter,
+            self.separator,
             self.quote_char,
             self.eol_char,
         );
@@ -492,55 +448,19 @@ impl<'a> CoreReader<'a> {
             remaining_bytes,
         ))
     }
-    fn get_projection(&mut self) -> Vec<usize> {
+    fn get_projection(&mut self) -> PolarsResult<Vec<usize>> {
         // we also need to sort the projection to have predictable output.
         // the `parse_lines` function expects this.
         self.projection
             .take()
             .map(|mut v| {
                 v.sort_unstable();
-                v
+                if let Some(idx) = v.last() {
+                    polars_ensure!(*idx < self.schema.len(), OutOfBounds: "projection index: {} is out of bounds for csv schema with length: {}", idx, self.schema.len())
+                }
+                Ok(v)
             })
-            .unwrap_or_else(|| (0..self.schema.len()).collect())
-    }
-
-    fn get_string_columns(&self, projection: &[usize]) -> PolarsResult<StringColumns> {
-        // keep track of the maximum capacity that needs to be allocated for the utf8-builder
-        // Per string column we keep a statistic of the maximum length of string bytes per chunk
-        // We must the names, not the indexes, (the indexes are incorrect due to projection
-        // pushdown)
-
-        let mut new_projection = Vec::with_capacity(projection.len());
-
-        for i in projection {
-            let (_, dtype) = self.schema.get_at_index(*i).ok_or_else(|| {
-                polars_err!(
-                    OutOfBounds:
-                    "projection index {} is out of bounds for CSV schema with {} columns",
-                    i, self.schema.len(),
-                )
-            })?;
-
-            if dtype == &DataType::Utf8 {
-                new_projection.push(*i)
-            }
-        }
-
-        Ok(StringColumns::new(self.schema.clone(), new_projection))
-    }
-
-    fn init_string_size_stats(
-        &self,
-        str_columns: &StringColumns,
-        capacity: usize,
-    ) -> Vec<RunningSize> {
-        // assume 10 chars per str
-        // this is not updated in low memory mode
-        let init_str_bytes = capacity * 10;
-        str_columns
-            .iter()
-            .map(|_| RunningSize::new(init_str_bytes))
-            .collect()
+            .unwrap_or_else(|| Ok((0..self.schema.len()).collect()))
     }
 
     fn parse_csv(
@@ -552,27 +472,14 @@ impl<'a> CoreReader<'a> {
         let logging = verbose();
         let (file_chunks, chunk_size, total_rows, starting_point_offset, bytes, remaining_bytes) =
             self.determine_file_chunks_and_statistics(&mut n_threads, bytes, logging)?;
-        let projection = self.get_projection();
-        let str_columns = self.get_string_columns(&projection)?;
+        let projection = self.get_projection()?;
 
         // An empty file with a schema should return an empty DataFrame with that schema
         if bytes.is_empty() {
-            // TODO! add DataFrame::new_from_schema
-            let buffers = init_buffers(
-                &projection,
-                0,
-                &self.schema,
-                &self.init_string_size_stats(&str_columns, 0),
-                self.quote_char,
-                self.encoding,
-                self.ignore_errors,
-            )?;
-            let df = DataFrame::new_no_checks(
-                buffers
-                    .into_iter()
-                    .map(|buf| buf.into_series())
-                    .collect::<PolarsResult<_>>()?,
-            );
+            let mut df = DataFrame::from(self.schema.as_ref());
+            if let Some(ref row_index) = self.row_index {
+                df.insert_column(0, Series::new_empty(&row_index.name, &IDX_DTYPE))?;
+            }
             return Ok(df);
         }
 
@@ -580,12 +487,10 @@ impl<'a> CoreReader<'a> {
         // Structure:
         //      the inner vec has got buffers from all the columns.
         if let Some(predicate) = predicate {
-            let str_capacities = self.init_string_size_stats(&str_columns, chunk_size);
             let dfs = POOL.install(|| {
                 file_chunks
                     .into_par_iter()
                     .map(|(bytes_offset_thread, stop_at_nbytes)| {
-                        let delimiter = self.delimiter;
                         let schema = self.schema.as_ref();
                         let ignore_errors = self.ignore_errors;
                         let projection = &projection;
@@ -602,10 +507,8 @@ impl<'a> CoreReader<'a> {
                                 projection,
                                 chunk_size,
                                 schema,
-                                &str_capacities,
                                 self.quote_char,
                                 self.encoding,
-                                self.ignore_errors,
                             )?;
 
                             let local_bytes = &bytes[read..stop_at_nbytes];
@@ -615,13 +518,13 @@ impl<'a> CoreReader<'a> {
                             read += parse_lines(
                                 local_bytes,
                                 offset,
-                                delimiter,
-                                self.comment_char,
+                                self.separator,
+                                self.comment_prefix.as_ref(),
                                 self.quote_char,
                                 self.eol_char,
                                 self.missing_is_null,
-                                self.truncate_ragged_lines,
                                 ignore_errors,
+                                self.truncate_ragged_lines,
                                 self.null_values.as_ref(),
                                 projection,
                                 &mut buffers,
@@ -637,19 +540,15 @@ impl<'a> CoreReader<'a> {
                                     .collect::<PolarsResult<_>>()?,
                             );
                             let current_row_count = local_df.height() as IdxSize;
-                            if let Some(rc) = &self.row_count {
-                                local_df.with_row_count_mut(&rc.name, Some(rc.offset));
+                            if let Some(rc) = &self.row_index {
+                                local_df.with_row_index_mut(&rc.name, Some(rc.offset));
                             };
 
                             cast_columns(&mut local_df, &self.to_cast, false, self.ignore_errors)?;
-                            let s = predicate.evaluate(&local_df)?;
+                            let s = predicate.evaluate_io(&local_df)?;
                             let mask = s.bool()?;
                             local_df = local_df.filter(mask)?;
 
-                            // update the running str bytes statistics
-                            if !self.low_memory {
-                                update_string_stats(&str_capacities, &str_columns, &local_df)?;
-                            }
                             dfs.push((local_df, current_row_count));
                         }
                         Ok(dfs)
@@ -657,7 +556,7 @@ impl<'a> CoreReader<'a> {
                     .collect::<PolarsResult<Vec<_>>>()
             })?;
             let mut dfs = flatten(&dfs, None);
-            if self.row_count.is_some() {
+            if self.row_index.is_some() {
                 update_row_counts(&mut dfs, 0)
             }
             accumulate_dataframes_vertical(dfs.into_iter().map(|t| t.0))
@@ -673,24 +572,21 @@ impl<'a> CoreReader<'a> {
                 std::cmp::min(rows_per_thread, max_proxy)
             };
 
-            let str_capacities = self.init_string_size_stats(&str_columns, capacity);
-
             let mut dfs = POOL.install(|| {
                 file_chunks
                     .into_par_iter()
                     .map(|(bytes_offset_thread, stop_at_nbytes)| {
                         let mut df = read_chunk(
                             bytes,
-                            self.delimiter,
+                            self.separator,
                             self.schema.as_ref(),
                             self.ignore_errors,
                             &projection,
                             bytes_offset_thread,
                             self.quote_char,
                             self.eol_char,
-                            self.comment_char,
+                            self.comment_prefix.as_ref(),
                             capacity,
-                            &str_capacities,
                             self.encoding,
                             self.null_values.as_ref(),
                             self.missing_is_null,
@@ -700,14 +596,9 @@ impl<'a> CoreReader<'a> {
                             starting_point_offset,
                         )?;
 
-                        // update the running str bytes statistics
-                        if !self.low_memory {
-                            update_string_stats(&str_capacities, &str_columns, &df)?;
-                        }
-
                         cast_columns(&mut df, &self.to_cast, false, self.ignore_errors)?;
-                        if let Some(rc) = &self.row_count {
-                            df.with_row_count_mut(&rc.name, Some(rc.offset));
+                        if let Some(rc) = &self.row_index {
+                            df.with_row_index_mut(&rc.name, Some(rc.offset));
                         }
                         let n_read = df.height() as IdxSize;
                         Ok((df, n_read))
@@ -724,17 +615,15 @@ impl<'a> CoreReader<'a> {
                                 &projection,
                                 remaining_rows,
                                 self.schema.as_ref(),
-                                &str_capacities,
                                 self.quote_char,
                                 self.encoding,
-                                self.ignore_errors,
                             )?;
 
                             parse_lines(
                                 remaining_bytes,
                                 0,
-                                self.delimiter,
-                                self.comment_char,
+                                self.separator,
+                                self.comment_prefix.as_ref(),
                                 self.quote_char,
                                 self.eol_char,
                                 self.missing_is_null,
@@ -757,15 +646,15 @@ impl<'a> CoreReader<'a> {
                         };
 
                         cast_columns(&mut df, &self.to_cast, false, self.ignore_errors)?;
-                        if let Some(rc) = &self.row_count {
-                            df.with_row_count_mut(&rc.name, Some(rc.offset));
+                        if let Some(rc) = &self.row_index {
+                            df.with_row_index_mut(&rc.name, Some(rc.offset));
                         }
                         let n_read = df.height() as IdxSize;
                         (df, n_read)
                     });
                 }
             }
-            if self.row_count.is_some() {
+            if self.row_index.is_some() {
                 update_row_counts(&mut dfs, 0)
             }
             accumulate_dataframes_vertical(dfs.into_iter().map(|t| t.0))
@@ -792,35 +681,18 @@ impl<'a> CoreReader<'a> {
     }
 }
 
-fn update_string_stats(
-    str_capacities: &[RunningSize],
-    str_columns: &StringColumns,
-    local_df: &DataFrame,
-) -> PolarsResult<()> {
-    // update the running str bytes statistics
-    for (str_index, name) in str_columns.iter().enumerate() {
-        let ca = local_df.column(name)?.utf8()?;
-        let str_bytes_len = ca.get_values_size();
-
-        let _ = str_capacities[str_index].update(str_bytes_len);
-    }
-
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn read_chunk(
     bytes: &[u8],
-    delimiter: u8,
+    separator: u8,
     schema: &Schema,
     ignore_errors: bool,
     projection: &[usize],
     bytes_offset_thread: usize,
     quote_char: Option<u8>,
     eol_char: u8,
-    comment_char: Option<u8>,
+    comment_prefix: Option<&CommentPrefix>,
     capacity: usize,
-    str_capacities: &[RunningSize],
     encoding: CsvEncoding,
     null_values: Option<&NullValuesCompiled>,
     missing_is_null: bool,
@@ -830,15 +702,7 @@ fn read_chunk(
     starting_point_offset: Option<usize>,
 ) -> PolarsResult<DataFrame> {
     let mut read = bytes_offset_thread;
-    let mut buffers = init_buffers(
-        projection,
-        capacity,
-        schema,
-        str_capacities,
-        quote_char,
-        encoding,
-        ignore_errors,
-    )?;
+    let mut buffers = init_buffers(projection, capacity, schema, quote_char, encoding)?;
 
     let mut last_read = usize::MAX;
     loop {
@@ -852,8 +716,8 @@ fn read_chunk(
         read += parse_lines(
             local_bytes,
             offset,
-            delimiter,
-            comment_char,
+            separator,
+            comment_prefix,
             quote_char,
             eol_char,
             missing_is_null,
@@ -874,28 +738,4 @@ fn read_chunk(
             .map(|buf| buf.into_series())
             .collect::<PolarsResult<_>>()?,
     ))
-}
-
-/// List of strings, which are stored inside of a [Schema].
-///
-/// Conceptually it is `Vec<&str>` with `&str` tied to the lifetime of
-/// the [Schema].
-struct StringColumns {
-    schema: SchemaRef,
-    fields: Vec<usize>,
-}
-
-impl StringColumns {
-    /// New [StringColumns], where the list `fields` has indices
-    /// of fields in the `schema`.
-    fn new(schema: SchemaRef, fields: Vec<usize>) -> Self {
-        Self { schema, fields }
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &str> {
-        self.fields.iter().map(|schema_i| {
-            let (name, _) = self.schema.get_at_index(*schema_i).unwrap();
-            name.as_str()
-        })
-    }
 }

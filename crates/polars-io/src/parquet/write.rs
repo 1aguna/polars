@@ -1,14 +1,13 @@
 use std::io::Write;
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef};
 use arrow::chunk::Chunk;
-use arrow::datatypes::{DataType as ArrowDataType, PhysicalType};
-use arrow::error::Error as ArrowError;
-use arrow::io::parquet::read::ParquetError;
-use arrow::io::parquet::write::{self, DynIter, DynStreamingIterator, Encoding, FileWriter, *};
+use arrow::datatypes::{ArrowDataType, PhysicalType};
 use polars_core::prelude::*;
 use polars_core::utils::{accumulate_dataframes_vertical_unchecked, split_df};
 use polars_core::POOL;
+use polars_parquet::read::ParquetError;
+use polars_parquet::write::{self, DynIter, DynStreamingIterator, Encoding, FileWriter, *};
 use rayon::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -32,21 +31,21 @@ pub struct ZstdLevel(i32);
 
 impl ZstdLevel {
     pub fn try_new(level: i32) -> PolarsResult<Self> {
-        ZstdLevelParquet::try_new(level).map_err(ArrowError::from)?;
+        ZstdLevelParquet::try_new(level)?;
         Ok(ZstdLevel(level))
     }
 }
 
 impl BrotliLevel {
     pub fn try_new(level: u32) -> PolarsResult<Self> {
-        BrotliLevelParquet::try_new(level).map_err(ArrowError::from)?;
+        BrotliLevelParquet::try_new(level)?;
         Ok(BrotliLevel(level))
     }
 }
 
 impl GzipLevel {
     pub fn try_new(level: u8) -> PolarsResult<Self> {
-        GzipLevelParquet::try_new(level).map_err(ArrowError::from)?;
+        GzipLevelParquet::try_new(level)?;
         Ok(GzipLevel(level))
     }
 }
@@ -102,7 +101,7 @@ pub struct ParquetWriter<W> {
     /// if `None` will be 512^2 rows
     row_group_size: Option<usize>,
     /// if `None` will be 1024^2 bytes
-    data_pagesize_limit: Option<usize>,
+    data_page_size: Option<usize>,
     /// Serialize columns in parallel
     parallel: bool,
 }
@@ -121,7 +120,7 @@ where
             compression: ParquetCompression::default().into(),
             statistics: false,
             row_group_size: None,
-            data_pagesize_limit: None,
+            data_page_size: None,
             parallel: true,
         }
     }
@@ -149,8 +148,8 @@ where
     }
 
     /// Sets the maximum bytes size of a data page. If `None` will be 1024^2 bytes.
-    pub fn with_data_pagesize_limit(mut self, limit: Option<usize>) -> Self {
-        self.data_pagesize_limit = limit;
+    pub fn with_data_page_size(mut self, limit: Option<usize>) -> Self {
+        self.data_page_size = limit;
         self
     }
 
@@ -165,12 +164,12 @@ where
             write_statistics: self.statistics,
             compression: self.compression,
             version: Version::V2,
-            data_pagesize_limit: self.data_pagesize_limit,
+            data_pagesize_limit: self.data_page_size,
         }
     }
 
     pub fn batched(self, schema: &Schema) -> PolarsResult<BatchedWriter<W>> {
-        let fields = schema.to_arrow().fields;
+        let fields = schema.to_arrow(true).fields;
         let schema = ArrowSchema::from(fields);
 
         let parquet_schema = to_parquet_schema(&schema)?;
@@ -187,7 +186,7 @@ where
         })
     }
 
-    /// Write the given DataFrame in the the writer `W`. Returns the total size of the file.
+    /// Write the given DataFrame in the writer `W`. Returns the total size of the file.
     pub fn finish(self, df: &mut DataFrame) -> PolarsResult<u64> {
         // ensures all chunks are aligned.
         df.align_chunks();
@@ -209,8 +208,8 @@ fn prepare_rg_iter<'a>(
     encodings: &'a [Vec<Encoding>],
     options: WriteOptions,
     parallel: bool,
-) -> impl Iterator<Item = Result<RowGroupIter<'a, ArrowError>, ArrowError>> + 'a {
-    let rb_iter = df.iter_chunks();
+) -> impl Iterator<Item = PolarsResult<RowGroupIter<'a, PolarsError>>> + 'a {
+    let rb_iter = df.iter_chunks(true);
     rb_iter.filter_map(move |batch| match batch.len() {
         0 => None,
         _ => {
@@ -233,7 +232,16 @@ fn get_encodings(schema: &ArrowSchema) -> Vec<Vec<Encoding>> {
 /// Declare encodings
 fn encoding_map(data_type: &ArrowDataType) -> Encoding {
     match data_type.to_physical_type() {
-        PhysicalType::Dictionary(_) => Encoding::RleDictionary,
+        PhysicalType::Dictionary(_) | PhysicalType::LargeBinary | PhysicalType::LargeUtf8 => {
+            Encoding::RleDictionary
+        },
+        PhysicalType::Primitive(dt) => {
+            use arrow::types::PrimitiveType::*;
+            match dt {
+                Float32 | Float64 | Float16 => Encoding::Plain,
+                _ => Encoding::RleDictionary,
+            }
+        },
         // remaining is plain
         _ => Encoding::Plain,
     }
@@ -279,7 +287,7 @@ fn create_serializer<'a>(
     encodings: &[Vec<Encoding>],
     options: WriteOptions,
     parallel: bool,
-) -> Result<RowGroupIter<'a, ArrowError>, ArrowError> {
+) -> PolarsResult<RowGroupIter<'a, PolarsError>> {
     let func = move |((array, type_), encoding): ((&ArrayRef, &ParquetType), &Vec<Encoding>)| {
         let encoded_columns = array_to_columns(array, type_.clone(), options, encoding).unwrap();
 
@@ -299,7 +307,7 @@ fn create_serializer<'a>(
                         options.compression,
                         vec![],
                     )
-                    .map_err(|e| ArrowError::External(format!("{e}"), Box::new(e))),
+                    .map_err(PolarsError::from),
                 );
 
                 Ok(pages)

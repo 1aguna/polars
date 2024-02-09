@@ -90,8 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .lazy()
         .select([
-            col("integers").cast(DataType::Utf8),
-            col("float").cast(DataType::Utf8),
+            col("integers").cast(DataType::String),
+            col("float").cast(DataType::String),
             col("floats_as_string").cast(DataType::Float64),
         ])
         .collect()?;
@@ -133,29 +133,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --8<-- [end:bool]
 
     // --8<-- [start:dates]
-
     use chrono::prelude::*;
-    use polars::time::*;
+
+    let date = polars::time::date_range(
+        "date",
+        NaiveDate::from_ymd_opt(2022, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        NaiveDate::from_ymd_opt(2022, 1, 5)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        Duration::parse("1d"),
+        ClosedWindow::Both,
+        TimeUnit::Milliseconds,
+        None,
+    )?
+    .cast(&DataType::Date)?;
+
+    let datetime = polars::time::date_range(
+        "datetime",
+        NaiveDate::from_ymd_opt(2022, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        NaiveDate::from_ymd_opt(2022, 1, 5)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        Duration::parse("1d"),
+        ClosedWindow::Both,
+        TimeUnit::Milliseconds,
+        None,
+    )?;
 
     let df = df! (
-        "date" => date_range(
-            "date",
-            NaiveDate::from_ymd_opt(2022, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(),
-            NaiveDate::from_ymd_opt(2022, 1, 5).unwrap().and_hms_opt(0, 0, 0).unwrap(),
-            Duration::parse("1d"),
-            ClosedWindow::Both,
-            TimeUnit::Milliseconds,
-            None
-        )?.cast(&DataType::Date)?,
-        "datetime" => datetime_range(
-            "datetime",
-            NaiveDate::from_ymd_opt(2022, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(),
-            NaiveDate::from_ymd_opt(2022, 1, 5).unwrap().and_hms_opt(0, 0, 0).unwrap(),
-            Duration::parse("1d"),
-            ClosedWindow::Both,
-            TimeUnit::Milliseconds,
-            None
-        )?,
+        "date" => date,
+        "datetime" => datetime,
     )?;
 
     let out = df
@@ -170,10 +185,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --8<-- [end:dates]
 
     // --8<-- [start:dates2]
+    let date = polars::time::date_range(
+        "date",
+        NaiveDate::from_ymd_opt(2022, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        NaiveDate::from_ymd_opt(2022, 1, 5)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        Duration::parse("1d"),
+        ClosedWindow::Both,
+        TimeUnit::Milliseconds,
+        None,
+    )?;
 
     let df = df! (
-            "date" => date_range("date",
-                    NaiveDate::from_ymd_opt(2022, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap(), NaiveDate::from_ymd_opt(2022, 1, 5).unwrap().and_hms_opt(0, 0, 0).unwrap(), Duration::parse("1d"),ClosedWindow::Both, TimeUnit::Milliseconds, None)?,
+            "date" => date,
             "string" => &[
                 "2022-01-01",
                 "2022-01-02",
@@ -187,9 +216,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .lazy()
         .select([
-            col("date").dt().strftime("%Y-%m-%d"),
-            col("string").str().strptime(
-                DataType::Datetime(TimeUnit::Microseconds, None),
+            col("date").dt().to_string("%Y-%m-%d"),
+            col("string").str().to_datetime(
+                Some(TimeUnit::Microseconds),
+                None,
                 StrptimeOptions::default(),
                 lit("raise"),
             ),

@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::series::implementations::null::NullChunked;
 
 macro_rules! unpack_chunked {
     ($series:expr, $expected:pat => $ca:ty, $name:expr) => {
@@ -83,14 +84,19 @@ impl Series {
         unpack_chunked!(self, DataType::Boolean => BooleanChunked, "Boolean")
     }
 
-    /// Unpack to [`ChunkedArray`] of dtype `[DataType::Utf8]`
-    pub fn utf8(&self) -> PolarsResult<&Utf8Chunked> {
-        unpack_chunked!(self, DataType::Utf8 => Utf8Chunked, "Utf8")
+    /// Unpack to [`ChunkedArray`] of dtype `[DataType::String]`
+    pub fn str(&self) -> PolarsResult<&StringChunked> {
+        unpack_chunked!(self, DataType::String => StringChunked, "String")
     }
 
     /// Unpack to [`ChunkedArray`] of dtype `[DataType::Binary]`
     pub fn binary(&self) -> PolarsResult<&BinaryChunked> {
         unpack_chunked!(self, DataType::Binary => BinaryChunked, "Binary")
+    }
+
+    /// Unpack to [`ChunkedArray`] of dtype `[DataType::Binary]`
+    pub fn binary_offset(&self) -> PolarsResult<&BinaryOffsetChunked> {
+        unpack_chunked!(self, DataType::BinaryOffset => BinaryOffsetChunked, "BinaryOffset")
     }
 
     /// Unpack to [`ChunkedArray`] of dtype `[DataType::Time]`
@@ -137,7 +143,7 @@ impl Series {
     /// Unpack to [`ChunkedArray`] of dtype `[DataType::Categorical]`
     #[cfg(feature = "dtype-categorical")]
     pub fn categorical(&self) -> PolarsResult<&CategoricalChunked> {
-        unpack_chunked!(self, DataType::Categorical(_) => CategoricalChunked, "Categorical")
+        unpack_chunked!(self, DataType::Categorical(_, _) | DataType::Enum(_, _) => CategoricalChunked, "Enum | Categorical")
     }
 
     /// Unpack to [`ChunkedArray`] of dtype `[DataType::Struct]`
@@ -151,5 +157,10 @@ impl Series {
             }
         }
         unpack_chunked!(self, DataType::Struct(_) => StructChunked, "Struct")
+    }
+
+    /// Unpack to [`ChunkedArray`] of dtype `[DataType::Null]`
+    pub fn null(&self) -> PolarsResult<&NullChunked> {
+        unpack_chunked!(self, DataType::Null => NullChunked, "Null")
     }
 }

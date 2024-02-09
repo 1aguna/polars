@@ -6,8 +6,11 @@ from polars.testing import assert_frame_equal
 def test_melt() -> None:
     df = pl.DataFrame({"A": ["a", "b", "c"], "B": [1, 3, 5], "C": [2, 4, 6]})
     for _idv, _vv in (("A", ("B", "C")), (cs.string(), cs.integer())):
-        melted = df.melt(id_vars="A", value_vars=["B", "C"])
-        assert all(melted["value"] == [1, 3, 5, 2, 4, 6])
+        melted_eager = df.melt(id_vars="A", value_vars=["B", "C"])
+        assert all(melted_eager["value"] == [1, 3, 5, 2, 4, 6])
+
+        melted_lazy = df.lazy().melt(id_vars="A", value_vars=["B", "C"])
+        assert all(melted_lazy.collect()["value"] == [1, 3, 5, 2, 4, 6])
 
     melted = df.melt(id_vars="A", value_vars="B")
     assert all(melted["value"] == [1, 3, 5])
@@ -64,5 +67,17 @@ def test_melt_projection_pd_7747() -> None:
             "number": [1, 2, 1, 2, 1],
             "value": [40, 30, 21, 33, 45],
         }
+    )
+    assert_frame_equal(result, expected)
+
+
+# https://github.com/pola-rs/polars/issues/10075
+def test_melt_no_value_vars() -> None:
+    lf = pl.LazyFrame({"a": [1, 2, 3]})
+
+    result = lf.melt("a")
+
+    expected = pl.LazyFrame(
+        schema={"a": pl.Int64, "variable": pl.String, "value": pl.Null}
     )
     assert_frame_equal(result, expected)

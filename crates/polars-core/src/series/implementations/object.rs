@@ -4,9 +4,7 @@ use std::borrow::Cow;
 use ahash::RandomState;
 
 use crate::chunked_array::object::PolarsObjectSafe;
-use crate::chunked_array::ops::compare_inner::{IntoPartialEqInner, PartialEqInner};
-#[cfg(feature = "chunked_ids")]
-use crate::chunked_array::ops::take::TakeChunked;
+use crate::chunked_array::ops::compare_inner::{IntoTotalEqInner, TotalEqInner};
 use crate::chunked_array::Settings;
 #[cfg(feature = "algorithm_group_by")]
 use crate::frame::group_by::{GroupsProxy, IntoGroupsProxy};
@@ -53,8 +51,8 @@ where
         self.0.agg_list(groups)
     }
 
-    fn into_partial_eq_inner<'a>(&'a self) -> Box<dyn PartialEqInner + 'a> {
-        (&self.0).into_partial_eq_inner()
+    fn into_total_eq_inner<'a>(&'a self) -> Box<dyn TotalEqInner + 'a> {
+        (&self.0).into_total_eq_inner()
     }
 
     fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
@@ -125,16 +123,6 @@ where
         ChunkFilter::filter(&self.0, filter).map(|ca| ca.into_series())
     }
 
-    #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_chunked_unchecked(&self, by: &[ChunkId], sorted: IsSorted) -> Series {
-        self.0.take_chunked_unchecked(by, sorted).into_series()
-    }
-
-    #[cfg(feature = "chunked_ids")]
-    unsafe fn _take_opt_chunked_unchecked(&self, by: &[Option<ChunkId>]) -> Series {
-        self.0.take_opt_chunked_unchecked(by).into_series()
-    }
-
     fn take(&self, indices: &IdxCa) -> PolarsResult<Series> {
         Ok(self.0.take(indices)?.into_series())
     }
@@ -165,7 +153,7 @@ where
     }
 
     fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
-        if matches!(data_type, DataType::Object(_)) {
+        if matches!(data_type, DataType::Object(_, None)) {
             Ok(self.0.clone().into_series())
         } else {
             Err(PolarsError::ComputeError(
@@ -176,6 +164,9 @@ where
 
     fn get(&self, index: usize) -> PolarsResult<AnyValue> {
         ObjectChunked::get_any_value(&self.0, index)
+    }
+    unsafe fn get_unchecked(&self, index: usize) -> AnyValue {
+        ObjectChunked::get_any_value_unchecked(&self.0, index)
     }
     fn null_count(&self) -> usize {
         ObjectChunked::null_count(&self.0)
@@ -221,27 +212,16 @@ where
         ObjectChunked::<T>::get_object(&self.0, index)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        &self.0
+    unsafe fn get_object_chunked_unchecked(
+        &self,
+        chunk: usize,
+        index: usize,
+    ) -> Option<&dyn PolarsObjectSafe> {
+        ObjectChunked::<T>::get_object_chunked_unchecked(&self.0, chunk, index)
     }
 
-    fn _sum_as_series(&self) -> Series {
-        ObjectChunked::<T>::full_null(self.name(), 1).into_series()
-    }
-    fn max_as_series(&self) -> Series {
-        ObjectChunked::<T>::full_null(self.name(), 1).into_series()
-    }
-    fn min_as_series(&self) -> Series {
-        ObjectChunked::<T>::full_null(self.name(), 1).into_series()
-    }
-    fn median_as_series(&self) -> Series {
-        ObjectChunked::<T>::full_null(self.name(), 1).into_series()
-    }
-    fn var_as_series(&self, _ddof: u8) -> Series {
-        ObjectChunked::<T>::full_null(self.name(), 1).into_series()
-    }
-    fn std_as_series(&self, _ddof: u8) -> Series {
-        ObjectChunked::<T>::full_null(self.name(), 1).into_series()
+    fn as_any(&self) -> &dyn Any {
+        &self.0
     }
 }
 

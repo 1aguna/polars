@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin~=1.2.1"]
+requires = ["maturin>=1.3.2"]
 build-backend = "maturin"
 
 [project]
@@ -26,38 +26,44 @@ classifiers = [
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering",
 ]
 
 [project.urls]
 Homepage = "https://www.pola.rs/"
-Documentation = "https://pola-rs.github.io/polars/py-polars/html/reference/index.html"
+Documentation = "https://docs.pola.rs/py-polars/html/reference/index.html"
 Repository = "https://github.com/pola-rs/polars"
 Changelog = "https://github.com/pola-rs/polars/releases"
 
 [project.optional-dependencies]
 # NOTE: keep this list in sync with show_versions() and requirements-dev.txt
-pyarrow = ["pyarrow >= 7.0.0"]
-pandas = ["pyarrow >= 7.0.0", "pandas"]
-numpy = ["numpy >= 1.16.0"]
-fsspec = ["fsspec"]
-connectorx = ["connectorx"]
-xlsx2csv = ["xlsx2csv >= 0.8.0"]
-openpyxl = ["openpyxl >= 3.0.0"]
-deltalake = ["deltalake >= 0.10.0"]
-timezone = ["backports.zoneinfo; python_version < '3.9'", "tzdata; platform_system == 'Windows'"]
-matplotlib = ["matplotlib"]
-pydantic = ["pydantic"]
-pyiceberg = ["pyiceberg >= 0.5.0"]
-sqlalchemy = ["sqlalchemy", "pandas"]
-xlsxwriter = ["xlsxwriter"]
 adbc = ["adbc_driver_sqlite"]
 cloudpickle = ["cloudpickle"]
+connectorx = ["connectorx >= 0.3.2"]
+deltalake = ["deltalake >= 0.14.0"]
+fsspec = ["fsspec"]
 gevent = ["gevent"]
+plot = ["hvplot >= 0.9.1"]
+matplotlib = ["matplotlib"]
+numpy = ["numpy >= 1.16.0"]
+openpyxl = ["openpyxl >= 3.0.0"]
+pandas = ["pyarrow >= 7.0.0", "pandas"]
+pyarrow = ["pyarrow >= 7.0.0"]
+pydantic = ["pydantic"]
+pyiceberg = ["pyiceberg >= 0.5.0"]
+pyxlsb = ["pyxlsb >= 1.0"]
+sqlalchemy = ["sqlalchemy", "pandas"]
+timezone = ["backports.zoneinfo; python_version < '3.9'", "tzdata; platform_system == 'Windows'"]
+xlsx2csv = ["xlsx2csv >= 0.8.0"]
+xlsxwriter = ["xlsxwriter"]
 all = [
-  "polars[pyarrow,pandas,numpy,fsspec,connectorx,xlsx2csv,deltalake,timezone,matplotlib,pydantic,pyiceberg,sqlalchemy,xlsxwriter,adbc,cloudpickle,gevent]",
+  "polars[pyarrow,pandas,numpy,fsspec,plot,connectorx,xlsx2csv,deltalake,timezone,pydantic,pyiceberg,sqlalchemy,xlsxwriter,adbc,cloudpickle,gevent]",
 ]
+
+[tool.maturin]
+include = ["rust-toolchain.toml"]
 
 [tool.mypy]
 files = ["polars", "tests"]
@@ -74,20 +80,23 @@ disable_error_code = [
 [[tool.mypy.overrides]]
 module = [
   "IPython.*",
-  "adbc_driver_postgresql.*",
+  "adbc_driver_manager.*",
   "adbc_driver_sqlite.*",
+  "arrow_odbc",
   "backports",
   "connectorx",
   "deltalake.*",
   "ezodf.*",
   "fsspec.*",
   "gevent",
+  "hvplot.*",
   "matplotlib.*",
   "moto.server",
   "openpyxl",
   "polars.polars",
   "pyarrow.*",
   "pydantic",
+  "pyxlsb",
   "sqlalchemy.*",
   "xlsx2csv",
   "xlsxwriter.*",
@@ -115,6 +124,7 @@ warn_return_any = false
 line-length = 88
 fix = true
 
+[tool.ruff.lint]
 select = [
   "E", # pycodestyle
   "W", # pycodestyle
@@ -122,11 +132,12 @@ select = [
   "B", # flake8-bugbear
   "C4", # flake8-comprehensions
   "D", # flake8-docstrings
+  "D213", # Augment NumPy docstring convention: Multi-line docstring summary should start at the second line
+  "D417", # Augment NumPy docstring convention: Missing argument descriptions
   "I", # isort
   "SIM", # flake8-simplify
   "TCH", # flake8-type-checking
   "TID", # flake8-tidy-imports
-  "Q", # flake8-quotes
   "UP", # pyupgrade
   "PT", # flake8-pytest-style
   "RUF", # Ruff-specific rules
@@ -135,21 +146,15 @@ select = [
   "PIE", # flake8-pie
   "TD", # flake8-todos
   "TRY", # tryceratops
+  "EM", # flake8-errmsg
   "FBT001", # flake8-boolean-trap
 ]
 
 ignore = [
-  # Line length regulated by black
+  # Line length regulated by formatter
   "E501",
   # pydocstyle: http://www.pydocstyle.org/en/stable/error_codes.html
-  # numpy convention with a few additional lints
-  "D107",
-  "D203",
-  "D212",
-  "D401",
-  "D402",
-  "D415",
-  "D416",
+  "D401", # Relax NumPy docstring convention: First line should be in imperative mood
   # flake8-pytest-style:
   "PT011", # pytest.raises({exception}) is too broad, set the match parameter or use a more specific exception
   # flake8-simplify
@@ -168,25 +173,32 @@ ignore = [
   "TD003", # Missing issue link on the line following this TODO
   # tryceratops
   "TRY003", # Avoid specifying long messages outside the exception class
+  # Lints below are turned off because of conflicts with the ruff formatter
+  "D206",
+  "W191",
 ]
 
-[tool.ruff.pycodestyle]
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D100", "D103", "B018", "FBT001"]
+
+[tool.ruff.lint.pycodestyle]
 max-doc-length = 88
 
-[tool.ruff.isort]
-split-on-trailing-comma = false
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
 
-[tool.ruff.flake8-tidy-imports]
+[tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
 
-[tool.ruff.flake8-type-checking]
+[tool.ruff.lint.flake8-type-checking]
 strict = true
 
-[tool.ruff.per-file-ignores]
-"tests/**/*.py" = ["D100", "D103", "B018", "FBT001"]
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.pytest.ini_options]
 addopts = [
+  "--tb=short",
   "--strict-config",
   "--strict-markers",
   "--import-mode=importlib",
@@ -200,12 +212,17 @@ markers = [
   "docs: Documentation code snippets",
 ]
 filterwarnings = [
-  # Fail on warnings...
+  # Fail on warnings
   "error",
-  # ...except where it prevents test debugging in an IPython console
+  # Allow debugging in an IPython console
   "ignore:.*unrecognized arguments.*PyDevIPCompleter:DeprecationWarning",
+  # Ignore warnings issued by dependency internals
   "ignore:.*is_sparse is deprecated.*:FutureWarning",
   "ignore:FigureCanvasAgg is non-interactive:UserWarning",
+  "ignore:datetime.datetime.utcfromtimestamp\\(\\) is deprecated.*:DeprecationWarning",
+  "ignore:datetime.datetime.utcnow\\(\\) is deprecated.*:DeprecationWarning",
+  # Introspection under PyCharm IDE can generate this in Python 3.12
+  "ignore:.*co_lnotab is deprecated, use co_lines.*:DeprecationWarning",
 ]
 xfail_strict = true
 

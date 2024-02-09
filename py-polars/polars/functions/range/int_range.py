@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, overload
 from polars import functions as F
 from polars.datatypes import Int64
 from polars.utils._parse_expr_input import parse_as_expression
-from polars.utils._wrap import wrap_expr
+from polars.utils._wrap import wrap_expr, wrap_s
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
     import polars.polars as plr
@@ -15,13 +15,13 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from polars import Expr, Series
-    from polars.type_aliases import IntoExpr, PolarsIntegerType
+    from polars.type_aliases import IntoExprColumn, PolarsIntegerType
 
 
 @overload
 def arange(
-    start: int | Expr | Series,
-    end: int | Expr | Series,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
     step: int = ...,
     *,
     dtype: PolarsIntegerType = ...,
@@ -32,8 +32,8 @@ def arange(
 
 @overload
 def arange(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
     step: int = ...,
     *,
     dtype: PolarsIntegerType = ...,
@@ -44,8 +44,8 @@ def arange(
 
 @overload
 def arange(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
     step: int = ...,
     *,
     dtype: PolarsIntegerType = ...,
@@ -55,8 +55,8 @@ def arange(
 
 
 def arange(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = 0,
+    end: int | IntoExprColumn | None = None,
     step: int = 1,
     *,
     dtype: PolarsIntegerType = Int64,
@@ -76,14 +76,15 @@ def arange(
     step
         Step size of the range.
     dtype
-        Data type of the range. Defaults to ``Int64``.
+        Data type of the range. Defaults to `Int64`.
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Returns
     -------
-    Column of data type ``dtype``.
+    Expr or Series
+        Column of integer data type `dtype`.
 
     See Also
     --------
@@ -94,21 +95,20 @@ def arange(
     --------
     >>> pl.arange(0, 3, eager=True)
     shape: (3,)
-    Series: 'int' [i64]
+    Series: 'literal' [i64]
     [
             0
             1
             2
     ]
-
     """
     return int_range(start, end, step, dtype=dtype, eager=eager)
 
 
 @overload
 def int_range(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
     step: int = ...,
     *,
     dtype: PolarsIntegerType = ...,
@@ -119,8 +119,8 @@ def int_range(
 
 @overload
 def int_range(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
     step: int = ...,
     *,
     dtype: PolarsIntegerType = ...,
@@ -131,8 +131,8 @@ def int_range(
 
 @overload
 def int_range(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
     step: int = ...,
     *,
     dtype: PolarsIntegerType = ...,
@@ -142,8 +142,8 @@ def int_range(
 
 
 def int_range(
-    start: int | IntoExpr,
-    end: int | IntoExpr,
+    start: int | IntoExprColumn = 0,
+    end: int | IntoExprColumn | None = None,
     step: int = 1,
     *,
     dtype: PolarsIntegerType = Int64,
@@ -155,21 +155,22 @@ def int_range(
     Parameters
     ----------
     start
-        Lower bound of the range (inclusive).
+        Start of the range (inclusive). Defaults to 0.
     end
-        Upper bound of the range (exclusive).
+        End of the range (exclusive). If set to `None` (default),
+        the value of `start` is used and `start` is set to `0`.
     step
         Step size of the range.
     dtype
-        Data type of the range. Defaults to ``Int64``.
+        Data type of the range.
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Returns
     -------
     Expr or Series
-        Column of data type :class:`Int64`.
+        Column of integer data type `dtype`.
 
     See Also
     --------
@@ -179,14 +180,49 @@ def int_range(
     --------
     >>> pl.int_range(0, 3, eager=True)
     shape: (3,)
-    Series: 'int' [i64]
+    Series: 'literal' [i64]
     [
             0
             1
             2
     ]
 
+    `end` can be omitted for a shorter syntax.
+
+    >>> pl.int_range(3, eager=True)
+    shape: (3,)
+    Series: 'literal' [i64]
+    [
+            0
+            1
+            2
+    ]
+
+    Generate an index column by using `int_range` in conjunction with :func:`len`.
+
+    >>> df = pl.DataFrame({"a": [1, 3, 5], "b": [2, 4, 6]})
+    >>> df.select(
+    ...     pl.int_range(pl.len(), dtype=pl.UInt32).alias("index"),
+    ...     pl.all(),
+    ... )
+    shape: (3, 3)
+    ┌───────┬─────┬─────┐
+    │ index ┆ a   ┆ b   │
+    │ ---   ┆ --- ┆ --- │
+    │ u32   ┆ i64 ┆ i64 │
+    ╞═══════╪═════╪═════╡
+    │ 0     ┆ 1   ┆ 2   │
+    │ 1     ┆ 3   ┆ 4   │
+    │ 2     ┆ 5   ┆ 6   │
+    └───────┴─────┴─────┘
     """
+    if end is None:
+        end = start
+        start = 0
+
+    if isinstance(start, int) and isinstance(end, int) and eager:
+        return wrap_s(plr.eager_int_range(start, end, step, dtype))
+
     start = parse_as_expression(start)
     end = parse_as_expression(end)
     result = wrap_expr(plr.int_range(start, end, step, dtype))
@@ -199,9 +235,9 @@ def int_range(
 
 @overload
 def int_ranges(
-    start: IntoExpr,
-    end: IntoExpr,
-    step: int = ...,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
+    step: int | IntoExprColumn = ...,
     *,
     dtype: PolarsIntegerType = ...,
     eager: Literal[False] = ...,
@@ -211,9 +247,9 @@ def int_ranges(
 
 @overload
 def int_ranges(
-    start: IntoExpr,
-    end: IntoExpr,
-    step: int = ...,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
+    step: int | IntoExprColumn = ...,
     *,
     dtype: PolarsIntegerType = ...,
     eager: Literal[True],
@@ -223,9 +259,9 @@ def int_ranges(
 
 @overload
 def int_ranges(
-    start: IntoExpr,
-    end: IntoExpr,
-    step: int = ...,
+    start: int | IntoExprColumn = ...,
+    end: int | IntoExprColumn | None = ...,
+    step: int | IntoExprColumn = ...,
     *,
     dtype: PolarsIntegerType = ...,
     eager: bool,
@@ -234,9 +270,9 @@ def int_ranges(
 
 
 def int_ranges(
-    start: IntoExpr,
-    end: IntoExpr,
-    step: int = 1,
+    start: int | IntoExprColumn = 0,
+    end: int | IntoExprColumn | None = None,
+    step: int | IntoExprColumn = 1,
     *,
     dtype: PolarsIntegerType = Int64,
     eager: bool = False,
@@ -247,21 +283,22 @@ def int_ranges(
     Parameters
     ----------
     start
-        Lower bound of the range (inclusive).
+        Start of the range (inclusive). Defaults to 0.
     end
-        Upper bound of the range (exclusive).
+        End of the range (exclusive). If set to `None` (default),
+        the value of `start` is used and `start` is set to `0`.
     step
         Step size of the range.
     dtype
-        Integer data type of the ranges. Defaults to ``Int64``.
+        Integer data type of the ranges. Defaults to `Int64`.
     eager
-        Evaluate immediately and return a ``Series``.
-        If set to ``False`` (default), return an expression instead.
+        Evaluate immediately and return a `Series`.
+        If set to `False` (default), return an expression instead.
 
     Returns
     -------
     Expr or Series
-        Column of data type ``List(dtype)``.
+        Column of data type `List(dtype)`.
 
     See Also
     --------
@@ -270,7 +307,7 @@ def int_ranges(
     Examples
     --------
     >>> df = pl.DataFrame({"start": [1, -1], "end": [3, 2]})
-    >>> df.with_columns(pl.int_ranges("start", "end"))
+    >>> df.with_columns(int_range=pl.int_ranges("start", "end"))
     shape: (2, 3)
     ┌───────┬─────┬────────────┐
     │ start ┆ end ┆ int_range  │
@@ -281,9 +318,26 @@ def int_ranges(
     │ -1    ┆ 2   ┆ [-1, 0, 1] │
     └───────┴─────┴────────────┘
 
+    `end` can be omitted for a shorter syntax.
+
+    >>> df.select("end", int_range=pl.int_ranges("end"))
+    shape: (2, 2)
+    ┌─────┬───────────┐
+    │ end ┆ int_range │
+    │ --- ┆ ---       │
+    │ i64 ┆ list[i64] │
+    ╞═════╪═══════════╡
+    │ 3   ┆ [0, 1, 2] │
+    │ 2   ┆ [0, 1]    │
+    └─────┴───────────┘
     """
+    if end is None:
+        end = start
+        start = 0
+
     start = parse_as_expression(start)
     end = parse_as_expression(end)
+    step = parse_as_expression(step)
     result = wrap_expr(plr.int_ranges(start, end, step, dtype))
 
     if eager:

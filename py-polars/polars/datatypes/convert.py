@@ -10,17 +10,16 @@ from decimal import Decimal as PyDecimal
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Collection,
     ForwardRef,
     Optional,
-    TypeVar,
     Union,
     get_args,
     overload,
 )
 
 from polars.datatypes import (
+    Array,
     Binary,
     Boolean,
     Categorical,
@@ -40,6 +39,7 @@ from polars.datatypes import (
     List,
     Null,
     Object,
+    String,
     Struct,
     Time,
     UInt8,
@@ -47,7 +47,6 @@ from polars.datatypes import (
     UInt32,
     UInt64,
     Unknown,
-    Utf8,
 )
 from polars.dependencies import numpy as np
 from polars.dependencies import pyarrow as pa
@@ -70,19 +69,10 @@ if TYPE_CHECKING:
     from polars.type_aliases import PolarsDataType, PythonDataType, SchemaDict
 
 
-T = TypeVar("T")
-
-
-def cache(function: Callable[..., T]) -> T:  # noqa: D103
-    # need this to satisfy mypy issue with "@property/@cache combination"
-    # See: https://github.com/python/mypy/issues/5858
-    return functools.lru_cache()(function)  # type: ignore[return-value]
-
-
 PY_STR_TO_DTYPE: SchemaDict = {
     "float": Float64,
     "int": Int64,
-    "str": Utf8,
+    "str": String,
     "bool": Boolean,
     "date": Date,
     "datetime": Datetime("us"),
@@ -107,7 +97,7 @@ def _map_py_type_to_dtype(
     if python_dtype is int:
         return Int64
     if python_dtype is str:
-        return Utf8
+        return String
     if python_dtype is bool:
         return Boolean
     if issubclass(python_dtype, datetime):
@@ -142,12 +132,11 @@ def _map_py_type_to_dtype(
             if len(nested) == 1:
                 nested = nested[0]
             return (
-                dtype
-                if nested is None
-                else dtype(_map_py_type_to_dtype(nested))  # type: ignore[operator]
+                dtype if nested is None else dtype(_map_py_type_to_dtype(nested))  # type: ignore[operator]
             )
 
-    raise TypeError("invalid type")
+    msg = "invalid type"
+    raise TypeError(msg)
 
 
 def is_polars_dtype(dtype: Any, *, include_unknown: bool = False) -> bool:
@@ -184,17 +173,16 @@ def unpack_dtypes(
     >>> struct_dtype = pl.Struct(
     ...     [
     ...         pl.Field("a", pl.Int64),
-    ...         pl.Field("b", pl.Utf8),
+    ...         pl.Field("b", pl.String),
     ...         pl.Field("c", pl.List(pl.Float64)),
     ...     ]
     ... )
     >>> unpack_dtypes([struct_dtype, list_dtype])  # doctest: +IGNORE_RESULT
-    {Float64, Int64, Utf8}
+    {Float64, Int64, String}
     >>> unpack_dtypes(
     ...     [struct_dtype, list_dtype], include_compound=True
     ... )  # doctest: +IGNORE_RESULT
-    {Float64, Int64, Utf8, List(Float64), Struct([Field('a', Int64), Field('b', Utf8), Field('c', List(Float64))])}
-
+    {Float64, Int64, String, List(Float64), Struct([Field('a', Int64), Field('b', String), Field('c', List(Float64))])}
     """  # noqa: W505
     if not dtypes:
         return set()
@@ -203,7 +191,7 @@ def unpack_dtypes(
 
     unpacked: set[PolarsDataType] = set()
     for tp in dtypes:
-        if isinstance(tp, List):
+        if isinstance(tp, (List, Array)):
             if include_compound:
                 unpacked.add(tp)
             unpacked.update(unpack_dtypes(tp.inner, include_compound=include_compound))
@@ -220,7 +208,7 @@ def unpack_dtypes(
 
 class _DataTypeMappings:
     @property
-    @cache
+    @functools.lru_cache  # noqa: B019
     def DTYPE_TO_FFINAME(self) -> dict[PolarsDataType, str]:
         return {
             Int8: "i8",
@@ -235,7 +223,7 @@ class _DataTypeMappings:
             Float64: "f64",
             Decimal: "decimal",
             Boolean: "bool",
-            Utf8: "str",
+            String: "str",
             List: "list",
             Date: "date",
             Datetime: "datetime",
@@ -248,7 +236,7 @@ class _DataTypeMappings:
         }
 
     @property
-    @cache
+    @functools.lru_cache  # noqa: B019
     def DTYPE_TO_CTYPE(self) -> dict[PolarsDataType, Any]:
         return {
             UInt8: ctypes.c_uint8,
@@ -268,7 +256,7 @@ class _DataTypeMappings:
         }
 
     @property
-    @cache
+    @functools.lru_cache  # noqa: B019
     def DTYPE_TO_PY_TYPE(self) -> dict[PolarsDataType, PythonDataType]:
         return {
             Float64: float,
@@ -277,7 +265,7 @@ class _DataTypeMappings:
             Int32: int,
             Int16: int,
             Int8: int,
-            Utf8: str,
+            String: str,
             UInt8: int,
             UInt16: int,
             UInt32: int,
@@ -290,14 +278,16 @@ class _DataTypeMappings:
             Time: time,
             Binary: bytes,
             List: list,
+            Array: list,
             Null: None.__class__,
         }
 
     @property
-    @cache
+    @functools.lru_cache  # noqa: B019
     def NUMPY_KIND_AND_ITEMSIZE_TO_DTYPE(self) -> dict[tuple[str, int], PolarsDataType]:
         return {
             # (np.dtype().kind, np.dtype().itemsize)
+            ("b", 1): Boolean,
             ("i", 1): Int8,
             ("i", 2): Int16,
             ("i", 4): Int32,
@@ -311,7 +301,7 @@ class _DataTypeMappings:
         }
 
     @property
-    @cache
+    @functools.lru_cache  # noqa: B019
     def PY_TYPE_TO_ARROW_TYPE(self) -> dict[PythonDataType, pa.lib.DataType]:
         return {
             float: pa.float64(),
@@ -326,12 +316,12 @@ class _DataTypeMappings:
         }
 
     @property
-    @cache
+    @functools.lru_cache  # noqa: B019
     def REPR_TO_DTYPE(self) -> dict[str, PolarsDataType]:
         def _dtype_str_repr_safe(o: Any) -> PolarsDataType | None:
             try:
                 return _dtype_str_repr(o.base_type()).split("[")[0]
-            except ValueError:
+            except TypeError:
                 return None
 
         return {
@@ -351,9 +341,8 @@ def dtype_to_ctype(dtype: PolarsDataType) -> Any:
         dtype = dtype.base_type()
         return DataTypeMappings.DTYPE_TO_CTYPE[dtype]
     except KeyError:  # pragma: no cover
-        raise NotImplementedError(
-            f"conversion of polars data type {dtype!r} to C-type not implemented"
-        ) from None
+        msg = f"conversion of polars data type {dtype!r} to C-type not implemented"
+        raise NotImplementedError(msg) from None
 
 
 def dtype_to_ffiname(dtype: PolarsDataType) -> str:
@@ -362,9 +351,8 @@ def dtype_to_ffiname(dtype: PolarsDataType) -> str:
         dtype = dtype.base_type()
         return DataTypeMappings.DTYPE_TO_FFINAME[dtype]
     except KeyError:  # pragma: no cover
-        raise NotImplementedError(
-            f"conversion of polars data type {dtype!r} to FFI not implemented"
-        ) from None
+        msg = f"conversion of polars data type {dtype!r} to FFI not implemented"
+        raise NotImplementedError(msg) from None
 
 
 def dtype_to_py_type(dtype: PolarsDataType) -> PythonDataType:
@@ -373,9 +361,8 @@ def dtype_to_py_type(dtype: PolarsDataType) -> PythonDataType:
         dtype = dtype.base_type()
         return DataTypeMappings.DTYPE_TO_PY_TYPE[dtype]
     except KeyError:  # pragma: no cover
-        raise NotImplementedError(
-            f"conversion of polars data type {dtype!r} to Python type not implemented"
-        ) from None
+        msg = f"conversion of polars data type {dtype!r} to Python type not implemented"
+        raise NotImplementedError(msg) from None
 
 
 @overload
@@ -430,9 +417,8 @@ def py_type_to_dtype(
     except (KeyError, TypeError):  # pragma: no cover
         if not raise_unmatched:
             return None
-        raise ValueError(
-            f"cannot infer dtype from {data_type!r} (type: {type(data_type).__name__!r})"
-        ) from None
+        msg = f"cannot infer dtype from {data_type!r} (type: {type(data_type).__name__!r})"
+        raise ValueError(msg) from None
 
 
 def py_type_to_arrow_type(dtype: PythonDataType) -> pa.lib.DataType:
@@ -440,9 +426,8 @@ def py_type_to_arrow_type(dtype: PythonDataType) -> pa.lib.DataType:
     try:
         return DataTypeMappings.PY_TYPE_TO_ARROW_TYPE[dtype]
     except KeyError:  # pragma: no cover
-        raise ValueError(
-            f"cannot parse Python data type {dtype!r} into Arrow data type"
-        ) from None
+        msg = f"cannot parse Python data type {dtype!r} into Arrow data type"
+        raise ValueError(msg) from None
 
 
 def dtype_short_repr_to_dtype(dtype_string: str | None) -> PolarsDataType | None:
@@ -483,15 +468,14 @@ def numpy_char_code_to_dtype(dtype_char: str) -> PolarsDataType:
     """Convert a numpy character dtype to a Polars dtype."""
     dtype = np.dtype(dtype_char)
     if dtype.kind == "U":
-        return Utf8
+        return String
     try:
         return DataTypeMappings.NUMPY_KIND_AND_ITEMSIZE_TO_DTYPE[
             (dtype.kind, dtype.itemsize)
         ]
     except KeyError:  # pragma: no cover
-        raise ValueError(
-            f"cannot parse numpy data type {dtype!r} into Polars data type"
-        ) from None
+        msg = f"cannot parse numpy data type {dtype!r} into Polars data type"
+        raise ValueError(msg) from None
 
 
 def maybe_cast(el: Any, dtype: PolarsDataType) -> Any:
@@ -502,14 +486,11 @@ def maybe_cast(el: Any, dtype: PolarsDataType) -> Any:
         _timedelta_to_pl_timedelta,
     )
 
-    try:
-        time_unit = dtype.time_unit  # type: ignore[union-attr]
-    except AttributeError:
-        time_unit = None
-
     if isinstance(el, datetime):
+        time_unit = getattr(dtype, "time_unit", None)
         return _datetime_to_pl_timestamp(el, time_unit)
     elif isinstance(el, timedelta):
+        time_unit = getattr(dtype, "time_unit", None)
         return _timedelta_to_pl_timedelta(el, time_unit)
 
     py_type = dtype_to_py_type(dtype)
@@ -517,7 +498,6 @@ def maybe_cast(el: Any, dtype: PolarsDataType) -> Any:
         try:
             el = py_type(el)  # type: ignore[call-arg, misc]
         except Exception:
-            raise TypeError(
-                f"cannot convert Python type {type(el).__name__!r} to {dtype!r}"
-            ) from None
+            msg = f"cannot convert Python type {type(el).__name__!r} to {dtype!r}"
+            raise TypeError(msg) from None
     return el

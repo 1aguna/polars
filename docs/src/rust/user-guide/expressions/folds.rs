@@ -1,7 +1,6 @@
 use polars::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    
     // --8<-- [start:mansum]
     let df = df!(
         "a" => &[1, 2, 3],
@@ -25,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .lazy()
         .filter(fold_exprs(
             lit(true),
-            |acc, x| Some(acc.bitand(&x)),
+            |acc, x| acc.bitand(&x).map(Some),
             [col("*").gt(1)],
         ))
         .collect()?;
@@ -40,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let out = df
         .lazy()
-        .select([concat_str([col("a"), col("b")], "")])
+        .select([concat_str([col("a"), col("b")], "", false)])
         .collect()?;
     println!("{:?}", out);
     // --8<-- [end:string]

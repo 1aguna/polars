@@ -16,13 +16,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11']
+        # Only the versions that are not already run as part of the regular test suite
+        python-version: ['3.9', '3.10']
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -30,5 +31,6 @@ jobs:
         run: pip install ipython numpy pytest
 
       - name: Run tests
-        working-directory: py-polars
-        run: PYTHONPATH=polars/utils pytest tests/test_udfs.py
+        env:
+          PYTHONPATH: py-polars
+        run: pytest .github/scripts/test_bytecode_parser.py
